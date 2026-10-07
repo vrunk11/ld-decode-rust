@@ -254,7 +254,7 @@ mod tests {
     /// so the parity with Python ld-decode cannot move.
     #[test]
     fn pll_at_40mhz_keeps_the_reference_periods() {
-        let base = 40000000.0 / 4321800.0;
+        let base: f64 = 40000000.0 / 4321800.0;
         let s = EfmPll::new(40_000_000.0).state();
         assert_eq!(s.base_period.to_bits(), base.to_bits());
         assert_eq!(s.minimum_period.to_bits(), (base * 0.90).to_bits());
@@ -267,7 +267,7 @@ mod tests {
     /// not the 9.26 of 40 MHz) and the +/-10 % window is centred on it.
     #[test]
     fn pll_at_30mhz_scales_the_periods() {
-        let base = 30000000.0 / 4321800.0;
+        let base: f64 = 30000000.0 / 4321800.0;
         let s = EfmPll::new(30_000_000.0).state();
         assert_eq!(s.base_period.to_bits(), base.to_bits());
         assert_eq!(s.minimum_period.to_bits(), (base * 0.90).to_bits());
