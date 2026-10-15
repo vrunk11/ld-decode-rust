@@ -11,6 +11,7 @@ use ld_decode::{DecoderMetadata, FieldInfoEntry, LumaOutput, WriteableField};
 use serde::Serialize;
 
 use crate::async_db::AsyncDbWriter;
+use crate::ldx::{LdxOutput, VideoGeometry};
 
 /// The ld-decode version this port replicates bit-for-bit. The reference
 /// release build reports `release:7.4.0`, which is parsed (mirroring
@@ -51,8 +52,12 @@ pub struct DecodeWriter {
     /// The picture stream. Boxed so the CLI can point it at stdout (`outfile
     /// == "-"`) instead of a `.tbc` file without a second code path; every
     /// other output is a real file (a pipe cannot carry the json header
-    /// rewrite, which needs seek).
-    outfile_video: BufWriter<Box<dyn Write + Send>>,
+    /// rewrite, which needs seek). `None` when the picture goes into an LDX
+    /// container instead.
+    outfile_video: Option<BufWriter<Box<dyn Write + Send>>>,
+    /// LDX output (`.ldx` file or LDX stream): picture, metadata, audio and
+    /// EFM as tracks of one container, in place of the separate files.
+    ldx: Option<LdxOutput>,
     outfile_audio: Option<BufWriter<File>>,
     outfile_efm: Option<BufWriter<File>>,
     /// Debug dump of the EFM samples fed to the PLL (mirrors ld-decode's
@@ -115,13 +120,15 @@ struct TbcMetadata {
 }
 
 impl DecodeWriter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        luma: Box<dyn Write + Send>,
+        luma: Option<Box<dyn Write + Send>>,
         audio: Option<File>,
         efm: Option<File>,
         pre_efm: Option<File>,
         json: Option<File>,
         db: Option<AsyncDbWriter>,
+        ldx: Option<LdxOutput>,
     ) -> Result<Self> {
         if let Some(mut json) = json.as_ref() {
             let mut chunk = FIELDS_OPEN.to_vec();
@@ -134,7 +141,8 @@ impl DecodeWriter {
         // measurable on the serial tail).
         const WBUF: usize = 8 * 1024 * 1024;
         Ok(Self {
-            outfile_video: BufWriter::with_capacity(WBUF, luma),
+            outfile_video: luma.map(|l| BufWriter::with_capacity(WBUF, l)),
+            ldx,
             outfile_audio: audio.map(|f| BufWriter::with_capacity(WBUF / 4, f)),
             outfile_efm: efm.map(|f| BufWriter::with_capacity(WBUF / 4, f)),
             outfile_pre_efm: pre_efm.map(|f| BufWriter::with_capacity(WBUF / 4, f)),
@@ -162,9 +170,14 @@ impl DecodeWriter {
         }
 
         let luma = field.luma();
-        match luma {
-            LumaOutput::Encoded(values) => write_u16_le(&mut self.outfile_video, values)?,
-            LumaOutput::Raw(values) => write_f32_slice(&mut self.outfile_video, values)?,
+        if let Some(video) = self.outfile_video.as_mut() {
+            match luma {
+                LumaOutput::Encoded(values) => write_u16_le(video, values)?,
+                LumaOutput::Raw(values) => write_f32_slice(video, values)?,
+            }
+        }
+        if self.ldx.is_some() {
+            self.write_ldx_field(field, metadata)?;
         }
 
         if let Some(audio_file) = self.outfile_audio.as_mut() {
@@ -195,7 +208,7 @@ impl DecodeWriter {
         self.last_field_write = Some(now);
         self.field_count += 1;
 
-        if self.json_file.is_some() {
+        if self.json_file.is_some() || self.ldx.is_some() {
             // Python's json dumper thread serializes the fi dicts by reference,
             // but only drains them when the main loop calls write():
             //
@@ -252,7 +265,9 @@ impl DecodeWriter {
 
     pub fn close(&mut self, metadata: Option<DecoderMetadata>) -> Result<()> {
         // Flush the buffered writers before the process drops them.
-        self.outfile_video.flush()?;
+        if let Some(v) = self.outfile_video.as_mut() {
+            v.flush()?;
+        }
         if let Some(a) = self.outfile_audio.as_mut() {
             a.flush()?;
         }
@@ -283,7 +298,8 @@ impl DecodeWriter {
             fps
         );
 
-        if let (Some(json_file), Some(metadata)) = (self.json_file.as_mut(), metadata) {
+        let mut final_json = None;
+        if let (true, Some(metadata)) = (self.json_file.is_some() || self.ldx.is_some(), metadata.as_ref()) {
             // The `videoParameters` are only known once decoding is done (the
             // ire levels and field height come from the last decoded field, and
             // `numberOfSequentialFields` from the final count), so the header is
@@ -296,7 +312,7 @@ impl DecodeWriter {
             // the aliased dict never reaches the json. Entries keep the values
             // from their own writeout, duplicated fileLoc included.
             let mut chunk = Vec::new();
-            append_header(&mut chunk, &metadata, field_count)?;
+            append_header(&mut chunk, metadata, field_count)?;
             for (i, e) in self.json_entries.iter().enumerate() {
                 if i > 0 {
                     chunk.push(b',');
@@ -305,17 +321,90 @@ impl DecodeWriter {
             }
             chunk.extend_from_slice(b"]}\r\n");
 
-            json_file
-                .seek(SeekFrom::Start(0))
-                .with_context(|| "json: seek to start")?;
-            json_file
-                .write_all(&chunk)
-                .with_context(|| "json: write header+fields")?;
-            json_file
-                .set_len(chunk.len() as u64)
-                .with_context(|| "json: set_len")?;
+            if let Some(json_file) = self.json_file.as_mut() {
+                json_file
+                    .seek(SeekFrom::Start(0))
+                    .with_context(|| "json: seek to start")?;
+                json_file
+                    .write_all(&chunk)
+                    .with_context(|| "json: write header+fields")?;
+                json_file
+                    .set_len(chunk.len() as u64)
+                    .with_context(|| "json: set_len")?;
+            }
+            final_json = Some(chunk);
+        }
+
+        if let Some(mut ldx) = self.ldx.take() {
+            // A decode that wrote no field still makes a valid file.
+            if !ldx.begun() {
+                let (video, header) = ldx_header(metadata.as_ref(), 0)?;
+                ldx.begin(&video, header)?;
+            }
+            // The whole set last: the current metadata of the file is then
+            // exactly the `.tbc.json` (the fields were sent one by one before
+            // their video, which a stream needs, but the reference's aliasing
+            // of re-written fields is only resolved here).
+            ldx.finish(final_json).context("finishing the LDX output")?;
         }
         Ok(())
+    }
+
+    /// One field into the LDX output: its metadata entry, its picture, its
+    /// audio and its EFM. The file is begun with the first field, whose
+    /// metadata give the video parameters.
+    fn write_ldx_field(&mut self, field: &WriteableField, metadata: Option<&DecoderMetadata>) -> Result<()> {
+        let values = match field.luma() {
+            LumaOutput::Encoded(values) => values,
+            LumaOutput::Raw(_) => anyhow::bail!("an LDX tbc track holds the 16-bit TBC, not the raw luma"),
+        };
+        let field_json = serde_json::to_vec(&field.info)?;
+        let efm: Vec<u8> = field.efm.iter().map(|&v| v as u8).collect();
+        let ldx = self.ldx.as_mut().expect("checked by the caller");
+        if !ldx.begun() {
+            let (mut video, header) = ldx_header(metadata, self.field_count)?;
+            if metadata.is_none() && video.field_width > 0 {
+                video.field_height = values.len() / video.field_width;
+            }
+            ldx.begin(&video, header)?;
+        }
+        ldx.write_field(field_json, values, &field.audio, &efm)
+    }
+}
+
+/// What the LDX `tbc` track says of the video, and the first block of the
+/// metadata track: the parameters alone (`videoParameters` with
+/// `numberOfSequentialFields` 0, `pcmAudioParameters`, no `fields`).
+fn ldx_header(metadata: Option<&DecoderMetadata>, _fields: usize) -> Result<(VideoGeometry, Vec<u8>)> {
+    match metadata {
+        Some(m) => {
+            let video = VideoGeometry {
+                system: m.system.to_string(),
+                field_width: m.field_width,
+                field_height: m.field_height,
+                sample_rate: m.sample_rate,
+            };
+            Ok((video, serde_json::to_vec(&tbc_metadata(m, 0))?))
+        }
+        None => {
+            // No metadata yet: the NTSC 4fsc geometry (the only system decoded).
+            let video = VideoGeometry {
+                system: "NTSC".to_string(),
+                field_width: 910,
+                field_height: 263,
+                sample_rate: 4.0 * 315.0e6 / 88.0,
+            };
+            let header = serde_json::to_vec(&serde_json::json!({
+                "videoParameters": {
+                    "system": video.system,
+                    "fieldWidth": video.field_width,
+                    "fieldHeight": video.field_height,
+                    "sampleRate": video.sample_rate,
+                    "numberOfSequentialFields": 0,
+                }
+            }))?;
+            Ok((video, header))
+        }
     }
 }
 
@@ -326,13 +415,21 @@ fn append_header(
     metadata: &DecoderMetadata,
     field_count: usize,
 ) -> Result<()> {
+    let bytes = serde_json::to_vec(&tbc_metadata(metadata, field_count))?;
+    chunk.extend_from_slice(&bytes[..bytes.len() - 1]);
+    chunk.extend_from_slice(b",\"fields\":[");
+    Ok(())
+}
+
+/// The `pcmAudioParameters` and `videoParameters` of the reference json.
+fn tbc_metadata(metadata: &DecoderMetadata, field_count: usize) -> TbcMetadata {
     // Mirror the reference `build_json` version parsing: `release:7.4.0`
     // splits into branch `release` / commit `7.4.0`.
     let (git_branch, git_commit) = match REFERENCE_VERSION.split_once(':') {
         Some((b, c)) => (b.to_string(), c.to_string()),
         None => (String::new(), String::new()),
     };
-    let tbc = TbcMetadata {
+    TbcMetadata {
         pcm_audio_parameters: PcmAudioParameters {
             bits: 16,
             is_little_endian: true,
@@ -357,11 +454,7 @@ fn append_header(
             active_video_start: metadata.active_video_start,
             active_video_end: metadata.active_video_end,
         },
-    };
-    let bytes = serde_json::to_vec(&tbc)?;
-    chunk.extend_from_slice(&bytes[..bytes.len() - 1]);
-    chunk.extend_from_slice(b",\"fields\":[");
-    Ok(())
+    }
 }
 
 /// Port of Python's `f'{platform.system()}:{platform.release()}:{platform.version()}'`.

@@ -4,6 +4,7 @@
 mod async_db;
 mod async_writer;
 mod db;
+mod ldx;
 mod prefetch;
 mod reader;
 mod writer;
@@ -34,8 +35,14 @@ struct Args {
     /// stdin (needs --format; --start/--seek can only skip forward there)
     infile: String,
     /// Base name for the output .tbc and .tbc.json files; "-" streams the
-    /// .tbc picture to stdout (sidecar outputs are then disabled)
+    /// .tbc picture to stdout (sidecar outputs are then disabled). A name
+    /// ending in .ldx (or --ldx) writes one LDX file instead
     outfile: String,
+    /// Write an LDX container (ld-decode-tools): <outfile>.ldx holding the
+    /// TBC, its metadata, the analog audio and the EFM as tracks; with "-",
+    /// an LDX stream on stdout that carries all of them
+    #[arg(long)]
+    ldx: bool,
     /// Input sample format; default: inferred from the file extension
     #[arg(long, value_enum)]
     format: Option<reader::SampleFormat>,
@@ -164,11 +171,19 @@ fn main() -> Result<()> {
     // Mirror the terminal output into `<outfile>.log` (like the reference
     // ld-decode). Opened before the tracing subscriber so every line of the
     // run lands in the file; a failure only disables file logging.
-    let outfile = args.outfile.clone();
     // `-` means the picture goes to stdout: no `<outfile>.*` sidecars exist
     // then, and the console log has to go to stderr so it cannot interleave
     // with the binary picture bytes on stdout.
-    let to_stdout = outfile == "-";
+    let to_stdout = args.outfile == "-";
+    // LDX output: everything in one container (a `.ldx` file, or an LDX
+    // stream on stdout) instead of the separate files.
+    let ldx_mode = args.ldx || args.outfile.to_ascii_lowercase().ends_with(".ldx");
+    // Base name of the outputs: `<outfile>` without its `.ldx`.
+    let outfile = if ldx_mode && !to_stdout && args.outfile.to_ascii_lowercase().ends_with(".ldx") {
+        args.outfile[..args.outfile.len() - 4].to_string()
+    } else {
+        args.outfile.clone()
+    };
     if !to_stdout {
         if let Err(e) = ld_decode::logging::install(std::path::Path::new(&format!("{outfile}.log"))) {
             eprintln!("WARN: cannot create log file {outfile}.log: {e:#}");
@@ -183,9 +198,15 @@ fn main() -> Result<()> {
         .with_target(false);
     if to_stdout {
         fmt.with_writer(std::io::stderr).init();
-        ld_decode::teeprintln!(
-            "NOTE: outfile is \"-\": streaming the .tbc picture to stdout; .tbc.json/.pcm/.efm/.tbc.db and .log are disabled"
-        );
+        if ldx_mode {
+            ld_decode::teeprintln!(
+                "NOTE: outfile is \"-\": streaming an LDX stream (tbc, metadata, pcm, efm) to stdout; .tbc.db and .log are disabled"
+            );
+        } else {
+            ld_decode::teeprintln!(
+                "NOTE: outfile is \"-\": streaming the .tbc picture to stdout; .tbc.json/.pcm/.efm/.tbc.db and .log are disabled"
+            );
+        }
     } else {
         fmt.with_writer(tracing_subscriber::fmt::writer::Tee::new(
             std::io::stdout,
@@ -261,19 +282,48 @@ fn main() -> Result<()> {
 
     let mut reader = DecodeReader::new(input.source);
 
-    let outfile = args.outfile.clone();
-    let luma: Box<dyn std::io::Write + Send> = if to_stdout {
-        Box::new(std::io::stdout())
+    // In LDX mode the container replaces every sidecar file.
+    let separate = !ldx_mode;
+    let ldx_output = if ldx_mode {
+        let writer = if to_stdout {
+            ldx::LdxWriter::stream(Box::new(std::io::BufWriter::with_capacity(8 << 20, std::io::stdout())))
+        } else {
+            ldx::LdxWriter::create(std::path::Path::new(&format!("{outfile}.ldx")))?
+        };
+        let name = if args.infile == "-" {
+            "stdin".to_string()
+        } else {
+            std::path::Path::new(&args.infile)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| args.infile.clone())
+        };
+        Some(ldx::LdxOutput::new(
+            writer,
+            ldx::LdxOutputConfig {
+                name,
+                pcm: !args.disable_analog_audio,
+                efm: !args.no_efm,
+                history: ldx::history(&format!("decoded {} at {} MHz", args.infile, inputfreq)),
+            },
+        ))
     } else {
-        Box::new(
+        None
+    };
+    let luma: Option<Box<dyn std::io::Write + Send>> = if !separate {
+        None
+    } else if to_stdout {
+        Some(Box::new(std::io::stdout()))
+    } else {
+        Some(Box::new(
             File::create(format!("{outfile}.tbc"))
                 .with_context(|| format!("creating {outfile}.tbc"))?,
-        )
+        ))
     };
     // Opened read+write: `File::create` alone is write-only on Windows, and
     // the writer re-reads the fields array at close time to prepend the JSON
     // header (os error 5 otherwise).
-    let json = if to_stdout {
+    let json = if to_stdout || !separate {
         None
     } else {
         Some(
@@ -286,7 +336,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("creating {outfile}.tbc.json"))?,
         )
     };
-    let audio = if args.disable_analog_audio || to_stdout {
+    let audio = if args.disable_analog_audio || to_stdout || !separate {
         None
     } else {
         Some(
@@ -294,7 +344,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("creating {outfile}.pcm"))?,
         )
     };
-    let efm = if args.no_efm || to_stdout {
+    let efm = if args.no_efm || to_stdout || !separate {
         None
     } else {
         Some(
@@ -307,7 +357,7 @@ fn main() -> Result<()> {
     });
     // SQLite metadata sidecar, created fresh every run (like the reference,
     // which unlinks any pre-existing `<out>.tbc.db`).
-    let db = if to_stdout {
+    let db = if to_stdout || !separate {
         None
     } else {
         Some(async_db::AsyncDbWriter::create(std::path::Path::new(
@@ -324,6 +374,7 @@ fn main() -> Result<()> {
         pre_efm,
         json,
         db,
+        ldx_output,
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
@@ -373,7 +424,7 @@ fn main() -> Result<()> {
     let max_frames = args.length;
     let seekable = reader.is_seekable();
     let wrote_fields = decode_all(&mut reader, &mut writer, spec, decoder, max_frames, start_base, seekable)?;
-    if !to_stdout && !wrote_fields {
+    if !to_stdout && !ldx_mode && !wrote_fields {
         // Python 7.4.0 leaves no `.tbc.json` at all on a decode that handles
         // no frames -- its JSONDumper never receives a snapshot and `_enqueue`
         // drops the `None` -- while this writer creates the placeholder

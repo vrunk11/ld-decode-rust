@@ -99,6 +99,7 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--lowband` | off | Lower-bandwidth (lowband) decode settings. |
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
+| `--ldx` | off (on for an `OUTFILE` ending in `.ldx`) | Write one [LDX container](#ldx-output) instead of the separate files; with `-`, an LDX stream on stdout. |
 
 ## Input formats
 
@@ -127,6 +128,25 @@ required for stdin (`INFILE` = `-`).
 | `<out>.efm` | EFM (digital audio) samples; `efmTValues` land in the JSON. |
 | `<out>.tbc.db` | SQLite copy of the field metadata. Row-identical to Python's, **not** byte-identical: WAL mode and a different SQLite build change the page layout on purpose. |
 | `<out>.log` | Everything the run printed, including per-field timings when asked. |
+
+### LDX output
+
+With `--ldx`, or an `OUTFILE` ending in `.ldx`, the decode is written as one
+[LDX](https://github.com/vrunk11/ld-decode-tools/blob/feature/container-format/docs/Specifications/container-format.md)
+file (`<out>.ldx`, plus `<out>.log`) for ld-decode-tools, in place of the
+separate files. It is a Matroska file (profile 1) with raw tracks:
+
+| Track | Kind | Content |
+| --- | --- | --- |
+| 1 | `tbc` | One field per block: the bytes of the `.tbc`. |
+| 2 | `metadata` | ld-decode JSON: the parameters first, each field's entry just before its video, and at the end the whole set, identical to the `.tbc.json`. |
+| 3 | `pcm` | The analog audio (44.1 kHz stereo), unless `--disable-analog-audio`. |
+| 3 or 4 | `efm` | The EFM t-values in 64 KiB chunks, unless `--no-efm`. |
+
+With `OUTFILE` `-` the same tracks go to stdout as an LDX stream (no size, no
+cues), so the whole decode, audio and EFM included, can feed the next tool:
+`ld-decode capture.flac - --ldx | ld-analyse -`. The `.tbc.db` is not written in
+LDX mode. Tracks are raw; `ld-container recompress` turns a file into FLAC.
 
 ## Verifying parity
 
