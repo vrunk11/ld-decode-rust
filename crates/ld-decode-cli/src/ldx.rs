@@ -37,6 +37,9 @@ const BYTE_CHUNK: usize = 65536;
 /// The audio sampling frequency of a raw sample track: a stand-in, the real
 /// rate is in the track's parameters.
 const STAND_IN_RATE: f64 = 48000.0;
+/// `ColourSpace` of a raw `tbc` track: the FourCC `Y1\0\x10` (16-bit little-
+/// endian grey), which ffmpeg (so ffplay, mpv...) reads as `gray16le`.
+const GREY16_FOURCC: [u8; 4] = [b'Y', b'1', 0, 16];
 /// The analogue audio rate of the `.pcm` output.
 const PCM_RATE: i128 = 44100;
 const APP: &str = "ld-decode-tools ldx";
@@ -69,6 +72,11 @@ mod id {
     pub const SAMPLING_FREQUENCY: u32 = 0xB5;
     pub const CHANNELS: u32 = 0x9F;
     pub const BIT_DEPTH: u32 = 0x6264;
+    pub const DEFAULT_DURATION: u32 = 0x23_E383;
+    pub const VIDEO: u32 = 0xE0;
+    pub const PIXEL_WIDTH: u32 = 0xB0;
+    pub const PIXEL_HEIGHT: u32 = 0xBA;
+    pub const COLOUR_SPACE: u32 = 0x2E_B524;
     pub const VOID: u32 = 0xEC;
     pub const TAGS: u32 = 0x1254_C367;
     pub const TAG: u32 = 0x7373;
@@ -348,9 +356,33 @@ fn track_entry(track: &Track) -> Vec<u8> {
     if !track.name.is_empty() {
         children.push(string(id::TRACK_NAME, &track.name));
     }
+    // A raw tbc track is real video: 16-bit grey frames of fieldWidth x
+    // fieldHeight (a field per block), `V_UNCOMPRESSED`, so that a player opens
+    // it. No CodecPrivate: the description is in the track's tag, as for FLAC.
+    if track.kind == Kind::Tbc && !flac {
+        let dimension = |name: &str| track.parameters.get(name).and_then(Value::as_u64).unwrap_or(0);
+        let ntsc_or_pal_ns = if track.parameters.get("system").and_then(Value::as_str) == Some("PAL") {
+            20_000_000
+        } else {
+            16_683_333
+        };
+        children.push(uint(id::DEFAULT_DURATION, ntsc_or_pal_ns));
+        children.push(uint(id::TRACK_TYPE, 1));
+        children.push(string(id::CODEC_ID, "V_UNCOMPRESSED"));
+        children.push(master(
+            id::VIDEO,
+            &[
+                uint(id::PIXEL_WIDTH, dimension("fieldWidth")),
+                uint(id::PIXEL_HEIGHT, dimension("fieldHeight")),
+                // The FourCC of 16-bit little-endian grey: 'Y','1',0,16.
+                element(id::COLOUR_SPACE, &GREY16_FOURCC),
+            ],
+        ));
+        return master(id::TRACK_ENTRY, &children);
+    }
     match track.kind {
         Kind::Tbc | Kind::Pcm => {
-            // Raw samples ride in an audio track (ffmpeg keeps 16-bit PCM in
+            // FLAC and PCM ride in an audio track (ffmpeg keeps 16-bit PCM in
             // Matroska bit for bit).
             let channels = if track.kind == Kind::Pcm { 2 } else { 1 };
             children.push(uint(id::TRACK_TYPE, 2));
@@ -1181,6 +1213,9 @@ mod tests {
         assert!(text.contains(r#""namespace":"ldx.tbcmetadata""#));
         assert!(text.contains("D_LDX/EFM"));
         assert!(text.contains("A_PCM/INT/LIT"));
+        // The raw video track is video: V_UNCOMPRESSED with the grey16 FourCC.
+        assert!(text.contains("V_UNCOMPRESSED"));
+        assert!(b.windows(8).any(|w| w == [id_bytes(id::COLOUR_SPACE), vec![0x84], GREY16_FOURCC.to_vec()].concat().as_slice()));
     }
 
     /// Decode the frames of one FLAC unit with claxon, given the track's

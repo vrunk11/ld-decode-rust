@@ -149,7 +149,12 @@ cues), so the whole decode, audio and EFM included, can feed the next tool:
 `ld-decode capture.flac - --ldx | ld-analyse -`. The `.tbc.db` is not written in
 LDX mode.
 
-The `tbc` and `pcm` tracks are raw by default. `--ldx-codec flac` (or `auto`)
+The `tbc` and `pcm` tracks are raw by default. A raw `tbc` track is declared as
+real video, `V_UNCOMPRESSED`, 16-bit grey (`ColourSpace` = the FourCC
+`Y1\0\x10`, 910x263 per field, `DefaultDuration` of a field), so ffmpeg-based
+players (ffplay, mpv) open and show it; the blocks are the same bytes as the
+`.tbc`, so a reader treats it like raw audio. VLC does not know that grey-16
+FourCC. `--ldx-codec flac` (or `auto`)
 writes them as FLAC the way the specification describes (section 6.1): frames of
 32,768 samples, EBML-laced, at most 8 to a unit (a 910x263 field is 7 frames and
 a short one), each unit coded by an encoder of its own so a block decodes alone,
