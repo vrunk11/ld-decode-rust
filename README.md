@@ -156,7 +156,7 @@ players (ffplay, mpv) open and show it; the blocks are the same bytes as the
 `.tbc`, so a reader treats it like raw audio. VLC does not know that grey-16
 FourCC. `--ldx-codec flac` (or `auto`)
 writes them as FLAC the way the specification describes (section 6.1): frames of
-32,768 samples, EBML-laced, at most 8 to a unit (a 910x263 field is 7 frames and
+32,767 samples (the encoder's cap; the specification says 32,768 and a decoder reads any size), EBML-laced, at most 8 to a unit (a 910x263 field is 7 frames and
 a short one), each unit coded by an encoder of its own so a block decodes alone,
 the top bit of the unsigned TBC samples flipped before coding, and the stand-in
 48 kHz rate. The metadata and EFM tracks are always raw. FFV1 is only for the

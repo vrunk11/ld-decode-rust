@@ -231,7 +231,8 @@ impl CodecChoice {
     }
 }
 
-/// FLAC as LDX carries it (section 6.1): frames of 32,768 samples, at most 8 to
+/// FLAC as LDX carries it (section 6.1): frames of 32,767 samples (32,768 in the text; the encoder, flacenc, caps a
+/// block at 32,767 and a decoder reads any size), at most 8 to
 /// a unit, each unit coded by an encoder of its own (so a block decodes alone),
 /// the stand-in rate of 48 kHz, 16-bit samples.
 mod flac {
@@ -239,7 +240,7 @@ mod flac {
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
 
-    pub const FRAME: usize = 32_768;
+    pub const FRAME: usize = 32_767;
     const MAX_FRAMES: usize = 8;
     const RATE: usize = 48_000;
 
@@ -279,7 +280,7 @@ mod flac {
     /// The `CodecPrivate` of a FLAC track: `fLaC` and the STREAMINFO block
     /// (marked the last metadata block), from an encoder of the track's shape.
     /// Encoded from a full frame and a short one, so that the block sizes it
-    /// declares (16 to 32,768) cover the short last frame of every unit.
+    /// declares (16 to 32,767) cover the short last frame of every unit.
     pub fn codec_private(channels: usize) -> Result<Vec<u8>> {
         let stream = stream(&vec![0i32; (FRAME + 16) * channels], channels)?;
         let mut sink = flacenc::bitsink::ByteSink::new();
@@ -1242,7 +1243,7 @@ mod tests {
 
     #[test]
     fn flac_tracks_give_the_samples_back() {
-        // A field of a full NTSC TBC: 239,330 samples = 7 frames of 32,768 and
+        // A field of a full NTSC TBC: 239,330 samples = 7 frames of 32,767 and
         // one shorter, laced in one block.
         let luma: Vec<u16> = (0..910 * 263u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 16) as u16).collect();
         let shared = Shared::default();
