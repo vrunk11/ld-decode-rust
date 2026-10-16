@@ -43,6 +43,11 @@ struct Args {
     /// an LDX stream on stdout that carries all of them
     #[arg(long)]
     ldx: bool,
+    /// Codec of the LDX video (tbc) track, as its format allows: raw, flac,
+    /// or auto (= flac); ffv1 is for 10-bit cvbs and is refused for tbc. The
+    /// analog audio track follows it (raw or flac)
+    #[arg(long, value_enum, default_value_t = ldx::CodecChoice::Raw)]
+    ldx_codec: ldx::CodecChoice,
     /// Input sample format; default: inferred from the file extension
     #[arg(long, value_enum)]
     format: Option<reader::SampleFormat>,
@@ -304,6 +309,7 @@ fn main() -> Result<()> {
                 name,
                 pcm: !args.disable_analog_audio,
                 efm: !args.no_efm,
+                codec: args.ldx_codec.for_tbc()?,
                 history: ldx::history(&format!("decoded {} at {} MHz", args.infile, inputfreq)),
             },
         ))

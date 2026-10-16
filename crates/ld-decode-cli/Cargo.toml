@@ -18,5 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ld-decode = { path = "../ld-decode" }
 mimalloc = "0.1"
 claxon = "0.4"
+# FLAC encoder for the LDX tbc/pcm tracks (--ldx-codec flac)
+flacenc = "0.5"
 ogg = "0.9"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

@@ -100,6 +100,7 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
 | `--ldx` | off (on for an `OUTFILE` ending in `.ldx`) | Write one [LDX container](#ldx-output) instead of the separate files; with `-`, an LDX stream on stdout. |
+| `--ldx-codec <c>` | `raw` | Codec of the LDX video (`tbc`) track: `raw`, `flac`, or `auto` (= `flac`); the analog audio follows it. `ffv1` is for 10-bit CVBS and is refused for a `tbc` track. |
 
 ## Input formats
 
@@ -134,7 +135,7 @@ required for stdin (`INFILE` = `-`).
 With `--ldx`, or an `OUTFILE` ending in `.ldx`, the decode is written as one
 [LDX](https://github.com/vrunk11/ld-decode-tools/blob/feature/container-format/docs/Specifications/container-format.md)
 file (`<out>.ldx`, plus `<out>.log`) for ld-decode-tools, in place of the
-separate files. It is a Matroska file (profile 1) with raw tracks:
+separate files. It is a Matroska file (profile 1) with these tracks:
 
 | Track | Kind | Content |
 | --- | --- | --- |
@@ -146,7 +147,15 @@ separate files. It is a Matroska file (profile 1) with raw tracks:
 With `OUTFILE` `-` the same tracks go to stdout as an LDX stream (no size, no
 cues), so the whole decode, audio and EFM included, can feed the next tool:
 `ld-decode capture.flac - --ldx | ld-analyse -`. The `.tbc.db` is not written in
-LDX mode. Tracks are raw; `ld-container recompress` turns a file into FLAC.
+LDX mode.
+
+The `tbc` and `pcm` tracks are raw by default. `--ldx-codec flac` (or `auto`)
+writes them as FLAC the way the specification describes (section 6.1): frames of
+32,768 samples, EBML-laced, at most 8 to a unit (a 910x263 field is 7 frames and
+a short one), each unit coded by an encoder of its own so a block decodes alone,
+the top bit of the unsigned TBC samples flipped before coding, and the stand-in
+48 kHz rate. The metadata and EFM tracks are always raw. FFV1 is only for the
+10-bit frames of a `cvbs` track, which this decoder does not produce.
 
 ## Verifying parity
 
