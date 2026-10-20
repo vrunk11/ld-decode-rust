@@ -74,46 +74,7 @@ fn wr_cf(dir: &str, name: &str, v: &[C64]) {
 }
 
 #[test]
-#[ignore]
-fn atan2_cmp() {
-    // Compare std f64::atan2 vs the platform C library's atan2 (UCRT on
-    // Windows, libm elsewhere) on a sweep of arguments, dump divergences so the
-    // caller can inspect which implementation numpy matches.
-    use crate::spec::libm_atan2;
-    let mut ndiff = 0usize;
-    let mut first: Vec<(f64, f64, f64, f64)> = Vec::new();
-    let mut x = 0.001_f64;
-    let mut y = -0.002_f64;
-    let mut mag = 0.5_f64;
-    for i in 0..1_000_000 {
-        mag = (mag * 1.00001 + 0.001).fract(); // 0..1, drifts slowly
-        let m = 10f64.powf(mag * 16.0 - 8.0); // 1e-8 .. 1e8
-        x = (x * 1.0001 + 0.31).fract() * 2.0 - 1.0;
-        y = (y * 0.9999 + 0.17).fract() * 2.0 - 1.0;
-        x *= m;
-        y *= m;
-        let s = y.atan2(x);
-        let u = libm_atan2::call(y, x);
-        if s.to_bits() != u.to_bits() {
-            ndiff += 1;
-            if first.len() < 5 {
-                first.push((x, y, s, u));
-            }
-        }
-    }
-    let out = std::env::var("LD_PROBE_OUT").unwrap_or_default();
-    if !out.is_empty() {
-        let mut s = format!("std-vs-libm atan2: {ndiff}/1000000 differ\n");
-        for (x, y, a, b) in &first {
-            s.push_str(&format!("x={x} y={y} std={a:.17e} libm={b:.17e}\n"));
-        }
-        std::fs::write(std::path::PathBuf::from(out).join("atan2_cmp.txt"), s).unwrap();
-    }
-    panic!("atan2_cmp ndiff={ndiff}");
-}
-
-#[test]
-#[ignore]
+#[ignore = "needs LD_PROBE_* dumps of a block window and its filters"]
 fn probe_block() {
     let out = std::env::var("LD_PROBE_OUT").expect("LD_PROBE_OUT");
     let raw = rd_f64("LD_PROBE_RAW");
