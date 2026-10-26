@@ -68,6 +68,19 @@ Le décalage est une adresse de lecture dynamique : pour l'échantillon n de la 
 
 Critère d'acceptation : résiduel RMS d'alignement ≤ ~0,1 échantillon à 40 MHz (~2,5 ns).
 
+### Vérification VBI, source par source et frame par frame
+
+Avant tout suivi fin, chaque source est vérifiée **séparément** contre la primaire, frame par frame :
+
+1. **Table de la source :** pour chaque frame, numéro lu dans le VBI (CAV : numéro de frame ; CLV : timecode), position `fileLoc` de ses deux champs, parité de champ (`is_first_field`). Elle est construite par un balayage de la source seule avec `Decoder::scan_field`, qui renvoie déjà `frame_number` ; `FieldInfoEntry` porte aussi `file_loc`, `vbi` et `is_first_field`.
+2. **Contrôle :** pour chaque frame de la primaire, on retrouve la même frame dans la source et on vérifie que le numéro correspond, que les deux champs sont dans le bon ordre, et que la position est cohérente avec la frame précédente.
+3. **Résultat par frame :** `ok` (la source contribue), ou `non couverte` (frame absente, répétée ou sautée : skip de disque, arrêt sur image, pause), ou `douteuse` (VBI illisible).
+4. Seules les frames `ok` entrent dans l'estimateur ; les autres ont `g_i = 0`.
+
+Une lecture VBI ratée ne prouve pas un désaccord. Le numéro doit avancer de 1 par frame : un numéro isolé incohérent entre deux voisins cohérents est traité comme une erreur de lecture (la frame reste `ok` par interpolation), et un vrai saut de séquence est un skip. Un disque sans numéros lisibles (lead-in, lead-out, zones non codées) retombe sur la corrélation croisée sur fenêtre large, avec respect de la parité de champ.
+
+Cette vérification est faite une fois en amont (passe d'alignement), pas pendant la démodulation parallèle.
+
 ### Skips de disque
 
 Chaque source est découpée en segments de continuité (perte de corrélation, discontinuité du numéro de frame VBI). Au skip, la source passe à g_i = 0 puis est recalée sur la bonne position du disque (frame VBI, puis niveau 2). Sans VBI lisible : recherche par corrélation sur une fenêtre large, en respectant la parité de champ. Si c'est la primaire qui skippe, elle impose sa timeline comme dans un décodage normal.
