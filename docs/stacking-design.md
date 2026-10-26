@@ -159,6 +159,28 @@ Code : `scripts/stacking_spike/` (`sweep.py <cnr,cnr,...> <corrélation_jitter> 
 
 **Conséquence :** l'alignement est le facteur limitant, pas la forme de l'estimateur. Reste à tester, hors périmètre convenu pour l'instant : une combinaison cohérente avant discriminateur, qui améliore la porteuse elle-même avant la non-linéarité et pourrait battre la moyenne près du seuil FM.
 
+### Sur un vrai signal RF (`scripts/stacking_spike/real_spike.py`)
+
+Fichier : `RF_Reference_40mhz_protected_cut.ddd.s16` du ticket decode-orc #330 (s16 brut, 14,7 M d'échantillons à 40 MHz, NTSC, 19 champs décodés par `ld-decode`, wSNR moyen 37,5 dB, bPSNR 39,2 dB, VBI lisibles). Méthode : le signal réel est déformé dans le temps de façon différente pour chaque source (même modèle d'offset, pente, wobble et jitter que le synthétique), puis chaque source reçoit un bruit indépendant. La référence est l'original déformé **sans** bruit ajouté. Le bruit propre de la capture est commun à toutes les copies : seul le bruit ajouté peut être réduit, donc ce test mesure l'alignement et le comportement sur de vraies images, pas un gain de stacking absolu. Une seule capture, un seul tirage de déformation par ligne du tableau.
+
+Erreur contre l'original (RMS IRE, source seule → moyenne pondérée, qui est ≈ l'estimateur conjoint) :
+
+| Cas | source seule | délai vrai, fractionnaire | délai vrai, entier | tracker, fractionnaire | résiduel du tracker |
+| --- | --- | --- | --- | --- | --- |
+| 2 sources, +30 dB ajouté, jitter lent | 3,95 | 2,78 | 3,32 | 3,20 | 0,26 smp |
+| 2 sources, +25 dB | 7,03 | 4,93 | 5,28 | 5,36 | 0,34 smp |
+| 2 sources, +20 dB | 12,52 | 8,77 | 9,03 | 9,65 | 0,64 smp |
+| 3 sources, +30 dB | 3,96 | 2,29 | 2,86 | 2,91 | 0,26-0,27 smp |
+| 2 sources, +30 dB, autre segment | 3,99 | 2,84 | **4,13** | 3,90 | 0,26 smp |
+| 2 sources, +30 dB, **jitter rapide** | 3,94 | 2,78 | 3,53 | **8,26** | 1,40 smp |
+
+- Avec un alignement parfait en mode fractionnaire, le gain est celui de la théorie : −3,0 dB à 2 sources, −4,8 dB à 3.
+- **Le mode entier est nettement insuffisant sur du vrai contenu** : il perd 0,5 à 0,6 IRE à 30 dB et peut être **pire que la source seule** (4,13 contre 3,99). Le mode fractionnaire est indispensable.
+- **Un jitter rapide fait échouer le tracker** (1,4 échantillon de résiduel) et le résultat empilé devient **bien pire que la source seule** (8,26 contre 3,94). Il faut donc une garde : pondérer chaque source par la confiance de son alignement local (par exemple la corrélation entre la primaire et la source recalée), de façon qu'un alignement douteux ramène son poids vers 0 au lieu de dégrader l'image. Cette garde n'est pas encore implémentée ni testée.
+- L'estimateur conjoint reste à égalité avec la moyenne pondérée, très légèrement moins bon en RMS (par exemple 2,29 contre 2,30 à 3 sources, 8,77 contre 8,80 à 20 dB), et aucun clic n'apparaît à ces CNR.
+
+Pas encore fait : le ré-encodage d'un `.tbc` décodé en FM avec une time-base déformée (vérité exacte sur du contenu réel). Il demande une pre-emphasis cohérente avec la de-emphasis du décodeur.
+
 ## Plan
 
 1. **Spike go/no-go :** paire synthétique à partir d'une capture (offset, pente ~20 ppm, wow, jitter à l'échelle de la ligne, bruit indépendant à fort niveau pour provoquer des clics, gain et fréquence d'échantillonnage différents, un skip). Mesurer (a) le résiduel d'alignement selon la fenêtre, la variante A/B et le mode entier/fractionnaire, (b) le nombre de clics résiduels et le SNR de l'estimateur conjoint contre la baseline.
