@@ -26,10 +26,10 @@ Pour la source i, à l'échantillon aligné k = n + m_i(n) (m_i : décalage enti
 
 1. **Vraisemblance.** `L(Δ) = Σ_i g_i(n) · Re(p̂_i(n) · e^{−jΔ})`, avec `p̂_i = p_i/|p_i|` et `g_i(n)` la fiabilité locale de la source, approximativement `Â_i/σ_i²`, réduite quand l'enveloppe instantanée `|z_i|` passe sous `Â_i` (précurseur de clic). `g_i = 0` si la source est en dropout, en skip de disque ou hors couverture. La forme exacte de `g_i` est à fixer au spike.
 2. **Estimation.** `Δ̂ = arg Σ_i g_i · p̂_i`, puis `f̂ = Δ̂·fs/2π` (mêmes conventions que `unwrap_hilbert_into` : Δ ramené dans [0, 2π)).
-3. **Décision.** Pour chaque source, on mesure le résidu `|arg(p_i · e^{−jΔ̂})|` contre la dispersion attendue. Une source nettement en désaccord (clic suspect) est écartée (g_i = 0) et l'estimation est recalculée.
+3. **Accumulation robuste.** Les sources n'ont jamais à être choisies : chacune ajoute sa preuve à `L(Δ)`, pondérée en continu. Pour chaque source on mesure le résidu `r_i = |arg(p_i · e^{−jΔ̂})|` contre la dispersion attendue, et son poids est réduit en douceur quand le résidu grandit (pondération robuste type Cauchy/Huber, itérée 1 à 2 fois). Une source en désaccord (clic suspect) pèse moins, sans disparaître ; aucune source n'est éliminée ni sélectionnée.
 4. **A priori.** Si aucune source n'est fiable à cet échantillon, `f̂(n)` est deviné par continuité à partir des échantillons voisins fiables, borné comme le noyau actuel ([1,5 MHz ; 0,75·`freq_hz`]).
 
-Remarque : dans les zones propres, où toutes les sources s'accordent, l'estimateur du maximum de vraisemblance est mathématiquement une pondération par l'inverse de la variance ; c'est optimal et on ne peut pas faire mieux (gain ≤ 10·log₁₀(N) dB). L'intérêt de l'approche est dans les zones douteuses, où l'on **décide** entre hypothèses (étapes 3 et 4) au lieu de moyenner.
+Remarque : dans les zones propres, où toutes les sources s'accordent, l'estimateur du maximum de vraisemblance est mathématiquement une pondération par l'inverse de la variance ; c'est optimal et on ne peut pas faire mieux (gain ≤ 10·log₁₀(N) dB). L'intérêt de l'approche est dans les zones douteuses, où la preuve de chaque source est pondérée par sa fiabilité locale et par son accord avec les autres (étapes 3 et 4), au lieu d'une moyenne à poids fixes. Le seul cas binaire est `g_i = 0` hors couverture, en skip de disque ou en dropout franc.
 
 ## Insertion dans le code
 
