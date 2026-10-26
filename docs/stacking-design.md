@@ -133,6 +133,32 @@ Mémoire en O(N) ; l'étage A coûte N×, le discriminateur et l'étage B 1×.
 - **Audio et EFM :** pris sur la primaire tant que leur phase n'est pas implémentée (voir [Audio analogique et EFM](#audio-analogique-et-efm)). Avec une seule entrée, leurs chemins actuels restent inchangés.
 - **Mesure :** `VitsMetrics` existe déjà ; on compare une source seule, le stack TBC actuel, une moyenne de fréquences en sortie (baseline) et l'estimateur conjoint, y compris le nombre de clics FM résiduels.
 
+## Résultats du spike (prototype numpy, signal synthétique)
+
+Code : `scripts/stacking_spike/` (`sweep.py <cnr,cnr,...> <corrélation_jitter> [seed]`). Signal FM NTSC synthétique à 40 MHz, une capture par source avec son propre offset, sa pente (±20 ppm × i), son wobble à ~30 Hz (3 et 4 µs), son jitter (30 ns RMS) et son bruit blanc gaussien. Erreur = RMS en IRE après un passe-bas de 4,2 MHz, contre la fréquence vraie. **Un seul tirage, bruit gaussien idéal, images aléatoires : ce n'est pas du vrai LaserDisc, et le code du dépôt n'a pas été exécuté.** Le prototype n'est pas le code Rust.
+
+**Gain avec alignement parfait (délai vrai connu).** 25 dB de CNR : 6,77 IRE pour une source, 4,76 pour deux (2,9 dB), 3,90 pour trois (4,8 dB). C'est le gain théorique 10·log₁₀(N).
+
+**Sensibilité à l'erreur d'alignement (erreur lisse injectée sur le vrai délai, 2 sources) :**
+
+| CNR | erreur 0 | 0,25 smp | 0,5 smp | 1,0 smp | source seule |
+| --- | --- | --- | --- | --- | --- |
+| 25 dB | 4,76 | 4,80 | 4,91 | 5,31 | 6,77 |
+| 35 dB | 1,57 | 1,68 | 1,98 | 2,83 | 2,18 |
+
+À 35 dB, une erreur de 0,5 échantillon fait perdre ~70 % du gain, et 1 échantillon est **pire que sans stacking**. Le critère de 0,1 échantillon est justifié ; viser au plus 0,25.
+
+**Précision du suiveur de délai testé** (corrélation croisée normalisée sur le signal démodulé passe-bas, coarse-to-fine, niveaux 16384 puis 2048 échantillons, lissage) : résiduel RMS de 0,25 échantillon à 35 dB, 0,52 à 25 dB, ~2,5-3 à 12-14 dB (le bruit dégrade la corrélation). Avec un jitter plus rapide que la ligne (corrélé sur ~8 µs), 1,4 échantillon à 25 dB. À 35 dB le suiveur conserve ~76 % du gain (1,69 contre 1,57 optimal). **Il n'atteint donc pas le critère de 0,1 et reste le principal point faible.**
+
+- Des fenêtres de 1024 échantillons ou moins ne contiennent pas assez d'image pour corréler.
+- Un affinage par retard de groupe sur le spectre croisé des signaux analytiques a été essayé et **ne fonctionne pas** : même sur un test propre à décalage connu l'erreur reste de 0,7 à 1,3 échantillon, et il est inobservable dans les zones où la porteuse est quasi pure. Retiré du prototype. Pistes non testées : alignement par les fronts de sync de chaque source, ou corrélation sur un signal moins filtré.
+
+**Estimateur conjoint contre moyenne pondérée par 1/σ² (baseline) : aucun avantage mesuré en RMS.** Pour les trois CNR testés (25, 14 et 12 dB) les deux sont à moins de 1 % l'un de l'autre, la moyenne pondérée étant très légèrement meilleure (17,0 contre 16,9 à 14 dB). Le seul écart visible est le nombre de clics FM résiduels, dans un premier run à 12 dB et 2 sources : 44-59 pour la moyenne contre 10-16 pour l'estimateur conjoint (source seule : 1994) ; à 3 sources il n'y en a plus aucun. La pondération robuste n'apporte rien de mesurable, et la médiane (N = 3) est moins bonne que la moyenne. Ces résultats viennent d'un unique tirage et des approximations de poids décrites plus haut, donc ils ne tranchent pas.
+
+**Autres constats :** le mode entier coûte 0,09 IRE à 25 dB (4,85 contre 4,76) et 0,14 à 35 dB (1,71 contre 1,57), ce qui plaide pour le fractionnaire. La correction de cadence locale `exp(j·Δ0·τ')` (différence de vitesse de lecture entre sources) apporte peu dans ce modèle (0,02 IRE).
+
+**Conséquence :** l'alignement est le facteur limitant, pas la forme de l'estimateur. Reste à tester, hors périmètre convenu pour l'instant : une combinaison cohérente avant discriminateur, qui améliore la porteuse elle-même avant la non-linéarité et pourrait battre la moyenne près du seuil FM.
+
 ## Plan
 
 1. **Spike go/no-go :** paire synthétique à partir d'une capture (offset, pente ~20 ppm, wow, jitter à l'échelle de la ligne, bruit indépendant à fort niveau pour provoquer des clics, gain et fréquence d'échantillonnage différents, un skip). Mesurer (a) le résiduel d'alignement selon la fenêtre, la variante A/B et le mode entier/fractionnaire, (b) le nombre de clics résiduels et le SNR de l'estimateur conjoint contre la baseline.
