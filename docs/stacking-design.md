@@ -85,9 +85,32 @@ Cette vérification est faite une fois en amont (passe d'alignement), pas pendan
 
 Chaque source est découpée en segments de continuité (perte de corrélation, discontinuité du numéro de frame VBI). Au skip, la source passe à g_i = 0 puis est recalée sur la bonne position du disque (frame VBI, puis niveau 2). Sans VBI lisible : recherche par corrélation sur une fenêtre large, en respectant la parité de champ. Si c'est la primaire qui skippe, elle impose sa timeline comme dans un décodage normal.
 
+## Audio analogique et EFM
+
+Ces deux sorties sortent du même noyau (`demod_block_cpu`) à partir du **même** spectre `indata` que la vidéo, donc l'étage A par source les fournit presque gratuitement.
+
+### Audio analogique (même estimateur, phase 1)
+
+Dans le noyau, chaque canal (gauche, droite) est une démodulation FM : tranche du spectre autour de la porteuse audio, multipliée par `filt1`, `ifft` vers un signal analytique décimé `a1` (cadence `a1_freq`, décimation `audio_fdiv`), puis `unwrap_hilbert(a1) + low_freq`. C'est exactement la structure vidéo, à cadence plus basse. L'estimateur conjoint s'applique tel quel : `p_i = a1_i(k)·conj(a1_i(k−1))`, accumulation pondérée par la fiabilité de chaque source, un seul `atan2`.
+
+- **Alignement :** le signal audio ne dépasse pas ~20 kHz, donc il tolère très bien l'erreur de délai (un décalage de l'ordre de l'échantillon décimé est négligeable). Le décalage entier dynamique `m_i(n)`, ramené à la cadence décimée, suffit.
+- **Coût :** deux petites `ifft` par source et par canal, déjà présentes ; un `atan2` par échantillon décimé.
+- **En aval :** l'étage 2 (`audio.rs` : filtre, de-emphasis, suppression des pics par `findpeaks`, rééchantillonnage vers le `.pcm`) reste inchangé et reçoit un étage 1 plus propre.
+
+### EFM (phase 2, plus délicat)
+
+L'EFM est `ifft(indata · Fefm).real`, un signal **linéaire** (une forme d'onde réelle, pas de FM), écrêté en i16, puis `efm_pll.rs` en détecte les passages à zéro (interpolation sous-échantillon) pour produire les T-values. Seule la **position temporelle** des passages à zéro porte l'information.
+
+- **Accumulation :** somme pondérée des formes d'onde alignées, `ê = Σ g_i·e_i / Σ g_i`, faite **avant** l'écrêtage i16 et la détection des passages à zéro. C'est l'estimateur optimal pour un bruit gaussien indépendant.
+- **Alignement exigeant :** une erreur de délai se convertit directement en gigue des passages à zéro, donc le mode fractionnaire est probablement nécessaire ici (à valider).
+- **Calibration par source :** gain, décalage continu, et surtout réponse différente d'un lecteur à l'autre. Il faut sans doute une égalisation adaptative (petit filtre FIR ajusté par LMS contre la primaire) avant la somme.
+- **Polarité et asymétrie :** à vérifier par source ; un décalage de niveau déplace les passages à zéro.
+
+C'est pourquoi l'EFM vient après la vidéo et l'audio.
+
 ## Rôle de la primaire
 
-Elle fournit la grille temporelle, l'EFM et l'audio. Dans l'estimateur elle est traitée comme les autres sources (même pondération par fiabilité). Choix automatique par meilleur SNR mesuré sur un pré-passage court (quelques centaines de champs) ; `--stack-primary` pour forcer.
+Elle fournit la grille temporelle. Pour l'audio et l'EFM elle est aussi traitée comme les autres sources dès que leurs phases sont implémentées. Dans l'estimateur elle est traitée comme les autres sources (même pondération par fiabilité). Choix automatique par meilleur SNR mesuré sur un pré-passage court (quelques centaines de champs) ; `--stack-primary` pour forcer.
 
 ## Agnostique capture / lecteur
 
@@ -107,7 +130,7 @@ Mémoire en O(N) ; l'étage A coûte N×, le discriminateur et l'étage B 1×.
 ## Contraintes
 
 - **Parité préservée :** le chemin multi-source est opt-in (`--stack <fichier>`, répétable). Avec une seule entrée on garde le chemin actuel (`unwrap_hilbert_into`), donc des sorties byte-identiques aux références ; les tests de parité existants restent le garde-fou.
-- **EFM** (dépend de la phase RF) et **audio** : pris sur la primaire dans un premier temps.
+- **Audio et EFM :** pris sur la primaire tant que leur phase n'est pas implémentée (voir [Audio analogique et EFM](#audio-analogique-et-efm)). Avec une seule entrée, leurs chemins actuels restent inchangés.
 - **Mesure :** `VitsMetrics` existe déjà ; on compare une source seule, le stack TBC actuel, une moyenne de fréquences en sortie (baseline) et l'estimateur conjoint, y compris le nombre de clics FM résiduels.
 
 ## Plan
@@ -115,5 +138,7 @@ Mémoire en O(N) ; l'étage A coûte N×, le discriminateur et l'étage B 1×.
 1. **Spike go/no-go :** paire synthétique à partir d'une capture (offset, pente ~20 ppm, wow, jitter à l'échelle de la ligne, bruit indépendant à fort niveau pour provoquer des clics, gain et fréquence d'échantillonnage différents, un skip). Mesurer (a) le résiduel d'alignement selon la fenêtre, la variante A/B et le mode entier/fractionnaire, (b) le nombre de clics résiduels et le SNR de l'estimateur conjoint contre la baseline.
 2. Refactor étage A / discriminateur / étage B, avec parité N=1 vérifiée.
 3. Lecture multi-source et verrouillage grossier.
-4. Suiveur de délai, table τ, estimateur conjoint.
+4. Suiveur de délai, table τ, estimateur conjoint vidéo.
 5. Option CLI et comparaison du SNR avec le stack TBC.
+6. Audio analogique : même estimateur sur `a1`, validation sur le `.pcm`.
+7. EFM : accumulation de formes d'onde avec calibration/égalisation par source, validation par le taux d'erreurs de T-values.
