@@ -584,7 +584,11 @@ impl SampleSource for VirtualSource {
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         let n = (self.inner.len.saturating_sub(self.pos) as usize).min(out.len());
         if n > 0 {
+            let t0 = std::time::Instant::now();
             self.compute(self.pos, &mut out[..n])?;
+            if std::env::var_os("LD_TIMING").is_some() {
+                ld_decode::teeprintln!("STACK read at={} n={} us={}", self.pos, n, t0.elapsed().as_micros());
+            }
             self.pos += n as u64;
         }
         Ok(n)
