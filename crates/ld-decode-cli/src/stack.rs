@@ -418,6 +418,9 @@ struct Inner {
 pub struct VirtualSource {
     inner: Arc<Inner>,
     pos: u64,
+    /// Its own pool on every core: the global rayon pool is the decoder's
+    /// small tail pool (a quarter of the demod budget).
+    pool: rayon::ThreadPool,
 }
 
 impl VirtualSource {
@@ -441,14 +444,18 @@ impl VirtualSource {
             len as f64 / fs
         );
         let mix = [Mixer::new(DEMIX_LO_HZ, fs), Mixer::new(DEMIX_HI_HZ, fs)];
-        Ok(Self { inner: Arc::new(Inner { inputs, timeline, weight, fs, len, mix }), pos: 0 })
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
+        Ok(Self { inner: Arc::new(Inner { inputs, timeline, weight, fs, len, mix }), pos: 0, pool })
     }
 
     fn compute(&self, s0: u64, out: &mut [f32]) -> Result<()> {
         let inner = &self.inner;
-        out.par_chunks_mut(TASK)
-            .enumerate()
-            .try_for_each(|(c, chunk)| compute_task(inner, s0 + (c * TASK) as u64, chunk))
+        self.pool.install(|| {
+            out.par_chunks_mut(TASK)
+                .enumerate()
+                .try_for_each(|(c, chunk)| compute_task(inner, s0 + (c * TASK) as u64, chunk))
+        })
     }
 }
 
