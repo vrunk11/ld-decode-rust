@@ -6,6 +6,7 @@ mod async_writer;
 mod db;
 mod prefetch;
 mod reader;
+mod opencl;
 mod stack;
 mod writer;
 
@@ -52,6 +53,10 @@ struct Args {
     /// sources always use read.
     #[arg(long, value_enum)]
     tbc: Option<TbcMode>,
+    /// Where the read-time TBC / stack computes the corrected RF: `cpu`, or
+    /// `opencl` (a GPU, through the OpenCL runtime of its driver).
+    #[arg(long, value_enum, default_value = "cpu")]
+    stack_device: StackDevice,
     /// Input sample format; default: inferred from the file extension
     #[arg(long, value_enum)]
     format: Option<reader::SampleFormat>,
@@ -113,6 +118,12 @@ struct Args {
 enum TbcMode {
     Read,
     Resample,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum StackDevice {
+    Cpu,
+    Opencl,
 }
 
 /// Default demod thread count: half the logical cores (8 on a 16-thread box,
@@ -296,7 +307,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq)?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.stack_device)?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -499,6 +510,7 @@ fn read_tbc_source(
     spec: &Arc<DecoderSpec>,
     ntscj: bool,
     inputfreq: f64,
+    device: StackDevice,
 ) -> Result<stack::VirtualSource> {
     let mut stacked = Vec::with_capacity(inputs.len());
     for path in inputs {
@@ -521,7 +533,7 @@ fn read_tbc_source(
     }
     let fs = inputfreq * 1e6;
     // NTSC line: 286 lines per 4.5 MHz.
-    stack::VirtualSource::new(stacked, fs, fs * 286.0 / 4.5e6)
+    stack::VirtualSource::new(stacked, fs, fs * 286.0 / 4.5e6, device == StackDevice::Opencl)
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF

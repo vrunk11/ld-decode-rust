@@ -18,6 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ld-decode = { path = "../ld-decode" }
 mimalloc = "0.1"
 rayon = "1"
+libloading = "0.8"
 rustfft = "6"
 claxon = "0.4"
 ogg = "0.9"
