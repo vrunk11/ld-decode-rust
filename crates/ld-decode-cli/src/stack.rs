@@ -96,6 +96,21 @@ impl Pass0Collector {
     }
 
     pub fn finish(&mut self, _metadata: Option<DecoderMetadata>) {}
+
+    /// Text dump of the records (`LD_DUMP_PASS0`), exact to the bit.
+    pub fn dump(&self, path: &std::path::Path) -> Result<()> {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for f in &self.fields {
+            let _ = write!(s, "{} {:?}", f.first, f.code);
+            for l in &f.lines {
+                let _ = write!(s, " {:016x}", l.to_bits());
+            }
+            s.push('\n');
+        }
+        std::fs::write(path, s)?;
+        Ok(())
+    }
 }
 
 /// The VBI words that identify a frame: CAV picture numbers and CLV time codes

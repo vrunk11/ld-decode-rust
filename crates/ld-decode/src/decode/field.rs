@@ -1945,6 +1945,7 @@ impl Field {
         audio_offset: f64,
         side_pool: &rayon::ThreadPool,
         efm_pre: Option<&[i16]>,
+        rows: Option<&[usize]>,
     ) -> Result<Vec<f32>> {
         let sub = std::env::var_os("LD_SUBTIME").is_some();
         let t0 = std::time::Instant::now();
@@ -2007,7 +2008,8 @@ impl Field {
         // gather for no wall-time gain (the detector's result isn't needed
         // until `buildmetadata`, several stages later). One thread spawn per
         // field is ~40 us — far cheaper than the pool time it frees.
-        let dod = self.spec.do_dod && std::env::var_os("LD_NO_DOD_PRE").is_none();
+        // A partial picture (`rows`) is for calibration only: no dropouts.
+        let dod = self.spec.do_dod && rows.is_none() && std::env::var_os("LD_NO_DOD_PRE").is_none();
         let mut dropouts: Option<(Vec<usize>, Vec<usize>, Vec<usize>)> = None;
         std::thread::scope(|sc| {
             let dod_handle = if dod {
@@ -2032,6 +2034,7 @@ impl Field {
                     wow_level_adjust_smoothing: self.spec.wow_level_adjust_smoothing,
                     level_adjust_threshold: 15.0,
                 },
+                rows,
             );
             if let Some(handle) = dod_handle {
                 dropouts = Some(handle.join().expect("dropout detection panicked"));

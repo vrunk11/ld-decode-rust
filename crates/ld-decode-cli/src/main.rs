@@ -512,8 +512,8 @@ fn read_tbc_source(
     inputfreq: f64,
     device: StackDevice,
 ) -> Result<stack::VirtualSource> {
-    let mut stacked = Vec::with_capacity(inputs.len());
-    for path in inputs {
+    // Pass 0 of one input: its line positions and VBI codes.
+    let locate = |idx: usize, path: &str| -> Result<stack::StackInput> {
         let fmt = match format {
             Some(f) => f,
             None => reader::infer_format(path)?,
@@ -526,15 +526,48 @@ fn read_tbc_source(
         decoder.set_black_ire(if ntscj { 0.0 } else { 7.5 });
         decoder.set_analog_audio(0.0);
         decoder.set_digital_audio(false);
+        // Only the line positions and VBI codes are kept; LD_PASS0_FULL runs
+        // the complete decode instead (they are identical, for checking).
+        decoder.set_locate_only(std::env::var_os("LD_PASS0_FULL").is_none());
         let mut collector = stack::Pass0Collector::default();
         decode_all(&mut rd, &mut Sink::Collect(&mut collector), Arc::clone(spec), decoder, None, 0, seekable)?;
         tracing::info!("read-time TBC pass 0: {} fields in {path}", collector.fields.len());
-        stacked.push(stack::StackInput::new(path, fmt, collector.fields)?);
-    }
+        if let Some(dir) = std::env::var_os("LD_DUMP_PASS0") {
+            collector.dump(&std::path::Path::new(&dir).join(format!("pass0_{idx}.txt")))?;
+        }
+        stack::StackInput::new(path, fmt, collector.fields)
+    };
+    // Several inputs run at once: one decode leaves some of the machine idle
+    // between its demod batches (6 inputs: 109 s one at a time, 98 s all at
+    // once). The decoders are independent, so the records are the same.
+    let jobs = std::env::var("LD_PASS0_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(PASS0_JOBS)
+        .clamp(1, inputs.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<Option<Result<stack::StackInput>>> = (0..inputs.len()).map(|_| None).collect();
+    let results = std::sync::Mutex::new(&mut done);
+    std::thread::scope(|sc| {
+        for _ in 0..jobs {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= inputs.len() {
+                    return;
+                }
+                let r = locate(i, &inputs[i]);
+                results.lock().unwrap()[i] = Some(r);
+            });
+        }
+    });
+    let stacked = done.into_iter().map(|r| r.expect("every input was located")).collect::<Result<Vec<_>>>()?;
     let fs = inputfreq * 1e6;
     // NTSC line: 286 lines per 4.5 MHz.
     stack::VirtualSource::new(stacked, fs, fs * 286.0 / 4.5e6, device == StackDevice::Opencl)
 }
+
+/// Inputs located at once by pass 0 (`LD_PASS0_JOBS` overrides).
+const PASS0_JOBS: usize = 6;
 
 /// Samples of rewind retained below the decoder's earliest need. MTF
 /// calibration rewinds `fdoffset` by up to ~1 field before re-decoding, and

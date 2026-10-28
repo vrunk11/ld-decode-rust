@@ -575,6 +575,8 @@ pub struct Decoder {
     analog_audio_freq: f64,
     /// Whether to produce EFM (.efm) output.
     digital_audio: bool,
+    /// Output lines the TBC picture is limited to (see [`Decoder::set_locate_only`]).
+    locate_rows: Option<Vec<usize>>,
 }
 
 
@@ -693,6 +695,7 @@ impl Decoder {
             readlen,
             analog_audio_freq: 44100.0,
             digital_audio: true,
+            locate_rows: None,
         }
     }
 
@@ -704,6 +707,27 @@ impl Decoder {
     /// Enable/disable EFM output.
     pub fn set_digital_audio(&mut self, enabled: bool) {
         self.digital_audio = enabled;
+    }
+
+    /// Decode only what locating the lines and reading the VBI needs: the TBC
+    /// picture is resampled only on the VITS lines the MTF calibration reads
+    /// (so its decisions, and every field's line positions, stay identical),
+    /// and dropouts are not detected. The picture and metadata written are
+    /// then not a usable decode.
+    pub fn set_locate_only(&mut self, on: bool) {
+        self.locate_rows = on.then(|| {
+            let mut rows: Vec<usize> = self
+                .spec
+                .sys_ld_vits_whitelocs
+                .iter()
+                .map(|w| w[0])
+                .chain([self.spec.sys_blacksnr_slice[0]])
+                .map(|l| l - 1)
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            rows
+        });
     }
 
     /// Port of the `lastfieldwritten` analog-audio A/V sync offset: how far
@@ -884,6 +908,7 @@ impl Decoder {
                         audio_offset,
                         &self.side_pool,
                         efm_pre.as_ref().map(|v| v.as_slice()),
+                        self.locate_rows.as_deref(),
                     )?;
                     // downscale(final_=true) already encoded the luma into
                     // field.dspicture with the same levels; reuse it instead of
@@ -2023,7 +2048,7 @@ impl Decoder {
             ac3_symbols: 0,
         };
 
-        if self.spec.do_dod {
+        if self.spec.do_dod && self.locate_rows.is_none() {
             let t_dod0 = std::time::Instant::now();
             // Dropouts were already computed as a side task during downscale
             // (pure over the field's data); fall back to a synchronous call
