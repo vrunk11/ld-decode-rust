@@ -6,6 +6,7 @@ mod async_writer;
 mod db;
 mod prefetch;
 mod reader;
+mod stack;
 mod writer;
 
 use std::fs::File;
@@ -31,11 +32,26 @@ use writer::DecodeWriter;
 )]
 struct Args {
     /// Source file (.lds, .s16, .r16, .rf, .r30, .ldf, .flac); "-" reads
-    /// stdin (needs --format; --start/--seek can only skip forward there)
-    infile: String,
+    /// stdin (needs --format; --start/--seek can only skip forward there).
+    /// Alternatively give the sources with -i and the output with -o.
+    infile: Option<String>,
     /// Base name for the output .tbc and .tbc.json files; "-" streams the
     /// .tbc picture to stdout (sidecar outputs are then disabled)
-    outfile: String,
+    outfile: Option<String>,
+    /// Source file; repeat to stack several captures of the same disc (the
+    /// first one is the primary). Needs -o; not combined with the positional
+    /// form.
+    #[arg(short = 'i', long = "input")]
+    inputs: Vec<String>,
+    /// Output base name, with -i
+    #[arg(short = 'o', long = "output")]
+    output: Option<String>,
+    /// Time-base correction: `read` reads the RF at the corrected positions
+    /// before demodulation, `resample` resamples the demodulated video (the
+    /// reference decoder's way). Default: resample for one source; several
+    /// sources always use read.
+    #[arg(long, value_enum)]
+    tbc: Option<TbcMode>,
     /// Input sample format; default: inferred from the file extension
     #[arg(long, value_enum)]
     format: Option<reader::SampleFormat>,
@@ -91,6 +107,12 @@ struct Args {
     /// get a quarter of this; `LD_PF_POOL` overrides the split.
     #[arg(long, short = 't', default_value_t = default_threads())]
     threads: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum TbcMode {
+    Read,
+    Resample,
 }
 
 /// Default demod thread count: half the logical cores (8 on a 16-thread box,
@@ -165,10 +187,19 @@ fn main() -> Result<()> {
         Args::parse()
     };
 
+    let (inputs, outfile) = resolve_io(&args)?;
+    let tbc = match (args.tbc, inputs.len()) {
+        (Some(TbcMode::Resample), n) if n > 1 => {
+            anyhow::bail!("several inputs are stacked with read-time TBC; --tbc resample takes a single input")
+        }
+        (Some(m), _) => m,
+        (None, 1) => TbcMode::Resample,
+        (None, _) => TbcMode::Read,
+    };
+
     // Mirror the terminal output into `<outfile>.log` (like the reference
     // ld-decode). Opened before the tracing subscriber so every line of the
     // run lands in the file; a failure only disables file logging.
-    let outfile = args.outfile.clone();
     // `-` means the picture goes to stdout: no `<outfile>.*` sidecars exist
     // then, and the console log has to go to stderr so it cannot interleave
     // with the binary picture bytes on stdout.
@@ -202,9 +233,9 @@ fn main() -> Result<()> {
     // the input sample rate.
     let format = match args.format {
         Some(f) => f,
-        None => reader::infer_format(&args.infile)?,
+        None => reader::infer_format(&inputs[0])?,
     };
-    let input = reader::open_input(&args.infile, format)?;
+    let input = reader::open_input(&inputs[0], format)?;
     let inputfreq = match (args.inputfreq, input.container_rate_hz) {
         (Some(f), _) => f,
         (None, Some(hz)) => {
@@ -263,9 +294,12 @@ fn main() -> Result<()> {
         spec.output_lines()
     );
 
-    let mut reader = DecodeReader::new(input.source);
+    let source: Box<dyn reader::SampleSource> = match tbc {
+        TbcMode::Resample => input.source,
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq)?),
+    };
+    let mut reader = DecodeReader::new(source);
 
-    let outfile = args.outfile.clone();
     let luma: Box<dyn std::io::Write + Send> = if to_stdout {
         Box::new(std::io::stdout())
     } else {
@@ -393,7 +427,7 @@ fn main() -> Result<()> {
 
     let max_frames = args.length;
     let seekable = reader.is_seekable();
-    let wrote_fields = decode_all(&mut reader, &mut writer, spec, decoder, max_frames, start_base, seekable)?;
+    let wrote_fields = decode_all(&mut reader, &mut Sink::Writer(&mut writer), spec, decoder, max_frames, start_base, seekable)?;
     if !to_stdout && !wrote_fields {
         // Python 7.4.0 leaves no `.tbc.json` at all on a decode that handles
         // no frames -- its JSONDumper never receives a snapshot and `_enqueue`
@@ -405,6 +439,89 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The sources and output base name, from either `infile outfile` or
+/// `-i ... -o ...` (never both).
+fn resolve_io(args: &Args) -> Result<(Vec<String>, String)> {
+    if !args.inputs.is_empty() {
+        if args.infile.is_some() || args.outfile.is_some() {
+            anyhow::bail!("give the sources either positionally (infile outfile) or with -i/-o, not both");
+        }
+        let Some(o) = &args.output else {
+            anyhow::bail!("-i needs -o <output base name>");
+        };
+        return Ok((args.inputs.clone(), o.clone()));
+    }
+    if args.output.is_some() {
+        anyhow::bail!("-o goes with -i; the positional form is `ld-decode infile outfile`");
+    }
+    match (&args.infile, &args.outfile) {
+        (Some(i), Some(o)) => Ok((vec![i.clone()], o.clone())),
+        _ => anyhow::bail!("missing output: `ld-decode infile outfile`, or `-i infile -o outfile`"),
+    }
+}
+
+/// Where `decode_all` sends the decoded fields: the output files, or the
+/// read-time TBC pass 0, which only keeps each field's lines and frame code.
+enum Sink<'a> {
+    Writer(&'a mut async_writer::AsyncDecodeWriter),
+    Collect(&'a mut stack::Pass0Collector),
+}
+
+impl Sink<'_> {
+    fn write(&mut self, field: &ld_decode::WriteableField, metadata: Option<&ld_decode::DecoderMetadata>) -> Result<()> {
+        match self {
+            Sink::Writer(w) => w.write_writeable(field.clone(), metadata),
+            Sink::Collect(c) => {
+                c.put(field);
+                Ok(())
+            }
+        }
+    }
+
+    fn close(&mut self, metadata: Option<ld_decode::DecoderMetadata>) -> Result<()> {
+        match self {
+            Sink::Writer(w) => w.close(metadata),
+            Sink::Collect(c) => {
+                c.finish(metadata);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `--tbc read`: decode every input once (pass 0, no audio or EFM) to locate
+/// its lines, then serve the read-time corrected, combined RF stream.
+fn read_tbc_source(
+    inputs: &[String],
+    format: Option<reader::SampleFormat>,
+    spec: &Arc<DecoderSpec>,
+    ntscj: bool,
+    inputfreq: f64,
+) -> Result<stack::VirtualSource> {
+    let mut stacked = Vec::with_capacity(inputs.len());
+    for path in inputs {
+        let fmt = match format {
+            Some(f) => f,
+            None => reader::infer_format(path)?,
+        };
+        tracing::info!("read-time TBC pass 0: locating the lines of {path}");
+        let input = reader::open_input(path, fmt)?;
+        let mut rd = DecodeReader::new(input.source);
+        let seekable = rd.is_seekable();
+        let mut decoder = Decoder::new(Arc::clone(spec), 0);
+        decoder.set_black_ire(if ntscj { 0.0 } else { 7.5 });
+        decoder.set_analog_audio(0.0);
+        decoder.set_digital_audio(false);
+        let mut collector = stack::Pass0Collector::default();
+        decode_all(&mut rd, &mut Sink::Collect(&mut collector), Arc::clone(spec), decoder, None, 0, seekable)?;
+        tracing::info!("read-time TBC pass 0: {} fields in {path}", collector.fields.len());
+        stacked.push(stack::StackInput::new(path, fmt, collector.fields)?);
+    }
+    let fs = inputfreq * 1e6;
+    // NTSC line: 286 lines per 4.5 MHz.
+    stack::VirtualSource::new(stacked, fs, fs * 286.0 / 4.5e6)
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF
@@ -523,7 +640,7 @@ fn setup_start(
 
 fn decode_all(
     reader: &mut DecodeReader,
-    writer: &mut async_writer::AsyncDecodeWriter,
+    writer: &mut Sink,
     spec: Arc<DecoderSpec>,
     mut decoder: Decoder,
     max_frames: Option<u64>,
@@ -636,7 +753,7 @@ fn decode_all(
         let metadata = decoder.metadata();
         let t_w0 = std::time::Instant::now();
         for field in &fields {
-            writer.write_writeable(field.clone(), metadata.as_ref())?;
+            writer.write(field, metadata.as_ref())?;
         }
         if std::env::var_os("LD_TIMING").is_some() {
             ld_decode::teeprintln!("WRITE fields={} us={}", fields.len(), t_w0.elapsed().as_micros());
@@ -662,7 +779,7 @@ fn decode_all(
                 let (consumed, fields) = decoder.decode(&window[skip..], base, true)?;
                 let metadata = decoder.metadata();
                 for field in &fields {
-                    writer.write_writeable(field.clone(), metadata.as_ref())?;
+                    writer.write(field, metadata.as_ref())?;
                 }
                 fields_written += fields.len();
                 if decoder.lead_out() {
