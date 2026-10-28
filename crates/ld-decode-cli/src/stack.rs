@@ -31,9 +31,10 @@ use crate::reader::{SampleFormat, SampleSource};
 
 /// FFT length of one read of an input (the span its positions cover in one
 /// task, plus `PAD` on each side).
-const NFFT: usize = 1 << 19;
-/// Virtual samples produced per parallel task.
-const TASK: usize = 1 << 18;
+const NFFT: usize = 1 << 17;
+/// Virtual samples produced per parallel task. Small enough that one decoder
+/// read (~2M samples) splits into more tasks than there are cores.
+const TASK: usize = 1 << 16;
 /// Input samples kept on each side of a task's span, so the circular FFT's
 /// edge effects stay out of the samples that are read.
 const PAD: usize = 8192;
@@ -329,8 +330,25 @@ struct Bands {
     hi: Vec<Complex64>,
 }
 
+/// Carrier phasors of one band, tabulated so that neither the demix nor the
+/// remix calls sin/cos per sample: `down[n] = exp(-j w n)` over a read span,
+/// `frac[p] = exp(j w p / SINC_PHASES)` for the sinc's fractional phases.
+struct Mixer {
+    down: Vec<Complex64>,
+    frac: Vec<Complex64>,
+}
+
+impl Mixer {
+    fn new(hz: f64, fs: f64) -> Self {
+        let w = 2.0 * std::f64::consts::PI * hz / fs;
+        let down = (0..NFFT).map(|n| Complex64::from_polar(1.0, -w * n as f64)).collect();
+        let frac = (0..=SINC_PHASES).map(|p| Complex64::from_polar(1.0, w * p as f64 / SINC_PHASES as f64)).collect();
+        Self { down, frac }
+    }
+}
+
 impl Bands {
-    fn read(file: &RawFile, start: i64, fs: f64) -> Result<Self> {
+    fn read(file: &RawFile, start: i64, fs: f64, mix: &[Mixer; 2]) -> Result<Self> {
         let mut raw = vec![0f32; NFFT];
         file.read_at(start, &mut raw)?;
         let (fwd, inv) = fft_plans();
@@ -355,37 +373,35 @@ impl Bands {
         inv.process(&mut lo);
         inv.process(&mut hi);
         let scale = 1.0 / NFFT as f64;
-        demix(&mut lo, 2.0 * std::f64::consts::PI * DEMIX_LO_HZ / fs, scale);
-        demix(&mut hi, 2.0 * std::f64::consts::PI * DEMIX_HI_HZ / fs, scale);
+        demix(&mut lo, &mix[0], scale);
+        demix(&mut hi, &mix[1], scale);
         Ok(Self { start, lo, hi })
     }
 }
 
 /// `z[n] *= scale * exp(-j w n)` (n local to the span).
-fn demix(z: &mut [Complex64], w: f64, scale: f64) {
-    for (n, v) in z.iter_mut().enumerate() {
-        let ph = -w * n as f64;
-        *v *= Complex64::new(ph.cos(), ph.sin()) * scale;
+fn demix(z: &mut [Complex64], mix: &Mixer, scale: f64) {
+    for (v, d) in z.iter_mut().zip(&mix.down) {
+        *v *= *d * scale;
     }
 }
 
-/// Band-limited value of a demixed band at local position `q`, remixed.
-fn interp(zb: &[Complex64], q: f64, w: f64) -> Complex64 {
+/// Band-limited value of a demixed band at local position `q`, remixed. The
+/// remix uses the same 1/SINC_PHASES-quantized position as the sinc row, so
+/// the carrier phase and the interpolated envelope refer to one instant.
+fn interp(zb: &[Complex64], q: f64, mix: &Mixer) -> Complex64 {
     let lut = sinc_lut();
     let k0 = q.floor();
-    let mut p = ((q - k0) * SINC_PHASES as f64).round() as usize;
-    let mut k = k0 as i64 - (SINC_TAPS / 2 - 1) as i64;
-    if p == SINC_PHASES {
-        p = 0;
-        k += 1;
-    }
+    let p = ((q - k0) * SINC_PHASES as f64).round() as usize;
+    let k = k0 as i64 - (SINC_TAPS / 2 - 1) as i64;
+    // Row SINC_PHASES is the integer shift by one: the table holds it.
     let row = &lut[p * SINC_TAPS..(p + 1) * SINC_TAPS];
     let mut acc = Complex64::new(0.0, 0.0);
     for (j, h) in row.iter().enumerate() {
         acc += zb[(k + j as i64) as usize] * *h;
     }
-    let ph = w * q;
-    acc * Complex64::new(ph.cos(), ph.sin())
+    // exp(j w (k0 + p/P)) = conj(down[k0]) * frac[p].
+    acc * mix.down[k0 as usize].conj() * mix.frac[p]
 }
 
 struct Inner {
@@ -394,6 +410,8 @@ struct Inner {
     weight: Vec<f64>,
     fs: f64,
     len: u64,
+    /// Low band, video band.
+    mix: [Mixer; 2],
 }
 
 /// The read-time corrected (and, with several inputs, combined) RF stream.
@@ -422,7 +440,8 @@ impl VirtualSource {
             timeline.t.len(),
             len as f64 / fs
         );
-        Ok(Self { inner: Arc::new(Inner { inputs, timeline, weight, fs, len }), pos: 0 })
+        let mix = [Mixer::new(DEMIX_LO_HZ, fs), Mixer::new(DEMIX_HI_HZ, fs)];
+        Ok(Self { inner: Arc::new(Inner { inputs, timeline, weight, fs, len, mix }), pos: 0 })
     }
 
     fn compute(&self, s0: u64, out: &mut [f32]) -> Result<()> {
@@ -460,8 +479,6 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
     let len = n + 2 * m;
     let tl = &inner.timeline;
     let ni = inner.inputs.len();
-    let w_lo = 2.0 * std::f64::consts::PI * DEMIX_LO_HZ / inner.fs;
-    let w_hi = 2.0 * std::f64::consts::PI * DEMIX_HI_HZ / inner.fs;
 
     // Ideal time of each sample and its anchor segment.
     let times: Vec<f64> = (0..len).map(|j| s0 as f64 - m as f64 + j as f64).collect();
@@ -474,35 +491,45 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
         segs.push(k);
     }
 
-    // Each input read at its own positions: low band and video band.
+    // Each input read at its own positions: low band and video band. The
+    // inputs are independent, so they run in parallel too.
+    type Span = (Vec<Complex64>, Vec<Complex64>, Vec<bool>);
+    let reads: Vec<Span> = inner
+        .inputs
+        .par_iter()
+        .enumerate()
+        .map(|(i, input)| -> Result<Span> {
+            let p: Vec<f64> = times.iter().zip(&segs).map(|(&s, &k)| tl.position(i, k, s)).collect();
+            let (mut pmin, mut pmax) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &v in p.iter().filter(|v| v.is_finite()) {
+                pmin = pmin.min(v);
+                pmax = pmax.max(v);
+            }
+            let mut zl = vec![Complex64::new(0.0, 0.0); len];
+            let mut zh = vec![Complex64::new(0.0, 0.0); len];
+            let mut c = vec![false; len];
+            if pmin.is_finite() {
+                let start = pmin.floor() as i64 - PAD as i64;
+                if pmax.ceil() as i64 + PAD as i64 > start + NFFT as i64 {
+                    bail!("stack: {} moves too fast for one read span at sample {s0}", input.path);
+                }
+                let b = Bands::read(&input.reader, start, inner.fs, &inner.mix)?;
+                for j in 0..len {
+                    if p[j].is_finite() {
+                        let q = p[j] - b.start as f64;
+                        zl[j] = interp(&b.lo, q, &inner.mix[0]);
+                        zh[j] = interp(&b.hi, q, &inner.mix[1]);
+                        c[j] = true;
+                    }
+                }
+            }
+            Ok((zl, zh, c))
+        })
+        .collect::<Result<_>>()?;
     let mut lo: Vec<Vec<Complex64>> = Vec::with_capacity(ni);
     let mut hi: Vec<Vec<Complex64>> = Vec::with_capacity(ni);
     let mut cov: Vec<Vec<bool>> = Vec::with_capacity(ni);
-    for (i, input) in inner.inputs.iter().enumerate() {
-        let p: Vec<f64> = times.iter().zip(&segs).map(|(&s, &k)| tl.position(i, k, s)).collect();
-        let (mut pmin, mut pmax) = (f64::INFINITY, f64::NEG_INFINITY);
-        for &v in p.iter().filter(|v| v.is_finite()) {
-            pmin = pmin.min(v);
-            pmax = pmax.max(v);
-        }
-        let mut zl = vec![Complex64::new(0.0, 0.0); len];
-        let mut zh = vec![Complex64::new(0.0, 0.0); len];
-        let mut c = vec![false; len];
-        if pmin.is_finite() {
-            let start = pmin.floor() as i64 - PAD as i64;
-            if pmax.ceil() as i64 + PAD as i64 > start + NFFT as i64 {
-                bail!("stack: {} moves too fast for one read span at sample {s0}", input.path);
-            }
-            let b = Bands::read(&input.reader, start, inner.fs)?;
-            for j in 0..len {
-                if p[j].is_finite() {
-                    let q = p[j] - b.start as f64;
-                    zl[j] = interp(&b.lo, q, w_lo);
-                    zh[j] = interp(&b.hi, q, w_hi);
-                    c[j] = true;
-                }
-            }
-        }
+    for (zl, zh, c) in reads {
         lo.push(zl);
         hi.push(zh);
         cov.push(c);
