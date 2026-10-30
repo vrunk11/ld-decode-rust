@@ -238,8 +238,10 @@ impl Timeline {
                 if a <= last + 0.25 * linelen {
                     continue;
                 }
+                // The timeline starts at the primary's own first line, so
+                // before it virtual time is the primary's file position.
                 let tk = match t.last() {
-                    None => 0.0,
+                    None => a,
                     Some(&tp) => {
                         let lines = ((2.0 * (a - last) / linelen).round() / 2.0).max(0.5);
                         tp + lines * linelen
@@ -255,6 +257,27 @@ impl Timeline {
         }
         if t.len() < 2 {
             bail!("pass 0 found no usable lines in the primary input");
+        }
+        // Before the first line and after the last, the stream is the primary
+        // alone read at its own rate: the decoder needs that lead-in to find
+        // the first field (and the tail for the last ones), which a timeline
+        // cut at the first and last located lines left out.
+        let ni = inputs.len();
+        if t[0] >= 1.0 {
+            t.insert(0, 0.0);
+            pos[0].insert(0, 0.0);
+            for p in pos.iter_mut().skip(1) {
+                p.insert(0, f64::NAN);
+            }
+        }
+        let (t_last, a_last) = (*t.last().unwrap(), *pos[0].last().unwrap());
+        let tail = inputs[0].reader.len as f64 - a_last;
+        if tail >= 1.0 {
+            t.push(t_last + tail);
+            pos[0].push(a_last + tail);
+            for p in pos.iter_mut().skip(1).take(ni - 1) {
+                p.push(f64::NAN);
+            }
         }
         for (i, s) in inputs.iter().enumerate().skip(1) {
             tracing::info!(
@@ -394,6 +417,21 @@ pub(crate) struct Inner {
     len: u64,
     /// Video-band filter table (see [`video_band_lut`]).
     pub(crate) hi_lut: Vec<Complex64>,
+    /// The CPU path's single-precision copies: sinc, video band re and im.
+    fir: [Vec<f32>; 3],
+}
+
+/// `sum(h[i] * x[i])` over 8 single-precision lanes (as the OpenCL kernel,
+/// in single precision): the lanes vectorize, a serial f64 chain does not.
+#[inline]
+fn dot8(h: &[f32], x: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    for (hc, xc) in h.chunks_exact(8).zip(x.chunks_exact(8)) {
+        for l in 0..8 {
+            acc[l] += hc[l] * xc[l];
+        }
+    }
+    acc.iter().sum()
 }
 
 /// What one span of virtual samples needs from the inputs: the anchor segment
@@ -527,7 +565,12 @@ impl VirtualSource {
         let hi_lut = video_band_lut(fs);
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
-        let inner = Inner { inputs, timeline, weight, len, hi_lut };
+        let fir = [
+            sinc_lut().iter().map(|&v| v as f32).collect(),
+            hi_lut.iter().map(|c| c.re as f32).collect(),
+            hi_lut.iter().map(|c| c.im as f32).collect(),
+        ];
+        let inner = Inner { inputs, timeline, weight, len, hi_lut, fir };
         let gpu = if opencl { Some(crate::opencl::StackGpu::new(&inner)?) } else { None };
         Ok(Self { inner: Arc::new(inner), pos: 0, pool, gpu })
     }
@@ -580,7 +623,7 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
     let m = LOCK_MARGIN;
     let len = n + 2 * m;
     let plan = inner.plan(s0 as f64 - m as f64, len)?;
-    let sinc = sinc_lut();
+    let [sinc, hi_re, hi_im] = &inner.fir;
 
     // Each input read at its own positions: the full signal (sinc) and the
     // analytic video band (the low band is their difference).
@@ -600,13 +643,13 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
                 }
                 let (k0, ph) = split_pos(p);
                 let xs = &span.raw[(k0 - (SINC_TAPS / 2 - 1) as i64) as usize..][..SINC_TAPS];
-                full[j] = sinc[ph * SINC_TAPS..][..SINC_TAPS].iter().zip(xs).map(|(h, &x)| h * f64::from(x)).sum();
+                full[j] = f64::from(dot8(&sinc[ph * SINC_TAPS..][..SINC_TAPS], xs));
                 let xs = &span.raw[(k0 - (HI_TAPS / 2 - 1) as i64) as usize..][..HI_TAPS];
-                let mut acc = Complex64::new(0.0, 0.0);
-                for (h, &x) in inner.hi_lut[ph * HI_TAPS..][..HI_TAPS].iter().zip(xs) {
-                    acc += h * f64::from(x);
-                }
-                hi[j] = acc;
+                let row = ph * HI_TAPS..(ph + 1) * HI_TAPS;
+                hi[j] = Complex64::new(
+                    f64::from(dot8(&hi_re[row.clone()], xs)),
+                    f64::from(dot8(&hi_im[row], xs)),
+                );
                 cov[j] = true;
             }
             (full, hi, cov)
