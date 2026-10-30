@@ -717,13 +717,14 @@ impl Decoder {
         self.digital_audio = enabled;
     }
 
-    /// Demodulate on the GPU (OpenCL, single precision; see `demod_gpu.rs`)
-    /// instead of the CPU kernel. Not bit-identical to the reference.
-    pub fn set_gpu_demod(&mut self, on: bool) -> Result<()> {
+    /// Demodulate on the GPU (OpenCL, single or double precision; see
+    /// `demod_gpu.rs`) instead of the CPU kernel. Not bit-identical to the
+    /// reference.
+    pub fn set_gpu_demod(&mut self, on: bool, f64: bool) -> Result<()> {
         self.gpu_demod = if on {
             let spec = &self.spec;
             let dspec = DemodSpecRef::with_plans(spec.freq, spec.freq_half, spec.freq_hz, spec.blocklen, &spec.filters, &self.levels);
-            Some(Arc::new(demod_gpu::GpuDemod::new(&dspec)?))
+            Some(Arc::new(demod_gpu::GpuDemod::new(&dspec, f64)?))
         } else {
             None
         };

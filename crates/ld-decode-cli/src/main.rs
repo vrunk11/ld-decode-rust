@@ -55,9 +55,14 @@ struct Args {
     tbc: Option<TbcMode>,
     /// Where the FM demodulation and the read-time TBC / stack run: `cpu`
     /// (bit-exact to the reference), or `opencl` (a GPU through its driver's
-    /// OpenCL runtime; single precision, not bit-identical).
+    /// OpenCL runtime; see --gpu-precision).
     #[arg(long, value_enum, default_value = "cpu")]
     device: Device,
+    /// Precision of the GPU demodulation (`--device opencl`): `double` gave
+    /// output byte-identical to the CPU on a whole test capture at no speed
+    /// cost; `single` differs by up to 1 LSB on ~1.6% of the pixels.
+    #[arg(long, value_enum, default_value = "double")]
+    gpu_precision: GpuPrecision,
     /// Input sample format; default: inferred from the file extension
     #[arg(long, value_enum)]
     format: Option<reader::SampleFormat>,
@@ -119,6 +124,12 @@ struct Args {
 enum TbcMode {
     Read,
     Resample,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum GpuPrecision {
+    Single,
+    Double,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -308,7 +319,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.device)?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.device, args.gpu_precision == GpuPrecision::Double)?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -377,7 +388,7 @@ fn main() -> Result<()> {
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
-    decoder.set_gpu_demod(args.device == Device::Opencl)?;
+    decoder.set_gpu_demod(args.device == Device::Opencl, args.gpu_precision == GpuPrecision::Double)?;
     // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
     // decoder itself starts at 0, exactly like `LDdecode.__init__`.
     decoder.set_black_ire(if args.ntscj { 0.0 } else { 7.5 });
@@ -510,6 +521,7 @@ fn read_tbc_source(
     ntscj: bool,
     inputfreq: f64,
     device: Device,
+    gpu_f64: bool,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
         .iter()
@@ -531,7 +543,7 @@ fn read_tbc_source(
                 let mut rd = DecodeReader::new(input.source);
                 let seekable = rd.is_seekable();
                 let mut decoder = Decoder::new(Arc::clone(&spec), 0);
-                decoder.set_gpu_demod(device == Device::Opencl)?;
+                decoder.set_gpu_demod(device == Device::Opencl, gpu_f64)?;
                 decoder.set_black_ire(if ntscj { 0.0 } else { 7.5 });
                 decoder.set_analog_audio(0.0);
                 decoder.set_digital_audio(false);

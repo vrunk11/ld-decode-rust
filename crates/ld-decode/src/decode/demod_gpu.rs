@@ -1,13 +1,16 @@
 //! OpenCL demodulator: [`demod_block_cpu`](super::demodblock::demod_block_cpu)
-//! for a whole batch of blocks at once, in single precision.
+//! for a whole batch of blocks at once, in single or double precision (the
+//! kernels are built with `REAL` = `float` or `double`).
 //!
 //! Same signal path and the same filters as the CPU kernel (see the header of
 //! `demodblock.rs`); the FFTs are a radix-8 Stockham transform with twiddles
-//! tabulated in double precision. It is not bit-identical to the reference
-//! (nothing on a GPU is), so it is an option, checked against the CPU kernel
-//! with `LD_GPU_CHECK`.
+//! tabulated in double precision. Its FFTs are not the reference's, so it is
+//! not bit-identical by construction; in double precision the differences
+//! stay far below the f32/16-bit roundings of the outputs (a whole test
+//! capture decoded byte-identical to the CPU). `LD_GPU_CHECK` compares the
+//! two kernels block by block.
 //!
-//! Precision: the FM discriminator's output is a frequency near 8 MHz that
+//! Single precision: the FM discriminator's output is a frequency near 8 MHz that
 //! moves ~7 kHz per IRE. Carried as is in single precision, that constant
 //! would leave only ~1 Hz of resolution and the post-demod FFTs would round
 //! at that scale. So the discriminator writes `f - c` (c = the 50 IRE
@@ -30,56 +33,56 @@ const MAX_BATCH: usize = 64;
 const SOURCE: &str = r#"
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
-inline float2 cmul(float2 a, float2 b) { return (float2)(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
-inline float2 cmulf(float2 a, float2 b) { return cmul(a, b); }
+inline REAL2 cmul(REAL2 a, REAL2 b) { return (REAL2)(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+inline REAL2 cmulf(REAL2 a, REAL2 b) { return cmul(a, b); }
 
 // Real samples -> complex rows.
-__kernel void load_real(__global const float* in, __global float2* out) {
+__kernel void load_real(__global const float* in, __global REAL2* out) {
     int i = get_global_id(0), b = get_global_id(1);
     if (i >= N) return;
-    out[b * N + i] = (float2)(in[b * N + i], 0.0f);
+    out[b * N + i] = (REAL2)((REAL)in[b * N + i], (REAL)0);
 }
 
 // The same from 16-bit codes: sample = code + off (exact for integers).
-__kernel void load_u16(__global const ushort* in, const float off, __global float2* out) {
+__kernel void load_u16(__global const ushort* in, const float off, __global REAL2* out) {
     int i = get_global_id(0), b = get_global_id(1);
     if (i >= N) return;
-    out[b * N + i] = (float2)((float)in[b * N + i] + off, 0.0f);
+    out[b * N + i] = (REAL2)((REAL)in[b * N + i] + (REAL)off, (REAL)0);
 }
 
 // v * exp(s * i * pi/4 * k) for k = 1, 2, 3 (s = -1 forward, +1 inverse).
-#define R2 0.70710678118654752f
-inline float2 w8_1(float2 v, float s) { return (float2)(R2 * (v.x - s * v.y), R2 * (v.y + s * v.x)); }
-inline float2 w8_2(float2 v, float s) { return (float2)(-s * v.y, s * v.x); }
-inline float2 w8_3(float2 v, float s) { return (float2)(R2 * (-v.x - s * v.y), R2 * (-v.y + s * v.x)); }
+#define R2 ((REAL)0.70710678118654752)
+inline REAL2 w8_1(REAL2 v, float s) { return (REAL2)(R2 * (v.x - s * v.y), R2 * (v.y + s * v.x)); }
+inline REAL2 w8_2(REAL2 v, float s) { return (REAL2)(-s * v.y, s * v.x); }
+inline REAL2 w8_3(REAL2 v, float s) { return (REAL2)(R2 * (-v.x - s * v.y), R2 * (-v.y + s * v.x)); }
 
 // One radix-8 Stockham pass (Govindaraju et al.): sub-transform length Ns.
 // tw[m] = exp(-2 pi i m / N), tabulated in double precision.
-__kernel void fft_pass(__global const float2* in, __global float2* out, __global const float2* tw,
+__kernel void fft_pass(__global const REAL2* in, __global REAL2* out, __global const REAL2* tw,
                        const int Ns, const float s) {
     int j = get_global_id(0), b = get_global_id(1);
     if (j >= N / 8) return;
-    __global const float2* x = in + (size_t)b * N;
-    __global float2* y = out + (size_t)b * N;
+    __global const REAL2* x = in + (size_t)b * N;
+    __global REAL2* y = out + (size_t)b * N;
     int k = j % Ns;
-    float2 v[8];
+    REAL2 v[8];
     for (int r = 0; r < 8; r++) v[r] = x[j + r * (N / 8)];
     if (Ns > 1) {
         int step = N / (Ns * 8);
         for (int r = 1; r < 8; r++) {
-            float2 t = tw[(k * r * step) & (N - 1)];
+            REAL2 t = tw[(k * r * step) & (N - 1)];
             if (s > 0.0f) t.y = -t.y;
             v[r] = cmul(v[r], t);
         }
     }
     // DFT-8: radix-2 split into two DFT-4.
-    float2 a0 = v[0] + v[4], a4 = v[0] - v[4];
-    float2 a1 = v[1] + v[5], a5 = w8_1(v[1] - v[5], s);
-    float2 a2 = v[2] + v[6], a6 = w8_2(v[2] - v[6], s);
-    float2 a3 = v[3] + v[7], a7 = w8_3(v[3] - v[7], s);
-    float2 c0 = a0 + a2, c2 = a0 - a2, c1 = a1 + a3, c3 = w8_2(a1 - a3, s);
-    float2 d0 = a4 + a6, d2 = a4 - a6, d1 = a5 + a7, d3 = w8_2(a5 - a7, s);
-    float2 o[8];
+    REAL2 a0 = v[0] + v[4], a4 = v[0] - v[4];
+    REAL2 a1 = v[1] + v[5], a5 = w8_1(v[1] - v[5], s);
+    REAL2 a2 = v[2] + v[6], a6 = w8_2(v[2] - v[6], s);
+    REAL2 a3 = v[3] + v[7], a7 = w8_3(v[3] - v[7], s);
+    REAL2 c0 = a0 + a2, c2 = a0 - a2, c1 = a1 + a3, c3 = w8_2(a1 - a3, s);
+    REAL2 d0 = a4 + a6, d2 = a4 - a6, d1 = a5 + a7, d3 = w8_2(a5 - a7, s);
+    REAL2 o[8];
     o[0] = c0 + c1; o[4] = c0 - c1; o[2] = c2 + c3; o[6] = c2 - c3;
     o[1] = d0 + d1; o[5] = d0 - d1; o[3] = d2 + d3; o[7] = d2 - d3;
     int idx = (j / Ns) * Ns * 8 + k;
@@ -88,22 +91,22 @@ __kernel void fft_pass(__global const float2* in, __global float2* out, __global
 
 // Hermitian full spectrum of x[:N/2+1] * f (what irfft inverts: the imaginary
 // parts of the DC and Nyquist bins are dropped).
-inline float2 herm(__global const float2* x, __global const float2* f, int k) {
-    if (k == 0 || k == N / 2) return (float2)(cmul(x[k], f[k]).x, 0.0f);
+inline REAL2 herm(__global const REAL2* x, __global const REAL2* f, int k) {
+    if (k == 0 || k == N / 2) return (REAL2)(cmul(x[k], f[k]).x, (REAL)0);
     if (k < N / 2) return cmul(x[k], f[k]);
-    float2 v = cmul(x[N - k], f[N - k]);
-    return (float2)(v.x, -v.y);
+    REAL2 v = cmul(x[N - k], f[N - k]);
+    return (REAL2)(v.x, -v.y);
 }
 
 // The block spectrum's three products: RF video (* MTF power), EFM, RF highpass.
-__kernel void rf_products(__global const float2* X, __global const float2* rfvideo, __global const float2* mtfpow,
-                          const int use_pow, __global const float2* fefm, __global const float2* frfhpf,
-                          __global float2* H, __global float2* E, __global float2* R) {
+__kernel void rf_products(__global const REAL2* X, __global const REAL2* rfvideo, __global const REAL2* mtfpow,
+                          const int use_pow, __global const REAL2* fefm, __global const REAL2* frfhpf,
+                          __global REAL2* H, __global REAL2* E, __global REAL2* R) {
     int k = get_global_id(0), b = get_global_id(1);
     if (k >= N) return;
-    __global const float2* x = X + (size_t)b * N;
+    __global const REAL2* x = X + (size_t)b * N;
     size_t o = (size_t)b * N + k;
-    float2 h = cmul(x[k], rfvideo[k]);
+    REAL2 h = cmul(x[k], rfvideo[k]);
     if (use_pow) h = cmul(h, mtfpow[k]);
     H[o] = h;
     E[o] = cmul(x[k], fefm[k]);
@@ -112,31 +115,31 @@ __kernel void rf_products(__global const float2* X, __global const float2* rfvid
 
 // FM discriminator, minus c; `raw` keeps the unclamped value, `D` the clamped
 // one as a complex row for the post-demod FFT.
-__kernel void discriminate(__global const float2* h, __global float* raw, __global float2* D,
-                           const double scale, const double c, const float lo, const float hi) {
+__kernel void discriminate(__global const REAL2* h, __global REAL* raw, __global REAL2* D,
+                           const double scale, const double c, const REAL lo, const REAL hi) {
     int n = get_global_id(0), b = get_global_id(1);
     if (n >= N) return;
     size_t o = (size_t)b * N + n;
-    float v;
+    REAL v;
     if (n == 0) {
-        v = (float)(-c);
+        v = (REAL)(-c);
     } else {
-        float2 z = h[o], w = h[o - 1];
-        float re = z.x * w.x + z.y * w.y, im = z.y * w.x - z.x * w.y;
+        REAL2 z = h[o], w = h[o - 1];
+        REAL re = z.x * w.x + z.y * w.y, im = z.y * w.x - z.x * w.y;
         double d = (double)atan2(im, re);
         if (d < 0.0) d += 6.283185307179586;
-        v = (float)(d * scale - c);
+        v = (REAL)(d * scale - c);
     }
     raw[o] = v;
-    D[o] = (float2)(clamp(v, lo, hi), 0.0f);
+    D[o] = (REAL2)(clamp(v, lo, hi), (REAL)0);
 }
 
 // The three post-demod filters as Hermitian spectra.
-__kernel void video_products(__global const float2* Y, __global const float2* f0, __global const float2* f1,
-                             __global const float2* f2, __global float2* V0, __global float2* V1, __global float2* V2) {
+__kernel void video_products(__global const REAL2* Y, __global const REAL2* f0, __global const REAL2* f1,
+                             __global const REAL2* f2, __global REAL2* V0, __global REAL2* V1, __global REAL2* V2) {
     int k = get_global_id(0), b = get_global_id(1);
     if (k >= N) return;
-    __global const float2* y = Y + (size_t)b * N;
+    __global const REAL2* y = Y + (size_t)b * N;
     size_t o = (size_t)b * N + k;
     V0[o] = herm(y, f0, k);
     V1[o] = herm(y, f1, k);
@@ -144,31 +147,31 @@ __kernel void video_products(__global const float2* Y, __global const float2* f0
 }
 
 // Cut and pack every output channel of the batch.
-__kernel void extract(__global const float2* V0, __global const float2* V1, __global const float2* V2,
-                      __global const float* raw, __global const float2* R, __global const float2* E,
+__kernel void extract(__global const REAL2* V0, __global const REAL2* V1, __global const REAL2* V2,
+                      __global const REAL* raw, __global const REAL2* R, __global const REAL2* E,
                       const int cstart, const int clen, const int rstart, const int rlen,
-                      const float add0, const float add1, const float add2, const float c,
+                      const REAL add0, const REAL add1, const REAL add2, const REAL c,
                       __global float* o_demod, __global float* o_05, __global float* o_burst,
                       __global float* o_raw, __global float* o_rfhpf, __global short* o_efm) {
     int j = get_global_id(0), b = get_global_id(1);
-    const float inv = 1.0f / (float)N;
+    const REAL inv = (REAL)1 / (REAL)N;
     size_t base = (size_t)b * N;
     if (j < clen) {
         size_t i = base + cstart + j, oo = (size_t)b * clen + j;
-        o_demod[oo] = V0[i].x * inv + add0;
-        o_05[oo] = V1[i].x * inv + add1;
-        o_burst[oo] = V2[i].x * inv + add2;
-        o_raw[oo] = raw[i] + c;
-        o_efm[oo] = convert_short_rtz(clamp(E[i].x * inv, -32768.0f, 32767.0f));
+        o_demod[oo] = (float)(V0[i].x * inv + add0);
+        o_05[oo] = (float)(V1[i].x * inv + add1);
+        o_burst[oo] = (float)(V2[i].x * inv + add2);
+        o_raw[oo] = (float)(raw[i] + c);
+        o_efm[oo] = convert_short_rtz(clamp(E[i].x * inv, (REAL)-32768, (REAL)32767));
     }
     if (j < rlen) {
-        o_rfhpf[(size_t)b * rlen + j] = R[base + rstart + j].x * inv;
+        o_rfhpf[(size_t)b * rlen + j] = (float)(R[base + rstart + j].x * inv);
     }
 }
 
 // Spectrum bins the CPU's analog-audio stage reads: per block, `n` bins from
 // each of the four starts in `starts`.
-__kernel void gather_bins(__global const float2* X, __global const int* starts, const int n, __global float2* out) {
+__kernel void gather_bins(__global const REAL2* X, __global const int* starts, const int n, __global REAL2* out) {
     int j = get_global_id(0), b = get_global_id(1);
     if (j >= 4 * n) return;
     int run = j / n, i = j % n;
@@ -211,24 +214,40 @@ struct State {
 
 pub(crate) struct GpuDemod {
     blocklen: usize,
+    /// Double precision (`REAL` = `double`).
+    f64: bool,
     /// DC gain of the three post-demod filters (to add `c * H(0)` back).
     fvideo_dc: [f64; 3],
     state: Mutex<State>,
 }
 
-fn c32(v: &[Complex64]) -> Vec<[f32; 2]> {
-    v.iter().map(|c| [c.re as f32, c.im as f32]).collect()
+/// Complex values as the kernels' `REAL2`, in bytes.
+fn cplx_bytes(v: &[Complex64], f64: bool) -> Vec<u8> {
+    if f64 {
+        v.iter().flat_map(|c| [c.re.to_ne_bytes(), c.im.to_ne_bytes()]).flatten().collect()
+    } else {
+        v.iter().flat_map(|c| [(c.re as f32).to_ne_bytes(), (c.im as f32).to_ne_bytes()]).flatten().collect()
+    }
+}
+
+/// A `REAL` kernel argument.
+fn real(v: f64, f64: bool) -> Arg<'static> {
+    if f64 {
+        Arg::F64(v)
+    } else {
+        Arg::F32(v as f32)
+    }
 }
 
 impl GpuDemod {
-    pub(crate) fn new(spec: &DemodSpecRef) -> Result<Self> {
+    pub(crate) fn new(spec: &DemodSpecRef, f64: bool) -> Result<Self> {
         let n = spec.blocklen;
         anyhow::ensure!(n.is_power_of_two() && n.trailing_zeros() % 3 == 0, "GPU demod needs blocklen = 8^k (got {n})");
         let gpu = Gpu::get()?;
         let mut ks = gpu
             .kernels(
                 SOURCE,
-                &format!("-DN={n}"),
+                &format!("-DN={n} {}", if f64 { "-DREAL=double -DREAL2=double2" } else { "-DREAL=float -DREAL2=float2" }),
                 &["load_real", "fft_pass", "rf_products", "discriminate", "video_products", "extract", "gather_bins", "load_u16"],
             )?
             .into_iter();
@@ -236,28 +255,22 @@ impl GpuDemod {
         let (k_load, k_fft, k_rf, k_disc, k_video, k_extract, k_bins, k_load16) = (k(), k(), k(), k(), k(), k(), k(), k());
         let q = gpu.queue()?;
         let f = spec.filters;
-        let upload = |data: &[[f32; 2]]| -> Result<Buffer> {
-            let b = gpu.buffer(std::mem::size_of_val(data))?;
-            q.write(&b, 0, data)?;
+        let upload = |data: &[Complex64]| -> Result<Buffer> {
+            let bytes = cplx_bytes(data, f64);
+            let b = gpu.buffer(bytes.len())?;
+            q.write(&b, 0, &bytes)?;
             Ok(b)
         };
-        let tw: Vec<[f32; 2]> = (0..n)
-            .map(|m| {
-                let a = -std::f64::consts::TAU * m as f64 / n as f64;
-                [a.cos() as f32, a.sin() as f32]
-            })
+        let tw: Vec<Complex64> = (0..n)
+            .map(|m| Complex64::from_polar(1.0, -std::f64::consts::TAU * m as f64 / n as f64))
             .collect();
         let state = State {
             tw: upload(&tw)?,
-            rfvideo: upload(&c32(&f.rfvideo))?,
-            mtfpow: gpu.buffer(n * 8)?,
-            fefm: upload(&c32(&f.fefm))?,
-            frfhpf: upload(&c32(&f.frfhpf_rfft))?,
-            fvideo: [
-                upload(&c32(&f.fvideo_rfft[0]))?,
-                upload(&c32(&f.fvideo_rfft[1]))?,
-                upload(&c32(&f.fvideo_rfft[2]))?,
-            ],
+            rfvideo: upload(&f.rfvideo)?,
+            mtfpow: gpu.buffer(n * if f64 { 16 } else { 8 })?,
+            fefm: upload(&f.fefm)?,
+            frfhpf: upload(&f.frfhpf_rfft)?,
+            fvideo: [upload(&f.fvideo_rfft[0])?, upload(&f.fvideo_rfft[1])?, upload(&f.fvideo_rfft[2])?],
             starts: gpu.buffer(16)?,
             rows: [gpu.buffer(8)?, gpu.buffer(8)?, gpu.buffer(8)?, gpu.buffer(8)?, gpu.buffer(8)?, gpu.buffer(8)?],
             raw: gpu.buffer(4)?,
@@ -279,7 +292,7 @@ impl GpuDemod {
             k_bins,
         };
         let fvideo_dc = [f.fvideo_rfft[0][0].re, f.fvideo_rfft[1][0].re, f.fvideo_rfft[2][0].re];
-        Ok(Self { blocklen: n, fvideo_dc, state: Mutex::new(state) })
+        Ok(Self { blocklen: n, f64, fvideo_dc, state: Mutex::new(state) })
     }
 
     /// Demodulate `blocks` (each `blocklen` samples), cut as the CPU kernel
@@ -314,11 +327,13 @@ impl GpuDemod {
         let nb = blocks.len();
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
-        let row_bytes = nb * n * 8;
+        let f64 = self.f64;
+        let esz = if f64 { 16 } else { 8 };
+        let row_bytes = nb * n * esz;
         for r in &mut st.rows {
             r.ensure(row_bytes)?;
         }
-        st.raw.ensure(nb * n * 4)?;
+        st.raw.ensure(nb * n * esz / 2)?;
         let q = &st.q;
 
         // Input, as complex rows (rows[0] = staging, then rows[1] = X). Integer
@@ -367,7 +382,7 @@ impl GpuDemod {
         let use_pow = mtf_pow.is_some();
         if let Some(p) = mtf_pow {
             if st.pow_level != Some(mtf_level) {
-                q.write(&st.mtfpow, 0, &c32(p))?;
+                q.write(&st.mtfpow, 0, &cplx_bytes(p, f64))?;
                 st.pow_level = Some(mtf_level);
             }
         }
@@ -396,7 +411,7 @@ impl GpuDemod {
         let half_bins: Vec<usize> = (0..2).map(|ch| spec.filters.audio[ch].nbins / 2).collect();
         let run = half_bins[0].max(half_bins[1]);
         if !lite {
-            st.bins.ensure(nb * 4 * run * 8)?;
+            st.bins.ensure(nb * 4 * run * esz)?;
             q.write(&st.starts, 0, &audio_starts)?;
             st.k_bins.args(&[Arg::Buf(&st.rows[x]), Arg::Buf(&st.starts), Arg::I32(run as i32), Arg::Buf(&st.bins)])?;
             q.launch(&st.k_bins, &[4 * run, nb], 64)?;
@@ -416,16 +431,16 @@ impl GpuDemod {
         // Discriminator: raw -> st.raw, clamped D -> rows[spare3].
         let c = spec.levels.iretohz(50.0);
         let scale = spec.freq_hz / std::f64::consts::TAU;
-        let lo = (1_500_000.0 - c) as f32;
-        let hi = (spec.freq_hz * 0.75 - c) as f32;
+        let lo = 1_500_000.0 - c;
+        let hi = spec.freq_hz * 0.75 - c;
         st.k_disc.args(&[
             Arg::Buf(&st.rows[hilbert]),
             Arg::Buf(&st.raw),
             Arg::Buf(&st.rows[spare3]),
             Arg::F64(scale),
             Arg::F64(c),
-            Arg::F32(lo),
-            Arg::F32(hi),
+            real(lo, f64),
+            real(hi, f64),
         ])?;
         q.launch(&st.k_disc, &[n, nb], 256)?;
         // The hilbert row is free from here; the post-demod FFT uses it.
@@ -467,7 +482,7 @@ impl GpuDemod {
             b.ensure(nb * if i == 4 { rlen } else { clen } * 4)?;
         }
         st.out_efm.ensure(nb * clen * 2)?;
-        let add: Vec<f32> = self.fvideo_dc.iter().map(|g| (c * g) as f32).collect();
+        let add: Vec<f64> = self.fvideo_dc.iter().map(|g| c * g).collect();
         st.k_extract.args(&[
             Arg::Buf(&st.rows[v_out[0]]),
             Arg::Buf(&st.rows[v_out[1]]),
@@ -479,10 +494,10 @@ impl GpuDemod {
             Arg::I32(clen as i32),
             Arg::I32(rstart as i32),
             Arg::I32(rlen as i32),
-            Arg::F32(add[0]),
-            Arg::F32(add[1]),
-            Arg::F32(add[2]),
-            Arg::F32(c as f32),
+            real(add[0], f64),
+            real(add[1], f64),
+            real(add[2], f64),
+            real(c, f64),
             Arg::Buf(&st.out_f[0]),
             Arg::Buf(&st.out_f[1]),
             Arg::Buf(&st.out_f[2]),
@@ -497,7 +512,7 @@ impl GpuDemod {
         let sizes: Vec<usize> = (0..5)
             .map(|i| if lite && i >= 3 { 0 } else { nb * if i == 4 { rlen } else { clen } * 4 })
             .collect();
-        let (efm_bytes, bin_bytes) = if lite { (0, 0) } else { (nb * clen * 2, nb * 4 * run * 8) };
+        let (efm_bytes, bin_bytes) = if lite { (0, 0) } else { (nb * clen * 2, nb * 4 * run * esz) };
         let total = sizes.iter().sum::<usize>() + efm_bytes + bin_bytes;
         st.down.ensure(total)?;
         let mut off = 0;
@@ -518,15 +533,23 @@ impl GpuDemod {
         };
         let ch: Vec<Vec<f32>> = sizes.iter().map(|&sz| take(sz).chunks_exact(4).map(|w| f32::from_ne_bytes([w[0], w[1], w[2], w[3]])).collect()).collect();
         let efm: Vec<i16> = take(efm_bytes).chunks_exact(2).map(|w| i16::from_ne_bytes([w[0], w[1]])).collect();
-        let bins: Vec<[f32; 2]> = take(bin_bytes)
-            .chunks_exact(8)
-            .map(|w| [f32::from_ne_bytes([w[0], w[1], w[2], w[3]]), f32::from_ne_bytes([w[4], w[5], w[6], w[7]])])
+        let bins: Vec<Complex64> = take(bin_bytes)
+            .chunks_exact(esz)
+            .map(|w| {
+                if f64 {
+                    Complex64::new(f64::from_ne_bytes(w[..8].try_into().unwrap()), f64::from_ne_bytes(w[8..].try_into().unwrap()))
+                } else {
+                    Complex64::new(
+                        f64::from(f32::from_ne_bytes(w[..4].try_into().unwrap())),
+                        f64::from(f32::from_ne_bytes(w[4..].try_into().unwrap())),
+                    )
+                }
+            })
             .collect();
         drop(guard);
 
         // Assemble per block; the analog audio's stage 1 runs on the CPU from
         // the gathered bins.
-        let to64 = |v: &[[f32; 2]]| -> Vec<Complex64> { v.iter().map(|c| Complex64::new(f64::from(c[0]), f64::from(c[1]))).collect() };
         let res = (0..nb)
             .map(|b| {
                 let cl = |i: usize| if ch[i].is_empty() { Vec::new() } else { ch[i][b * clen..(b + 1) * clen].to_vec() };
@@ -546,7 +569,7 @@ impl GpuDemod {
                 let audio = [0usize, 1].map(|a| {
                     let base = b * 4 * run + 2 * a * run;
                     let h = half_bins[a];
-                    audio_stage1(&to64(&bins[base..base + h]), &to64(&bins[base + run..base + run + h]), a, spec, true)
+                    audio_stage1(&bins[base..base + h], &bins[base + run..base + run + h], a, spec, true)
                 });
                 BlockDecode {
                     video: VideoChannels {
