@@ -194,7 +194,7 @@ impl Live {
         })
     }
 
-    fn push(&self, input: usize, rec: FieldRec) {
+    pub(crate) fn push(&self, input: usize, rec: FieldRec) {
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
         if input == 0 {
@@ -211,6 +211,11 @@ impl Live {
         st.fields[input].push(rec);
         self.advance(st);
         self.cv.notify_all();
+    }
+
+    /// The stacked decode is over: pass 0 can stop.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// Pass 0 of `input` ended (Err: it failed, unless the stack stopped it).
@@ -393,7 +398,7 @@ impl Live {
 /// (top nibble 0xF or 0x8), sorted. Two captures of the same frame give the
 /// same set; a misread gives a different one, so the field is just left
 /// unpaired.
-fn frame_code(words: &[i64]) -> Vec<i64> {
+pub(crate) fn frame_code(words: &[i64]) -> Vec<i64> {
     let mut v: Vec<i64> = words
         .iter()
         .copied()
@@ -418,6 +423,11 @@ impl StackInput {
     /// Length in samples.
     pub fn len(&self) -> u64 {
         self.reader.len
+    }
+
+    /// Samples `[start, start + out.len())`; zeros outside the file.
+    pub(crate) fn read_at(&self, start: i64, out: &mut [f32]) -> Result<()> {
+        self.reader.read_at(start, out)
     }
 }
 
@@ -599,7 +609,7 @@ pub(crate) fn sinc_lut() -> &'static [f64] {
     })
 }
 
-fn bessel_i0(x: f64) -> f64 {
+pub(crate) fn bessel_i0(x: f64) -> f64 {
     let x2 = x * x / 4.0;
     let (mut sum, mut term, mut k) = (1.0f64, 1.0f64, 1.0f64);
     loop {

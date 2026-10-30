@@ -6,6 +6,7 @@ mod async_writer;
 mod db;
 mod prefetch;
 mod reader;
+mod rfsync;
 mod opencl;
 mod stack;
 mod writer;
@@ -65,6 +66,11 @@ struct Args {
     /// (pass 0 without MTF calibration, stack FIRs in single precision).
     #[arg(long, value_enum, default_value = "slow")]
     preset: Preset,
+    /// How pass 0 locates each input's lines for `--tbc read`: `decode` (a
+    /// demodulating decode of every input), or `rf` (sync pulses and colour
+    /// burst measured straight on the RF, without demodulating).
+    #[arg(long, value_enum, default_value = "decode")]
+    pass0: Pass0,
     /// Precision of the GPU demodulation (`--device opencl`); default double
     /// (byte-identical to the CPU on a whole test capture, at no speed cost).
     #[arg(long, value_enum)]
@@ -136,6 +142,12 @@ enum TbcMode {
 enum Preset {
     Slow,
     Fast,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Pass0 {
+    Decode,
+    Rf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -331,7 +343,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.device, args.gpu_precision != Some(GpuPrecision::Single), args.preset)?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.device, args.gpu_precision != Some(GpuPrecision::Single), args.preset, args.pass0)?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -535,6 +547,7 @@ fn read_tbc_source(
     device: Device,
     gpu_f64: bool,
     preset: Preset,
+    pass0: Pass0,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
         .iter()
@@ -549,6 +562,16 @@ fn read_tbc_source(
     // down as it goes, so it stops where the stacked decode stops.
     for (i, (path, &fmt)) in inputs.iter().zip(&fmts).enumerate() {
         let (spec, live, path) = (Arc::clone(spec), Arc::clone(&live), path.clone());
+        if pass0 == Pass0::Rf {
+            let src = stack::StackInput::new(&path, fmt)?;
+            std::thread::Builder::new().name(format!("pass0-{i}")).spawn(move || {
+                tracing::info!("read-time TBC pass 0 (RF): locating the lines of {path}");
+                // A panic would leave the stacked decode waiting on this input.
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rfsync::locate(&src, fs, &live, i)));
+                live.finish(i, run.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))));
+            })?;
+            continue;
+        }
         std::thread::Builder::new().name(format!("pass0-{i}")).spawn(move || {
             let run = || -> Result<()> {
                 tracing::info!("read-time TBC pass 0: locating the lines of {path}");
