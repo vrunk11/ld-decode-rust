@@ -2521,6 +2521,39 @@ fn gpu_demod_blocks(
     dspec: &DemodSpecRef,
     rotdelay: i64,
 ) -> Vec<BlockDecode> {
+    // Both ends work at once: the first share of the batch goes to the device,
+    // the rest to the CPU pool, the share following their measured per-block
+    // times so that they finish together (a device with little f64 throughput
+    // would otherwise leave the cores idle). The device gives the CPU's bytes,
+    // so the split does not move the output. `LD_GPU_SHARE` pins the share.
+    let n = blocks.len();
+    let k = ((n as f64 * gpu.share()).round() as usize).clamp(usize::from(n > 0), n);
+    let (on_dev, on_cpu) = blocks.split_at(k);
+    let ((dev_out, t_dev), (cpu_out, t_cpu)) = rayon::join(
+        || {
+            let t = std::time::Instant::now();
+            (gpu_demod_device(gpu, on_dev, mtf, pow, dspec, rotdelay), t.elapsed())
+        },
+        || {
+            let t = std::time::Instant::now();
+            let out: Vec<BlockDecode> =
+                on_cpu.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect();
+            (out, t.elapsed())
+        },
+    );
+    gpu.record(on_dev.len(), t_dev, on_cpu.len(), t_cpu);
+    dev_out.into_iter().chain(cpu_out).collect()
+}
+
+/// The device part of a batch (with the CPU fallback and `LD_GPU_CHECK`).
+fn gpu_demod_device(
+    gpu: &demod_gpu::GpuDemod,
+    blocks: &[(u64, &[f32])],
+    mtf: f64,
+    pow: Option<&[Complex64]>,
+    dspec: &DemodSpecRef,
+    rotdelay: i64,
+) -> Vec<BlockDecode> {
     let cpu = || -> Vec<BlockDecode> {
         blocks.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect()
     };

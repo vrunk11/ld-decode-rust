@@ -18,7 +18,7 @@
 //! `c * H(0)` is added back to each filtered channel: the filters are linear,
 //! so it is the same quantity, now resolved to ~0.1 Hz.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use anyhow::Result;
 use rustfft::num_complex::Complex64;
@@ -219,6 +219,9 @@ pub(crate) struct GpuDemod {
     /// DC gain of the three post-demod filters (to add `c * H(0)` back).
     fvideo_dc: [f64; 3],
     state: Mutex<State>,
+    /// Smoothed time per block (s) on the device and on the CPU pool, which
+    /// sets the device's share of each batch (`share`).
+    balance: Mutex<(f64, f64)>,
 }
 
 /// Complex values as the kernels' `REAL2`, in bytes.
@@ -292,7 +295,31 @@ impl GpuDemod {
             k_bins,
         };
         let fvideo_dc = [f.fvideo_rfft[0][0].re, f.fvideo_rfft[1][0].re, f.fvideo_rfft[2][0].re];
-        Ok(Self { blocklen: n, f64, fvideo_dc, state: Mutex::new(state) })
+        Ok(Self { blocklen: n, f64, fvideo_dc, state: Mutex::new(state), balance: Mutex::new((1.0, 1.0)) })
+    }
+
+    /// The device's share of a batch: the CPU's time per block over the sum,
+    /// so both ends finish together; kept within 5..95% so each end goes on
+    /// being measured. `LD_GPU_SHARE` pins it.
+    pub(crate) fn share(&self) -> f64 {
+        static PINNED: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+        if let Some(v) = *PINNED.get_or_init(|| std::env::var("LD_GPU_SHARE").ok().and_then(|v| v.parse().ok())) {
+            return f64::clamp(v, 0.0, 1.0);
+        }
+        let (dev, cpu) = *self.balance.lock().unwrap();
+        (cpu / (dev + cpu)).clamp(0.05, 0.95)
+    }
+
+    /// Fold one batch's timings (blocks and wall time on each end) into the
+    /// smoothed per-block times.
+    pub(crate) fn record(&self, n_dev: usize, t_dev: std::time::Duration, n_cpu: usize, t_cpu: std::time::Duration) {
+        let mut b = self.balance.lock().unwrap();
+        if n_dev > 0 {
+            b.0 += (t_dev.as_secs_f64() / n_dev as f64 - b.0) * if b.0 == 1.0 { 1.0 } else { 0.2 };
+        }
+        if n_cpu > 0 {
+            b.1 += (t_cpu.as_secs_f64() / n_cpu as f64 - b.1) * if b.1 == 1.0 { 1.0 } else { 0.2 };
+        }
     }
 
     /// Demodulate `blocks` (each `blocklen` samples), cut as the CPU kernel
@@ -566,6 +593,3 @@ impl GpuDemod {
         Ok(res)
     }
 }
-
-/// Shared per-decoder handle.
-pub(crate) type GpuDemodRef = Arc<GpuDemod>;
