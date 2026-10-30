@@ -1496,7 +1496,7 @@ impl Decoder {
                     });
                     let blocks: Vec<(u64, &[f32])> =
                         missing.iter().map(|&(bnum, off)| (bnum, &data[off..off + spec.blocklen])).collect();
-                    gpu_demod_blocks(g, &blocks, mtf, pow.as_deref(), &dspec, spec.delays.video_rot)
+                    gpu_demod_blocks(g, &blocks, mtf, pow.as_deref(), &dspec, spec.delays.video_rot, self.locate_rows.is_some())
                 }
                 _ => missing
                     .par_iter()
@@ -1570,6 +1570,7 @@ impl Decoder {
                     let f_mtf = mtf;
                     let memo = Arc::clone(&self.mtf_pow_memo);
                     let gpu = self.gpu_demod.clone();
+                    let locate = self.locate_rows.is_some();
                     let (tx, rx) = std::sync::mpsc::channel();
                     // `install` (not just `spawn`) sets the thread-local pool
                     // so the inner par_iter dispatches onto the dedicated
@@ -1634,7 +1635,7 @@ impl Decoder {
                         }
                         let results: Vec<(u64, BlockDecode)> = if let Some(g) = &gpu {
                             let blocks: Vec<(u64, &[f32])> = inputs.iter().map(|(b, v)| (*b, v.as_slice())).collect();
-                            let out = gpu_demod_blocks(g, &blocks, f_mtf, mtf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec_arc.delays.video_rot);
+                            let out = gpu_demod_blocks(g, &blocks, f_mtf, mtf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec_arc.delays.video_rot, locate);
                             inputs.iter().map(|(b, _)| *b).zip(out).collect()
                         } else { inputs
                             .into_par_iter()
@@ -1698,7 +1699,7 @@ impl Decoder {
                         Some(g) if !prefetch.is_empty() => {
                             let blocks: Vec<(u64, &[f32])> =
                                 prefetch.iter().map(|&(bnum, off)| (bnum, &data[off..off + spec.blocklen])).collect();
-                            gpu_demod_blocks(g, &blocks, mtf, pf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec.delays.video_rot)
+                            gpu_demod_blocks(g, &blocks, mtf, pf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec.delays.video_rot, self.locate_rows.is_some())
                         }
                         _ => prefetch
                             .par_iter()
@@ -1852,15 +1853,23 @@ impl Decoder {
             let dst0 = dsts[0]; let dst1 = dsts[1]; let dst2 = dsts[2]; let dst3 = dsts[3];
             let dst4 = dsts[4]; let dst5 = dsts[5]; let dst6 = dsts[6]; let dst7 = dsts[7];
             let dst8 = dsts[8];
+            // Locate-only decodes (`set_locate_only`) assemble just what line
+            // location reads: video, 0.5 MHz, burst, and the RF input (the
+            // VITS RF levels behind the MTF calibration). The raw demod and
+            // RF highpass only feed dropout detection, the audio and EFM only
+            // their outputs, all off there.
+            let locate = self.locate_rows.is_some();
             enqueue_chan!(0, dst0, parts_demod, f32sz);
-            enqueue_chan!(1, dst1, parts_demod_raw, f32sz);
             enqueue_chan!(2, dst2, parts_demod_05, f32sz);
             enqueue_chan!(3, dst3, parts_demod_burst, f32sz);
-            enqueue_chan!(4, dst4, parts_audio0, f32sz);
-            enqueue_chan!(5, dst5, parts_audio1, f32sz);
-            enqueue_chan!(6, dst6, parts_efm, i16sz);
-            enqueue_chan!(7, dst7, parts_rfhpf, f32sz);
             enqueue_chan!(8, dst8, parts_input, f32sz);
+            if !locate {
+                enqueue_chan!(1, dst1, parts_demod_raw, f32sz);
+                enqueue_chan!(4, dst4, parts_audio0, f32sz);
+                enqueue_chan!(5, dst5, parts_audio1, f32sz);
+                enqueue_chan!(6, dst6, parts_efm, i16sz);
+                enqueue_chan!(7, dst7, parts_rfhpf, f32sz);
+            }
             // Measured on the side pool (6 threads instead of the global 3):
             // the scatter itself drops 2.15 -> 1.72 ms, but the extra memory
             // traffic slows the concurrent prefetch demod enough that the
@@ -1880,6 +1889,7 @@ impl Decoder {
             // wow and sinc instead of blocking the tail; `downscale` receives
             // the result before reading it (same bytes as the inline call).
             let t_ph0 = std::time::Instant::now();
+            if !locate {
             let ph2_audio0 = raw.video.audio[0].clone();
             let ph2_audio1 = raw.video.audio[1].clone();
             let ph2_spec = Arc::clone(&self.spec);
@@ -1892,8 +1902,9 @@ impl Decoder {
                 }));
                 let _ = ph2_cell2.set(res.map_err(|_| ()));
             });
-            self.dbg.phase2 = t_ph0.elapsed().as_nanos() as u64;
             raw.audio_pend = Some(ph2_cell);
+            }
+            self.dbg.phase2 = t_ph0.elapsed().as_nanos() as u64;
             raw.efm = std::mem::take(&mut raw.video.efm);
             rawdecode = raw;
 
@@ -2542,12 +2553,13 @@ fn gpu_demod_blocks(
     pow: Option<&[Complex64]>,
     dspec: &DemodSpecRef,
     rotdelay: i64,
+    lite: bool,
 ) -> Vec<BlockDecode> {
     let cpu = || -> Vec<BlockDecode> {
         blocks.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect()
     };
     let data: Vec<&[f32]> = blocks.iter().map(|b| b.1).collect();
-    let out = match gpu.demod(&data, mtf, pow, rotdelay, dspec) {
+    let out = match gpu.demod(&data, mtf, pow, rotdelay, dspec, lite) {
         Ok(v) => v,
         Err(e) => {
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2557,7 +2569,7 @@ fn gpu_demod_blocks(
             return cpu();
         }
     };
-    if std::env::var_os("LD_GPU_CHECK").is_some() {
+    if std::env::var_os("LD_GPU_CHECK").is_some() && !lite {
         let reference = cpu();
         let worst = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         let rms = |a: &[f32], b: &[f32]| {
