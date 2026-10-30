@@ -1,4 +1,4 @@
-//! Pass 0 straight from the RF (`--pass0 rf`): the lines of an input are
+//! Pass 0 straight from the RF: the lines of an input are
 //! located without demodulating it.
 //!
 //! The carrier sits at its lowest frequency during a sync pulse (-40 IRE,

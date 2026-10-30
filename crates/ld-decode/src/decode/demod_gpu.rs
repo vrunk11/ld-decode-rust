@@ -296,8 +296,7 @@ impl GpuDemod {
     }
 
     /// Demodulate `blocks` (each `blocklen` samples), cut as the CPU kernel
-    /// does with `cut = true`. `lite` (a locate-only decode) brings back only
-    /// the video, 0.5 MHz and burst channels; the others are left empty.
+    /// does with `cut = true`.
     pub(crate) fn demod(
         &self,
         blocks: &[&[f32]],
@@ -305,11 +304,10 @@ impl GpuDemod {
         mtf_pow: Option<&[Complex64]>,
         rotdelay: i64,
         spec: &DemodSpecRef,
-        lite: bool,
     ) -> Result<Vec<BlockDecode>> {
         let mut out = Vec::with_capacity(blocks.len());
         for chunk in blocks.chunks(MAX_BATCH) {
-            out.extend(self.batch(chunk, mtf_level, mtf_pow, rotdelay, spec, lite)?);
+            out.extend(self.batch(chunk, mtf_level, mtf_pow, rotdelay, spec)?);
         }
         Ok(out)
     }
@@ -321,7 +319,6 @@ impl GpuDemod {
         mtf_pow: Option<&[Complex64]>,
         rotdelay: i64,
         spec: &DemodSpecRef,
-        lite: bool,
     ) -> Result<Vec<BlockDecode>> {
         let n = self.blocklen;
         let nb = blocks.len();
@@ -410,12 +407,10 @@ impl GpuDemod {
             .collect();
         let half_bins: Vec<usize> = (0..2).map(|ch| spec.filters.audio[ch].nbins / 2).collect();
         let run = half_bins[0].max(half_bins[1]);
-        if !lite {
-            st.bins.ensure(nb * 4 * run * esz)?;
-            q.write(&st.starts, 0, &audio_starts)?;
-            st.k_bins.args(&[Arg::Buf(&st.rows[x]), Arg::Buf(&st.starts), Arg::I32(run as i32), Arg::Buf(&st.bins)])?;
-            q.launch(&st.k_bins, &[4 * run, nb], 64)?;
-        }
+        st.bins.ensure(nb * 4 * run * esz)?;
+        q.write(&st.starts, 0, &audio_starts)?;
+        st.k_bins.args(&[Arg::Buf(&st.rows[x]), Arg::Buf(&st.starts), Arg::I32(run as i32), Arg::Buf(&st.bins)])?;
+        q.launch(&st.k_bins, &[4 * run, nb], 64)?;
 
         // Inverse transforms: H (hilbert), E (EFM), R (RF highpass). Each lands
         // in the free row after 5 passes; move the roles accordingly.
@@ -507,12 +502,9 @@ impl GpuDemod {
         ])?;
         q.launch(&st.k_extract, &[clen.max(rlen), nb], 256)?;
 
-        // Everything back through the pinned buffer, in one wait (`lite`: the
-        // video, 0.5 MHz and burst channels only).
-        let sizes: Vec<usize> = (0..5)
-            .map(|i| if lite && i >= 3 { 0 } else { nb * if i == 4 { rlen } else { clen } * 4 })
-            .collect();
-        let (efm_bytes, bin_bytes) = if lite { (0, 0) } else { (nb * clen * 2, nb * 4 * run * esz) };
+        // Everything back through the pinned buffer, in one wait.
+        let sizes: Vec<usize> = (0..5).map(|i| nb * if i == 4 { rlen } else { clen } * 4).collect();
+        let (efm_bytes, bin_bytes) = (nb * clen * 2, nb * 4 * run * esz);
         let total = sizes.iter().sum::<usize>() + efm_bytes + bin_bytes;
         st.down.ensure(total)?;
         let mut off = 0;
@@ -552,20 +544,7 @@ impl GpuDemod {
         // the gathered bins.
         let res = (0..nb)
             .map(|b| {
-                let cl = |i: usize| if ch[i].is_empty() { Vec::new() } else { ch[i][b * clen..(b + 1) * clen].to_vec() };
-                if lite {
-                    return BlockDecode {
-                        video: VideoChannels {
-                            demod: cl(0),
-                            demod_raw: Vec::new(),
-                            demod_05: cl(1),
-                            demod_burst: cl(2),
-                            audio: [Vec::new(), Vec::new()],
-                            efm: Vec::new(),
-                        },
-                        rfhpf: Vec::new(),
-                    };
-                }
+                let cl = |i: usize| ch[i][b * clen..(b + 1) * clen].to_vec();
                 let audio = [0usize, 1].map(|a| {
                     let base = b * 4 * run + 2 * a * run;
                     let h = half_bins[a];

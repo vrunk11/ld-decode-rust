@@ -137,9 +137,6 @@ pub(crate) struct Field {
     pub fields_written: usize,
     pub readloc: u64,
     pub initphase: bool,
-    /// Keep the hsync-refined line positions, without the burst refinement
-    /// (experimental fast pass 0).
-    pub skip_burst_refine: bool,
 
     pub inlinelen: usize,
     pub outlinelen: usize,
@@ -458,7 +455,6 @@ impl Field {
         let linelen = spec.linelen;
         let outlinelen = spec.sys_outlinelen;
         let mut field = Field {
-            skip_burst_refine: false,
             spec,
             levels,
             data,
@@ -1949,7 +1945,6 @@ impl Field {
         audio_offset: f64,
         side_pool: &rayon::ThreadPool,
         efm_pre: Option<&[i16]>,
-        rows: Option<&[usize]>,
     ) -> Result<Vec<f32>> {
         let sub = std::env::var_os("LD_SUBTIME").is_some();
         let t0 = std::time::Instant::now();
@@ -2012,8 +2007,7 @@ impl Field {
         // gather for no wall-time gain (the detector's result isn't needed
         // until `buildmetadata`, several stages later). One thread spawn per
         // field is ~40 us — far cheaper than the pool time it frees.
-        // A partial picture (`rows`) is for calibration only: no dropouts.
-        let dod = self.spec.do_dod && rows.is_none() && std::env::var_os("LD_NO_DOD_PRE").is_none();
+        let dod = self.spec.do_dod && std::env::var_os("LD_NO_DOD_PRE").is_none();
         let mut dropouts: Option<(Vec<usize>, Vec<usize>, Vec<usize>)> = None;
         std::thread::scope(|sc| {
             let dod_handle = if dod {
@@ -2038,7 +2032,6 @@ impl Field {
                     wow_level_adjust_smoothing: self.spec.wow_level_adjust_smoothing,
                     level_adjust_threshold: 15.0,
                 },
-                rows,
             );
             if let Some(handle) = dod_handle {
                 dropouts = Some(handle.join().expect("dropout detection panicked"));
@@ -2741,7 +2734,7 @@ impl Field {
 
         let linelocs2 = self.linelocs2.clone();
         let t_a = std::time::Instant::now();
-        let linelocs3 = if self.skip_burst_refine { linelocs2.clone() } else { self.refine_linelocs_burst(&spec, &linelocs2) };
+        let linelocs3 = self.refine_linelocs_burst(&spec, &linelocs2);
         let t_burst = t_a.elapsed().as_nanos() as u64;
         let t_a = std::time::Instant::now();
         let linelocs4 = self.fix_badlines(&spec, &linelocs3, Some(&linelocs2));

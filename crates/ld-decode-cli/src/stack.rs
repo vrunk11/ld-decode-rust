@@ -2,7 +2,7 @@
 //! built on it.
 //!
 //! Pass 0 locates every input (one per input, running alongside the stacked
-//! decode: straight from the RF, `rfsync.rs`, or a decode) and keeps, per field, the VBI frame code, the parity and
+//! decode, straight from the RF: `rfsync.rs`) and keeps, per field, the VBI frame code, the parity and
 //! the absolute position of each line. Fields of the same frame are paired
 //! across inputs, and the primary's (first input's) lines define a timeline of
 //! nominal-length lines, laid down as far as every input is located ([`Live`]);
@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{bail, Context as _, Result};
-use ld_decode::{DecoderMetadata, WriteableField};
 use rayon::prelude::*;
 use rustfft::num_complex::Complex64;
 use rustfft::FftPlanner;
@@ -73,43 +72,6 @@ pub struct FieldRec {
     pub code: Option<Vec<i64>>,
     /// Absolute position of each line (input samples).
     pub lines: Vec<f64>,
-}
-
-/// Pass-0 sink of one input: turns each decoded field into a record and hands
-/// it to the live timeline.
-pub struct Pass0Collector {
-    live: Arc<Live>,
-    input: usize,
-    /// Parity and frame code of the previous field.
-    last: Option<(bool, Option<Vec<i64>>)>,
-}
-
-impl Pass0Collector {
-    pub fn new(live: Arc<Live>, input: usize) -> Self {
-        Self { live, input, last: None }
-    }
-
-    pub fn put(&mut self, field: &WriteableField) -> Result<()> {
-        if self.live.stop.load(Ordering::Relaxed) {
-            bail!("stack: pass 0 no longer needed");
-        }
-        let info = field.info();
-        let code = if info.is_first_field {
-            info.vbi.as_ref().map(|v| frame_code(&v.vbi_data)).filter(|c| !c.is_empty())
-        } else {
-            // A second field belongs to the frame its first field opened.
-            self.last.as_ref().filter(|p| p.0).and_then(|p| p.1.clone())
-        };
-        self.last = Some((info.is_first_field, code.clone()));
-        let base = info.file_loc as f64;
-        self.live.push(
-            self.input,
-            FieldRec { first: info.is_first_field, code, lines: field.linelocs.iter().map(|l| base + l).collect() },
-        );
-        Ok(())
-    }
-
-    pub fn finish(&mut self, _metadata: Option<DecoderMetadata>) {}
 }
 
 /// Text dump of pass-0 records (`LD_DUMP_PASS0`), exact to the bit.

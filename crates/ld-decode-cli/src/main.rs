@@ -59,19 +59,12 @@ struct Args {
     /// OpenCL runtime; see --gpu-precision).
     #[arg(long, value_enum, default_value = "cpu")]
     device: Device,
-    /// Speed/exactness preset. `slow`: nothing traded for speed (GPU demod in
-    /// double precision, a decoding pass 0 with its MTF calibration, stack
-    /// FIRs and phase lock in double precision in one fixed order, so the GPU
-    /// gives the CPU's output). `fast`: the shortcuts measured without visible
-    /// loss (a decoding pass 0 without MTF calibration, stack FIRs in single
-    /// precision).
+    /// Speed/exactness preset of the stack (`--tbc read`). `slow`: nothing
+    /// traded for speed (stack FIRs and phase lock in double precision in one
+    /// fixed order, so the GPU gives the CPU's output). `fast`: stack FIRs in
+    /// single precision (measured without visible loss).
     #[arg(long, value_enum, default_value = "slow")]
     preset: Preset,
-    /// How pass 0 locates each input's lines for `--tbc read`: `rf` (sync
-    /// pulses and colour burst measured straight on the RF, without
-    /// demodulating), or `decode` (a demodulating decode of every input).
-    #[arg(long, value_enum, default_value = "rf")]
-    pass0: Pass0,
     /// Precision of the GPU demodulation (`--device opencl`); default double
     /// (byte-identical to the CPU on a whole test capture, at no speed cost).
     #[arg(long, value_enum)]
@@ -143,12 +136,6 @@ enum TbcMode {
 enum Preset {
     Slow,
     Fast,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum Pass0 {
-    Decode,
-    Rf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -344,7 +331,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.device, args.gpu_precision != Some(GpuPrecision::Single), args.preset, args.pass0)?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, request.inputfreq, args.device, args.preset)?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -476,7 +463,7 @@ fn main() -> Result<()> {
 
     let max_frames = args.length;
     let seekable = reader.is_seekable();
-    let wrote_fields = decode_all(&mut reader, &mut Sink::Writer(&mut writer), spec, decoder, max_frames, start_base, seekable)?;
+    let wrote_fields = decode_all(&mut reader, &mut writer, spec, decoder, max_frames, start_base, seekable)?;
     if !to_stdout && !wrote_fields {
         // Python 7.4.0 leaves no `.tbc.json` at all on a decode that handles
         // no frames -- its JSONDumper never receives a snapshot and `_enqueue`
@@ -511,44 +498,14 @@ fn resolve_io(args: &Args) -> Result<(Vec<String>, String)> {
     }
 }
 
-/// Where `decode_all` sends the decoded fields: the output files, or the
-/// read-time TBC pass 0, which only keeps each field's lines and frame code.
-enum Sink<'a> {
-    Writer(&'a mut async_writer::AsyncDecodeWriter),
-    Collect(&'a mut stack::Pass0Collector),
-}
-
-impl Sink<'_> {
-    fn write(&mut self, field: &ld_decode::WriteableField, metadata: Option<&ld_decode::DecoderMetadata>) -> Result<()> {
-        match self {
-            Sink::Writer(w) => w.write_writeable(field.clone(), metadata),
-            Sink::Collect(c) => c.put(field),
-        }
-    }
-
-    fn close(&mut self, metadata: Option<ld_decode::DecoderMetadata>) -> Result<()> {
-        match self {
-            Sink::Writer(w) => w.close(metadata),
-            Sink::Collect(c) => {
-                c.finish(metadata);
-                Ok(())
-            }
-        }
-    }
-}
-
-/// `--tbc read`: locate every input's lines (pass 0, no audio or EFM, running
-/// alongside) and serve the read-time corrected, combined RF stream.
+/// `--tbc read`: locate every input's lines (pass 0, straight from the RF,
+/// running alongside) and serve the read-time corrected, combined RF stream.
 fn read_tbc_source(
     inputs: &[String],
     format: Option<reader::SampleFormat>,
-    spec: &Arc<DecoderSpec>,
-    ntscj: bool,
     inputfreq: f64,
     device: Device,
-    gpu_f64: bool,
     preset: Preset,
-    pass0: Pass0,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
         .iter()
@@ -558,41 +515,17 @@ fn read_tbc_source(
     let fs = inputfreq * 1e6;
     // NTSC line: 286 lines per 4.5 MHz.
     let live = stack::Live::new(inputs.to_vec(), stacked[0].len(), fs * 286.0 / 4.5e6);
-    // Pass 0, one per input running alongside the stacked decode (from the RF,
-    // or a decode with --pass0 decode): it locates the lines and reads the VBI
-    // codes, and the timeline is laid down as it goes, so it stops where the
-    // stacked decode stops.
+    // Pass 0, one per input running alongside the stacked decode: it locates
+    // the lines and reads the VBI codes from the RF, and the timeline is laid
+    // down as it goes, so it stops where the stacked decode stops.
     for (i, (path, &fmt)) in inputs.iter().zip(&fmts).enumerate() {
-        let (spec, live, path) = (Arc::clone(spec), Arc::clone(&live), path.clone());
-        if pass0 == Pass0::Rf {
-            let src = stack::StackInput::new(&path, fmt)?;
-            std::thread::Builder::new().name(format!("pass0-{i}")).spawn(move || {
-                tracing::info!("read-time TBC pass 0 (RF): locating the lines of {path}");
-                // A panic would leave the stacked decode waiting on this input.
-                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rfsync::locate(&src, fs, &live, i)));
-                live.finish(i, run.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))));
-            })?;
-            continue;
-        }
+        let (live, path) = (Arc::clone(&live), path.clone());
+        let src = stack::StackInput::new(&path, fmt)?;
         std::thread::Builder::new().name(format!("pass0-{i}")).spawn(move || {
-            let run = || -> Result<()> {
-                tracing::info!("read-time TBC pass 0: locating the lines of {path}");
-                let input = reader::open_input(&path, fmt)?;
-                let mut rd = DecodeReader::new(input.source);
-                let seekable = rd.is_seekable();
-                let mut decoder = Decoder::new(Arc::clone(&spec), 0);
-                decoder.set_gpu_demod(device == Device::Opencl, gpu_f64)?;
-                decoder.set_black_ire(if ntscj { 0.0 } else { 7.5 });
-                decoder.set_analog_audio(0.0);
-                decoder.set_digital_audio(false);
-                // Only the line positions and VBI codes are kept; LD_PASS0_FULL
-                // runs the complete decode instead (for comparisons).
-                decoder.set_locate_only(std::env::var_os("LD_PASS0_FULL").is_none(), preset == Preset::Slow);
-                let mut collector = stack::Pass0Collector::new(Arc::clone(&live), i);
-                decode_all(&mut rd, &mut Sink::Collect(&mut collector), spec, decoder, None, 0, seekable)?;
-                Ok(())
-            };
-            live.finish(i, run());
+            tracing::info!("read-time TBC pass 0: locating the lines of {path}");
+            // A panic would leave the stacked decode waiting on this input.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rfsync::locate(&src, fs, &live, i)));
+            live.finish(i, run.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))));
         })?;
     }
     stack::VirtualSource::new(stacked, live, fs, device == Device::Opencl, preset == Preset::Slow)
@@ -714,7 +647,7 @@ fn setup_start(
 
 fn decode_all(
     reader: &mut DecodeReader,
-    writer: &mut Sink,
+    writer: &mut async_writer::AsyncDecodeWriter,
     spec: Arc<DecoderSpec>,
     mut decoder: Decoder,
     max_frames: Option<u64>,
@@ -831,7 +764,7 @@ fn decode_all(
         let metadata = decoder.metadata();
         let t_w0 = std::time::Instant::now();
         for field in &fields {
-            writer.write(field, metadata.as_ref())?;
+            writer.write_writeable(field.clone(), metadata.as_ref())?;
         }
         if std::env::var_os("LD_TIMING").is_some() {
             ld_decode::teeprintln!("WRITE fields={} us={}", fields.len(), t_w0.elapsed().as_micros());
@@ -857,7 +790,7 @@ fn decode_all(
                 let (consumed, fields) = decoder.decode(&window[skip..], base, true)?;
                 let metadata = decoder.metadata();
                 for field in &fields {
-                    writer.write(field, metadata.as_ref())?;
+                    writer.write_writeable(field.clone(), metadata.as_ref())?;
                 }
                 fields_written += fields.len();
                 if decoder.lead_out() {

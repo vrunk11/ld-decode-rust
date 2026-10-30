@@ -578,11 +578,6 @@ pub struct Decoder {
     analog_audio_freq: f64,
     /// Whether to produce EFM (.efm) output.
     digital_audio: bool,
-    /// Output lines the TBC picture is limited to (see [`Decoder::set_locate_only`]).
-    locate_rows: Option<Vec<usize>>,
-    /// Pass-0 shortcuts of locate-only decodes (see `set_locate_only`): no
-    /// MTF calibration (default), no burst refinement (`LD_PASS0_FAST`).
-    pass0_fast: (bool, bool),
 }
 
 
@@ -702,8 +697,6 @@ impl Decoder {
             readlen,
             analog_audio_freq: 44100.0,
             digital_audio: true,
-            locate_rows: None,
-            pass0_fast: (false, false),
         }
     }
 
@@ -729,34 +722,6 @@ impl Decoder {
             None
         };
         Ok(())
-    }
-
-    /// Decode only what locating the lines and reading the VBI needs: no
-    /// dropout detection, and with `mtf` the MTF calibration on a TBC picture
-    /// resampled only on the VITS lines it reads (line positions
-    /// bit-identical to a full decode); without it, no TBC picture, VITS
-    /// metrics or redo at all (positions move by ~0.015 samples rms; stack
-    /// noise and sharpness unchanged on 18 captures). The picture and
-    /// metadata written are not a usable decode. `LD_PASS0_FAST` overrides
-    /// for experiments: `mtf` / `nomtf`, and `noburst` (no burst refinement,
-    /// measured worse: 0.16 samples).
-    pub fn set_locate_only(&mut self, on: bool, mtf: bool) {
-        let fast = std::env::var("LD_PASS0_FAST").unwrap_or_default();
-        let mtf = if fast.contains("nomtf") { false } else if fast.contains("mtf") { true } else { mtf };
-        self.pass0_fast = (on && !mtf, on && fast.contains("noburst"));
-        self.locate_rows = on.then(|| {
-            let mut rows: Vec<usize> = self
-                .spec
-                .sys_ld_vits_whitelocs
-                .iter()
-                .map(|w| w[0])
-                .chain([self.spec.sys_blacksnr_slice[0]])
-                .map(|l| l - 1)
-                .collect();
-            rows.sort_unstable();
-            rows.dedup();
-            rows
-        });
     }
 
     /// Port of the `lastfieldwritten` analog-audio A/V sync offset: how far
@@ -928,95 +893,84 @@ impl Decoder {
                             efm_pre = Some(input);
                         }
                     }
-                    // Locate-only decodes skip the MTF calibration (see
-                    // `set_locate_only`): no TBC picture, VITS metrics or redo.
-                    if self.pass0_fast.0 {
-                        self.metadata = Some(MetadataFieldState {
-                            out_scale: field.out_scale,
-                            outlinecount: field.outlinecount,
-                        });
-                        redo = None;
-                    } else {
-                        let luma = field.downscale(
-                            self.output_lines,
-                            self.spec.sys_outlinelen,
-                            0,
-                            true,
-                            self.analog_audio_freq,
-                            audio_offset,
-                            &self.side_pool,
-                            efm_pre.as_ref().map(|v| v.as_slice()),
-                            self.locate_rows.as_deref(),
-                        )?;
-                        // downscale(final_=true) already encoded the luma into
-                        // field.dspicture with the same levels; reuse it instead of
-                        // recomputing the identical 1M-sample conversion.
-                        picture = Some(LumaOutput::Encoded(Arc::new(field.dspicture.clone())));
-                        self.metadata = Some(MetadataFieldState {
-                            out_scale: field.out_scale,
-                            outlinecount: field.outlinecount,
-                        });
+                    let luma = field.downscale(
+                        self.output_lines,
+                        self.spec.sys_outlinelen,
+                        0,
+                        true,
+                        self.analog_audio_freq,
+                        audio_offset,
+                        &self.side_pool,
+                        efm_pre.as_ref().map(|v| v.as_slice()),
+                    )?;
+                    // downscale(final_=true) already encoded the luma into
+                    // field.dspicture with the same levels; reuse it instead of
+                    // recomputing the identical 1M-sample conversion.
+                    picture = Some(LumaOutput::Encoded(Arc::new(field.dspicture.clone())));
+                    self.metadata = Some(MetadataFieldState {
+                        out_scale: field.out_scale,
+                        outlinecount: field.outlinecount,
+                    });
 
-                        t_down += t_d0.elapsed().as_nanos() as u64;
-                        let t_v0 = std::time::Instant::now();
-                        let metrics = vits::compute_vits_metrics(&self.spec, field, None);
-                        // Cache for buildmetadata: wSNR/bPSNR don't depend on the
-                        // previous field, so the second call in buildmetadata is a
-                        // pure duplicate for this field.
-                        self.cached_vits = Some(metrics.clone());
-                        if let Some(p) = std::env::var_os("LD_DUMP_BWRATIO") {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-                                let _ = writeln!(f, "{} {:.17} {:.17} {:?} {:?}", self.fields_written, metrics.black_to_white_rf_ratio.unwrap_or(-1.0), self.mtf_level, metrics.white_rf_level, metrics.black_line_rf_level);
-                            }
+                    t_down += t_d0.elapsed().as_nanos() as u64;
+                    let t_v0 = std::time::Instant::now();
+                    let metrics = vits::compute_vits_metrics(&self.spec, field, None);
+                    // Cache for buildmetadata: wSNR/bPSNR don't depend on the
+                    // previous field, so the second call in buildmetadata is a
+                    // pure duplicate for this field.
+                    self.cached_vits = Some(metrics.clone());
+                    if let Some(p) = std::env::var_os("LD_DUMP_BWRATIO") {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                            let _ = writeln!(f, "{} {:.17} {:.17} {:?} {:?}", self.fields_written, metrics.black_to_white_rf_ratio.unwrap_or(-1.0), self.mtf_level, metrics.white_rf_level, metrics.black_line_rf_level);
                         }
-                        if let Some(ratio) = metrics.black_to_white_rf_ratio {
-                            // Python only records the ratio on the first pass (it
-                            // runs inside `if ... and adjusted is False`); the
-                            // redo pass would otherwise double-count the same
-                            // field and skew the MTF calibration.
-                            if !adjusted {
-                                let keep = if self.is_clv { 900 } else { 30 };
-                                self.bw_ratios.push(ratio);
-                                if self.bw_ratios.len() > keep {
-                                    self.bw_ratios.drain(..self.bw_ratios.len() - keep);
-                                }
-                                if let Some(p) = std::env::var_os("LD_DUMP_ISCLV") {
-                                    use std::io::Write;
-                                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open(&p)
-                                    {
-                                        let _ = writeln!(
-                                            f,
-                                            "fw={} is_clv={} keep={} rl={} lc={:?}",
-                                            self.fields_written,
-                                            self.is_clv,
-                                            keep,
-                                            self.fdoffset_abs(),
-                                            field.linecode
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        redo = if !self.check_mtf() {
-                            // Python: `redo = self.fdoffset - offset`, then every
-                            // redo test (`if redo:`, `if adjusted is False and
-                            // redo:`) is a truthiness test — a target of 0.0 is
-                            // FALSY, so a redo of the very first field (fdoffset
-                            // == offset == 0) is silently cancelled and the field
-                            // is written with its first-pass content. Replicating
-                            // that here; Option::Some(0.0) would be truthy.
-                            py_falsy_redo(self.fdoffset_abs() - offset.unwrap_or(0.0))
-                        } else {
-                            None
-                        };
-
-                        t_vits += t_v0.elapsed().as_nanos() as u64;
                     }
+                    if let Some(ratio) = metrics.black_to_white_rf_ratio {
+                        // Python only records the ratio on the first pass (it
+                        // runs inside `if ... and adjusted is False`); the
+                        // redo pass would otherwise double-count the same
+                        // field and skew the MTF calibration.
+                        if !adjusted {
+                            let keep = if self.is_clv { 900 } else { 30 };
+                            self.bw_ratios.push(ratio);
+                            if self.bw_ratios.len() > keep {
+                                self.bw_ratios.drain(..self.bw_ratios.len() - keep);
+                            }
+                            if let Some(p) = std::env::var_os("LD_DUMP_ISCLV") {
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&p)
+                                {
+                                    let _ = writeln!(
+                                        f,
+                                        "fw={} is_clv={} keep={} rl={} lc={:?}",
+                                        self.fields_written,
+                                        self.is_clv,
+                                        keep,
+                                        self.fdoffset_abs(),
+                                        field.linecode
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    redo = if !self.check_mtf() {
+                        // Python: `redo = self.fdoffset - offset`, then every
+                        // redo test (`if redo:`, `if adjusted is False and
+                        // redo:`) is a truthiness test — a target of 0.0 is
+                        // FALSY, so a redo of the very first field (fdoffset
+                        // == offset == 0) is silently cancelled and the field
+                        // is written with its first-pass content. Replicating
+                        // that here; Option::Some(0.0) would be truthy.
+                        py_falsy_redo(self.fdoffset_abs() - offset.unwrap_or(0.0))
+                    } else {
+                        None
+                    };
+
+                    t_vits += t_v0.elapsed().as_nanos() as u64;
                     let t_v1 = std::time::Instant::now();
 
                     // Perform AGC changes on first fields only to prevent luma
@@ -1518,7 +1472,7 @@ impl Decoder {
                     });
                     let blocks: Vec<(u64, &[f32])> =
                         missing.iter().map(|&(bnum, off)| (bnum, &data[off..off + spec.blocklen])).collect();
-                    gpu_demod_blocks(g, &blocks, mtf, pow.as_deref(), &dspec, spec.delays.video_rot, self.locate_rows.is_some())
+                    gpu_demod_blocks(g, &blocks, mtf, pow.as_deref(), &dspec, spec.delays.video_rot)
                 }
                 _ => missing
                     .par_iter()
@@ -1592,7 +1546,6 @@ impl Decoder {
                     let f_mtf = mtf;
                     let memo = Arc::clone(&self.mtf_pow_memo);
                     let gpu = self.gpu_demod.clone();
-                    let locate = self.locate_rows.is_some();
                     let (tx, rx) = std::sync::mpsc::channel();
                     // `install` (not just `spawn`) sets the thread-local pool
                     // so the inner par_iter dispatches onto the dedicated
@@ -1657,7 +1610,7 @@ impl Decoder {
                         }
                         let results: Vec<(u64, BlockDecode)> = if let Some(g) = &gpu {
                             let blocks: Vec<(u64, &[f32])> = inputs.iter().map(|(b, v)| (*b, v.as_slice())).collect();
-                            let out = gpu_demod_blocks(g, &blocks, f_mtf, mtf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec_arc.delays.video_rot, locate);
+                            let out = gpu_demod_blocks(g, &blocks, f_mtf, mtf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec_arc.delays.video_rot);
                             inputs.iter().map(|(b, _)| *b).zip(out).collect()
                         } else { inputs
                             .into_par_iter()
@@ -1721,7 +1674,7 @@ impl Decoder {
                         Some(g) if !prefetch.is_empty() => {
                             let blocks: Vec<(u64, &[f32])> =
                                 prefetch.iter().map(|&(bnum, off)| (bnum, &data[off..off + spec.blocklen])).collect();
-                            gpu_demod_blocks(g, &blocks, mtf, pf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec.delays.video_rot, self.locate_rows.is_some())
+                            gpu_demod_blocks(g, &blocks, mtf, pf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec.delays.video_rot)
                         }
                         _ => prefetch
                             .par_iter()
@@ -1875,23 +1828,15 @@ impl Decoder {
             let dst0 = dsts[0]; let dst1 = dsts[1]; let dst2 = dsts[2]; let dst3 = dsts[3];
             let dst4 = dsts[4]; let dst5 = dsts[5]; let dst6 = dsts[6]; let dst7 = dsts[7];
             let dst8 = dsts[8];
-            // Locate-only decodes (`set_locate_only`) assemble just what line
-            // location reads: video, 0.5 MHz, burst, and the RF input (the
-            // VITS RF levels behind the MTF calibration). The raw demod and
-            // RF highpass only feed dropout detection, the audio and EFM only
-            // their outputs, all off there.
-            let locate = self.locate_rows.is_some();
             enqueue_chan!(0, dst0, parts_demod, f32sz);
+            enqueue_chan!(1, dst1, parts_demod_raw, f32sz);
             enqueue_chan!(2, dst2, parts_demod_05, f32sz);
             enqueue_chan!(3, dst3, parts_demod_burst, f32sz);
+            enqueue_chan!(4, dst4, parts_audio0, f32sz);
+            enqueue_chan!(5, dst5, parts_audio1, f32sz);
+            enqueue_chan!(6, dst6, parts_efm, i16sz);
+            enqueue_chan!(7, dst7, parts_rfhpf, f32sz);
             enqueue_chan!(8, dst8, parts_input, f32sz);
-            if !locate {
-                enqueue_chan!(1, dst1, parts_demod_raw, f32sz);
-                enqueue_chan!(4, dst4, parts_audio0, f32sz);
-                enqueue_chan!(5, dst5, parts_audio1, f32sz);
-                enqueue_chan!(6, dst6, parts_efm, i16sz);
-                enqueue_chan!(7, dst7, parts_rfhpf, f32sz);
-            }
             // Measured on the side pool (6 threads instead of the global 3):
             // the scatter itself drops 2.15 -> 1.72 ms, but the extra memory
             // traffic slows the concurrent prefetch demod enough that the
@@ -1911,7 +1856,6 @@ impl Decoder {
             // wow and sinc instead of blocking the tail; `downscale` receives
             // the result before reading it (same bytes as the inline call).
             let t_ph0 = std::time::Instant::now();
-            if !locate {
             let ph2_audio0 = raw.video.audio[0].clone();
             let ph2_audio1 = raw.video.audio[1].clone();
             let ph2_spec = Arc::clone(&self.spec);
@@ -1924,9 +1868,8 @@ impl Decoder {
                 }));
                 let _ = ph2_cell2.set(res.map_err(|_| ()));
             });
-            raw.audio_pend = Some(ph2_cell);
-            }
             self.dbg.phase2 = t_ph0.elapsed().as_nanos() as u64;
+            raw.audio_pend = Some(ph2_cell);
             raw.efm = std::mem::take(&mut raw.video.efm);
             rawdecode = raw;
 
@@ -1985,7 +1928,7 @@ impl Decoder {
             }
             self.dbg.df_new = rest;
         }
-        let mut field = Field::new(
+        let field = Field::new(
             self.spec.clone(),
             self.levels,
             rawdecode,
@@ -1998,7 +1941,6 @@ impl Decoder {
             false,
             mtf_level,
         );
-        field.skip_burst_refine = self.pass0_fast.1;
         Ok(AssembleOutcome::Field(AssembledField {
             field,
             readloc,
@@ -2125,7 +2067,7 @@ impl Decoder {
             ac3_symbols: 0,
         };
 
-        if self.spec.do_dod && self.locate_rows.is_none() {
+        if self.spec.do_dod {
             let t_dod0 = std::time::Instant::now();
             // Dropouts were already computed as a side task during downscale
             // (pure over the field's data); fall back to a synchronous call
@@ -2576,13 +2518,12 @@ fn gpu_demod_blocks(
     pow: Option<&[Complex64]>,
     dspec: &DemodSpecRef,
     rotdelay: i64,
-    lite: bool,
 ) -> Vec<BlockDecode> {
     let cpu = || -> Vec<BlockDecode> {
         blocks.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect()
     };
     let data: Vec<&[f32]> = blocks.iter().map(|b| b.1).collect();
-    let out = match gpu.demod(&data, mtf, pow, rotdelay, dspec, lite) {
+    let out = match gpu.demod(&data, mtf, pow, rotdelay, dspec) {
         Ok(v) => v,
         Err(e) => {
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2592,7 +2533,7 @@ fn gpu_demod_blocks(
             return cpu();
         }
     };
-    if std::env::var_os("LD_GPU_CHECK").is_some() && !lite {
+    if std::env::var_os("LD_GPU_CHECK").is_some() {
         let reference = cpu();
         let worst = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         let rms = |a: &[f32], b: &[f32]| {

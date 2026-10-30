@@ -122,11 +122,6 @@ pub(crate) struct SincScaleParams {
 ///
 /// `interpolated_pixel_locs` and `wowfactors` must have at least
 /// `outwidth * (lineoffset + 1) + dsout.len()` entries.
-///
-/// `rows`, when given, limits the work to those output lines (the others are
-/// left as they are). Every output sample is computed on its own from the
-/// field-wide wow statistics, so the lines computed are bit-identical to a
-/// full call.
 pub(crate) fn scale_field_sinc(
     buf: &[f32],
     dsout: &mut [f32],
@@ -134,7 +129,6 @@ pub(crate) fn scale_field_sinc(
     wowfactors: &[f64],
     sinc_lut: &[f32],
     params: SincScaleParams,
-    rows: Option<&[usize]>,
 ) {
     assert_eq!(sinc_lut.len(), (SINC_PHASE_COUNT + 1) * SINC_TAP_COUNT);
     let level_adjust_threshold = params.level_adjust_threshold;
@@ -221,8 +215,12 @@ pub(crate) fn scale_field_sinc(
     // time it separates "the gather is slow" from "the pool did not give the
     // gather the threads it asked for" — the two have different fixes.
     let gather_cpu = std::sync::atomic::AtomicU64::new(0);
-    let work = |base: usize, out: &mut [f32]| {
+    dsout
+        .par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(ci, out)| {
             let c0 = std::time::Instant::now();
+            let base = dsout_start + ci * chunk;
             // Fused per-sample: resolve the LUT row pair, blend the 16 weights,
             // gather+accumulate, then move on. No intermediate gather lists —
             // weights live in registers and LLVM interleaves the weight blend
@@ -356,19 +354,7 @@ pub(crate) fn scale_field_sinc(
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
-        };
-    match rows {
-        None => dsout
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(ci, out)| work(dsout_start + ci * chunk, out)),
-        Some(rows) => {
-            let w = params.outwidth;
-            for &r in rows.iter().filter(|&&r| (r + 1) * w <= dsout_len) {
-                work(dsout_start + r * w, &mut dsout[r * w..(r + 1) * w]);
-            }
-        }
-    }
+        });
 
     if subt {
         let t_gather = ts0.elapsed().as_nanos() as u64;
@@ -833,7 +819,6 @@ mod tests {
                 wow_level_adjust_smoothing: 0.0,
                 level_adjust_threshold: 15.0,
             },
-            None,
         );
         for &v in &out {
             assert!((v - 7.0).abs() < 1e-4, "got {v}");
