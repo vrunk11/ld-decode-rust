@@ -53,6 +53,10 @@ pub(crate) const SINC_PHASES: usize = 1024;
 /// (raised cosine from 2.5 to 3.5 MHz, as the prototype's analytic band edge).
 pub(crate) const SPLIT_LO_HZ: f64 = 2.5e6;
 pub(crate) const SPLIT_HI_HZ: f64 = 3.5e6;
+/// PAL: the video FM's lower chroma sideband reaches down to ~2.7 MHz (the
+/// pilot's to 3.0), while EFM stays below 1.75 MHz and the audio carriers at
+/// 0.68 / 1.07 MHz.
+pub(crate) const PAL_SPLIT_HZ: (f64, f64) = (1.9e6, 2.4e6);
 /// Video-band filter: taps and Kaiser beta. Only the crossover's shape depends
 /// on it (the low band is the full signal minus this band), and 128 taps put
 /// the leakage across the crossover near -37 dB.
@@ -596,7 +600,7 @@ fn int_exp(c: f64, a: f64, b: f64) -> Complex64 {
 /// `2 g(f)` for f > 0 and 0 below, `g` rising as a raised cosine over
 /// `SPLIT_LO_HZ..SPLIT_HI_HZ`, flat, then falling over `top` (a raised cosine
 /// too, so the response stays short). Closed form, so the table is exact.
-fn video_band_response(tau: f64, fs: f64, top: (f64, f64)) -> Complex64 {
+fn video_band_response(tau: f64, fs: f64, split: (f64, f64), top: (f64, f64)) -> Complex64 {
     let pi = std::f64::consts::PI;
     let c = 2.0 * pi * tau / fs;
     // Raised-cosine edge over [f0, f1]: 0.5 + s * 0.5 cos(pi (f - f0) / B),
@@ -607,7 +611,7 @@ fn video_band_response(tau: f64, fs: f64, top: (f64, f64)) -> Complex64 {
             + Complex64::from_polar(0.5, k * f0) * int_exp(c - k, f0, f1);
         int_exp(c, f0, f1) * 0.5 + cosine * (0.5 * s)
     };
-    let sum = edge(SPLIT_LO_HZ, SPLIT_HI_HZ, -1.0) + int_exp(c, SPLIT_HI_HZ, top.0) + edge(top.0, top.1, 1.0);
+    let sum = edge(split.0, split.1, -1.0) + int_exp(c, split.1, top.0) + edge(top.0, top.1, 1.0);
     sum * (2.0 / fs)
 }
 
@@ -615,7 +619,7 @@ fn video_band_response(tau: f64, fs: f64, top: (f64, f64)) -> Complex64 {
 /// rows of `HI_TAPS` taps, tap `d` weighting input sample
 /// `k0 - (HI_TAPS/2 - 1) + d` for a position `k0 + p/SINC_PHASES`, Kaiser
 /// windowed.
-fn video_band_lut(fs: f64) -> Vec<Complex64> {
+fn video_band_lut(fs: f64, split: (f64, f64)) -> Vec<Complex64> {
     let top = ((18.0e6f64).min(0.4 * fs), (22.0e6f64).min(0.5 * fs));
     let h = (HI_TAPS / 2) as f64;
     let i0b = bessel_i0(HI_BETA);
@@ -626,7 +630,7 @@ fn video_band_lut(fs: f64) -> Vec<Complex64> {
             // q - n for n = k0 - (h - 1) + d and q = k0 + a.
             let tau = a + (h - 1.0) - d as f64;
             let r = (1.0 - (tau / h).powi(2)).max(0.0);
-            lut.push(video_band_response(tau, fs, top) * (bessel_i0(HI_BETA * r.sqrt()) / i0b));
+            lut.push(video_band_response(tau, fs, split, top) * (bessel_i0(HI_BETA * r.sqrt()) / i0b));
         }
     }
     lut
@@ -954,7 +958,7 @@ pub struct VirtualSource {
 }
 
 impl VirtualSource {
-    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, opencl: bool, exact: bool) -> Result<Self> {
+    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool) -> Result<Self> {
         // 1/sigma^2 from each input's noise floor, measured where pass 0
         // first located it (the stream starts before the rest is known).
         let mut weight = Vec::new();
@@ -965,7 +969,7 @@ impl VirtualSource {
             weight.push(1.0 / sig2);
         }
         tracing::info!("stack: {} input(s), read-time TBC as pass 0 locates the lines", inputs.len());
-        let hi_lut = video_band_lut(fs);
+        let hi_lut = video_band_lut(fs, if pal { PAL_SPLIT_HZ } else { (SPLIT_LO_HZ, SPLIT_HI_HZ) });
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
         let fir = [

@@ -336,7 +336,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, request.inputfreq, args.device, args.preset)?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset)?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -510,6 +510,7 @@ fn read_tbc_source(
     inputs: &[String],
     format: Option<reader::SampleFormat>,
     inputfreq: f64,
+    pal: bool,
     device: Device,
     preset: Preset,
 ) -> Result<stack::VirtualSource> {
@@ -520,7 +521,9 @@ fn read_tbc_source(
     let stacked = inputs.iter().zip(&fmts).map(|(p, &f)| stack::StackInput::new(p, f)).collect::<Result<Vec<_>>>()?;
     let fs = inputfreq * 1e6;
     // NTSC line: 286 lines per 4.5 MHz.
-    let live = stack::Live::new(inputs.to_vec(), stacked[0].len(), fs * 286.0 / 4.5e6);
+    // Line: NTSC 286 lines per 4.5 MHz, PAL 64 us.
+    let linelen = if pal { fs * 64e-6 } else { fs * 286.0 / 4.5e6 };
+    let live = stack::Live::new(inputs.to_vec(), stacked[0].len(), linelen);
     // Pass 0, one per input running alongside the stacked decode: it locates
     // the lines and reads the VBI codes from the RF, and the timeline is laid
     // down as it goes, so it stops where the stacked decode stops.
@@ -530,11 +533,12 @@ fn read_tbc_source(
         std::thread::Builder::new().name(format!("pass0-{i}")).spawn(move || {
             tracing::info!("read-time TBC pass 0: locating the lines of {path}");
             // A panic would leave the stacked decode waiting on this input.
-            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rfsync::locate(&src, fs, &live, i)));
+            let sys = if pal { rfsync::System::pal() } else { rfsync::System::ntsc() };
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rfsync::locate(&src, fs, &sys, &live, i)));
             live.finish(i, run.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))));
         })?;
     }
-    stack::VirtualSource::new(stacked, live, fs, device == Device::Opencl, preset == Preset::Slow)
+    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow)
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF
