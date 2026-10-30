@@ -3317,7 +3317,7 @@ mod tests {
         let audio_lfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 146.25;
         let audio_rfreq = (1e6 * SYS_FSC_MHZ / 227.5) * 178.75;
         let ([left, right], fdiv) =
-            compute_audio_filters(40e6, 20e6, 32768, audio_lfreq, audio_rfreq);
+            compute_audio_filters(&NTSC, 40e6, 20e6, 32768, audio_lfreq, audio_rfreq);
         assert_eq!(fdiv, 32);
         assert!((left.a1_freq - 1250000.0).abs() < 1e-6);
         assert!((right.low_freq - 2500000.0).abs() < 1e-6);
