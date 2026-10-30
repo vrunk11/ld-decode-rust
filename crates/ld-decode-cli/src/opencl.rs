@@ -18,14 +18,16 @@ const SOURCE: &str = r#"
 // One input read at its virtual samples: the full signal (sinc) and the
 // analytic video band, as stack.rs compute_task does.
 __kernel void read_input(
-    __global const float* raw,
+    __global const float* raw_all,
     __global const uint* seg,
     __global const double* seg_t0,
-    __global const double* a0,
-    __global const double* slope,
+    __global const double* a0_all,
+    __global const double* slope_all,
     const double s0,
     const int len,
     const int base,
+    const long raw_off,
+    const int seg_off,
     __global const float* sinc,
     __global const float2* hil,
     __global float* full,
@@ -34,6 +36,9 @@ __kernel void read_input(
 {
     int j = get_global_id(0);
     if (j >= len) return;
+    __global const float* raw = raw_all + raw_off;
+    __global const double* a0 = a0_all + seg_off;
+    __global const double* slope = slope_all + seg_off;
     uint k = seg[j];
     double a = a0[k];
     if (isnan(a)) {
@@ -60,7 +65,10 @@ __kernel void read_input(
 }
 
 // Phase-lock every input's video band onto the primary's over LOCK_WIN
-// samples and sum with the weights (the rest of each input as read).
+// samples and sum with the weights (the rest of each input as read). A
+// work-group of TILE outputs stages the window products of each input in
+// local memory once, so the 128-sample sums read it instead of global memory.
+#define TILE 256
 __kernel void combine(
     const int ni,
     const int len,
@@ -72,30 +80,39 @@ __kernel void combine(
     __global const float* weight,
     __global float* out)
 {
+    __local float2 prod[TILE + LOCK_WIN];
+    int lid = get_local_id(0);
     int jo = get_global_id(0);
-    if (jo >= n) return;
     int j = jo + m;
+    int t0 = (int)get_group_id(0) * TILE + m - LOCK_WIN / 2;
+    bool active = jo < n;
     float acc = 0.0f, wsum = 0.0f;
-    if (cov[j]) { acc += full[j] * weight[0]; wsum += weight[0]; }
-    int lo = max(0, j - LOCK_WIN / 2), up = min(len, j + LOCK_WIN / 2);
+    if (active && cov[j]) { acc += full[j] * weight[0]; wsum += weight[0]; }
     for (int i = 1; i < ni; i++) {
         int b = i * len;
-        if (!cov[b + j]) continue;
-        float2 r = (float2)(0.0f, 0.0f);
-        for (int t = lo; t < up; t++) {
-            if (cov[t] && cov[b + t]) {
+        for (int u = lid; u < TILE + LOCK_WIN; u += TILE) {
+            int t = t0 + u;
+            float2 v = (float2)(0.0f, 0.0f);
+            if (t >= 0 && t < len && cov[t] && cov[b + t]) {
                 float2 x = hi[t], y = hi[b + t];
-                r += (float2)(x.x * y.x + x.y * y.y, x.y * y.x - x.x * y.y);
+                v = (float2)(x.x * y.x + x.y * y.y, x.y * y.x - x.x * y.y);
             }
+            prod[u] = v;
         }
-        float a = length(r);
-        float2 rot = a > 0.0f ? r / a : (float2)(1.0f, 0.0f);
-        float2 d = rot - (float2)(1.0f, 0.0f);
-        float2 z = hi[b + j];
-        acc += (full[b + j] + (z.x * d.x - z.y * d.y)) * weight[i];
-        wsum += weight[i];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (active && cov[b + j]) {
+            float2 r = (float2)(0.0f, 0.0f);
+            for (int u = 0; u < LOCK_WIN; u++) r += prod[lid + u];
+            float a = length(r);
+            float2 rot = a > 0.0f ? r / a : (float2)(1.0f, 0.0f);
+            float2 d = rot - (float2)(1.0f, 0.0f);
+            float2 z = hi[b + j];
+            acc += (full[b + j] + (z.x * d.x - z.y * d.y)) * weight[i];
+            wsum += weight[i];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    out[jo] = wsum > 0.0f ? acc / wsum : 0.0f;
+    if (active) out[jo] = wsum > 0.0f ? acc / wsum : 0.0f;
 }
 "#;
 
@@ -177,18 +194,29 @@ impl StackGpu {
         st.out.ensure(out.len() * 4)?;
         st.q.write(&st.seg, 0, &plan.seg)?;
         st.q.write(&st.seg_t0, 0, &plan.seg_t0)?;
+        // Every input in one upload: spans back to back, segment laws at
+        // `i * nseg` (all NaN for an input this read does not cover).
+        let nseg = plan.seg_t0.len();
+        let mut raw = Vec::new();
+        let mut offs = Vec::with_capacity(ni);
+        let mut a0 = vec![f64::NAN; ni * nseg];
+        let mut slope = vec![0.0f64; ni * nseg];
         for (i, span) in plan.inputs.iter().enumerate() {
-            let Some(span) = span else {
-                // Not covered anywhere in this read.
-                st.q.write(&st.cov, i * len, &vec![0u8; len])?;
-                continue;
-            };
-            st.raw.ensure(span.raw.len() * 4)?;
-            st.a0.ensure(span.a0.len() * 8)?;
-            st.slope.ensure(span.slope.len() * 8)?;
-            st.q.write(&st.raw, 0, &span.raw)?;
-            st.q.write(&st.a0, 0, &span.a0)?;
-            st.q.write(&st.slope, 0, &span.slope)?;
+            offs.push(raw.len() as i64);
+            if let Some(span) = span {
+                raw.extend_from_slice(&span.raw);
+                a0[i * nseg..(i + 1) * nseg].copy_from_slice(&span.a0);
+                slope[i * nseg..(i + 1) * nseg].copy_from_slice(&span.slope);
+            }
+        }
+        let t0 = std::time::Instant::now();
+        st.raw.ensure(raw.len() * 4)?;
+        st.a0.ensure(a0.len() * 8)?;
+        st.slope.ensure(slope.len() * 8)?;
+        st.q.write(&st.raw, 0, &raw)?;
+        st.q.write(&st.a0, 0, &a0)?;
+        st.q.write(&st.slope, 0, &slope)?;
+        for (i, &off) in offs.iter().enumerate() {
             st.k_read.args(&[
                 Arg::Buf(&st.raw),
                 Arg::Buf(&st.seg),
@@ -198,6 +226,8 @@ impl StackGpu {
                 Arg::F64(plan.s0),
                 Arg::I32(len as i32),
                 Arg::I32((i * len) as i32),
+                Arg::I64(off),
+                Arg::I32((i * nseg) as i32),
                 Arg::Buf(&st.sinc),
                 Arg::Buf(&st.hil),
                 Arg::Buf(&st.full),
@@ -205,9 +235,13 @@ impl StackGpu {
                 Arg::Buf(&st.cov),
             ])?;
             st.q.launch(&st.k_read, &[len], 256)?;
-            // The raw/a0/slope buffers are reused by the next input.
+        }
+        let timing = std::env::var_os("LD_TIMING").is_some();
+        let t1 = std::time::Instant::now();
+        if timing {
             st.q.finish()?;
         }
+        let t2 = std::time::Instant::now();
         st.k_combine.args(&[
             Arg::I32(ni as i32),
             Arg::I32(len as i32),
@@ -220,6 +254,15 @@ impl StackGpu {
             Arg::Buf(&st.out),
         ])?;
         st.q.launch(&st.k_combine, &[out.len()], 256)?;
-        st.q.read(&st.out, 0, out)
+        st.q.read(&st.out, 0, out)?;
+        if timing {
+            ld_decode::teeprintln!(
+                "STACKCL upload_us={} read_us={} combine_us={}",
+                (t1 - t0).as_micros(),
+                (t2 - t1).as_micros(),
+                t2.elapsed().as_micros()
+            );
+        }
+        Ok(())
     }
 }

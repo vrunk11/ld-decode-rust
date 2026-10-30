@@ -253,6 +253,7 @@ impl Drop for Kernel {
 pub enum Arg<'a> {
     Buf(&'a Buffer),
     I32(i32),
+    I64(i64),
     F32(f32),
     F64(f64),
 }
@@ -263,6 +264,7 @@ impl Kernel {
             let (size, ptr): (usize, *const c_void) = match a {
                 Arg::Buf(b) => (std::mem::size_of::<Handle>(), (&b.mem as *const Handle).cast()),
                 Arg::I32(v) => (4, (v as *const i32).cast()),
+                Arg::I64(v) => (8, (v as *const i64).cast()),
                 Arg::F32(v) => (4, (v as *const f32).cast()),
                 Arg::F64(v) => (8, (v as *const f64).cast()),
             };
