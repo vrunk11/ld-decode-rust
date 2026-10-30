@@ -803,14 +803,177 @@ impl Inner {
     }
 }
 
-/// The read-time corrected (and, with several inputs, combined) RF stream.
-pub struct VirtualSource {
+/// Virtual samples per read-ahead chunk.
+const CHUNK: usize = 1 << 21;
+/// Chunks computed ahead of the decoder's read position.
+const AHEAD: u64 = 3;
+/// Chunks kept behind it, for the decoder's short rewinds.
+const BEHIND: u64 = 1;
+
+/// What computes the stream: the inputs and timeline, the pool, the GPU.
+struct Engine {
     inner: Arc<Inner>,
-    pos: u64,
     /// Its own pool on every core: the global rayon pool is the decoder's
     /// small tail pool (a quarter of the demod budget).
     pool: rayon::ThreadPool,
     gpu: Option<crate::opencl::StackGpu>,
+}
+
+impl Engine {
+    /// The GPU path's plan for `n` samples at `s0` (with the lock margins).
+    fn gpu_plan(&self, s0: u64, n: usize) -> Result<Plan> {
+        let m = LOCK_MARGIN;
+        self.inner.plan(s0 as f64 - m as f64, n + 2 * m, self.inner.has_codes())
+    }
+
+    /// Samples `[s0, s0 + n)` of the stream; `plan` is the GPU plan for
+    /// exactly that span when it was prepared ahead.
+    fn compute(&self, s0: u64, n: usize, plan: Option<Plan>) -> Result<Vec<f32>> {
+        let mut out = vec![0f32; n];
+        let inner = &self.inner;
+        self.pool.install(|| match &self.gpu {
+            Some(gpu) => {
+                let t0 = std::time::Instant::now();
+                let plan = match plan {
+                    Some(p) => p,
+                    None => self.gpu_plan(s0, n)?,
+                };
+                let t1 = std::time::Instant::now();
+                gpu.run(&plan, LOCK_MARGIN, &mut out)?;
+                if std::env::var_os("LD_TIMING").is_some() {
+                    ld_decode::teeprintln!("STACKGPU plan_us={} gpu_us={}", (t1 - t0).as_micros(), t1.elapsed().as_micros());
+                }
+                Ok(())
+            }
+            None => out
+                .par_chunks_mut(TASK)
+                .enumerate()
+                .try_for_each(|(c, chunk)| compute_task(inner, s0 + (c * TASK) as u64, chunk)),
+        })?;
+        Ok(out)
+    }
+}
+
+/// The read-ahead buffer: chunks of the stream computed by a producer thread
+/// ahead of the decoder, so the stacking (and pass 0's progress it waits on)
+/// overlaps the decode instead of stalling it on every read.
+struct Ahead {
+    state: Mutex<AheadState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct AheadState {
+    /// Chunk the decoder reads next.
+    want: u64,
+    chunks: std::collections::BTreeMap<u64, Arc<Vec<f32>>>,
+    /// Stream length, once pass 0 has located the whole primary.
+    len: Option<u64>,
+    error: Option<String>,
+    stop: bool,
+}
+
+impl Ahead {
+    /// The producer: compute the missing chunks of `[want, want + AHEAD)`,
+    /// in order. On the GPU the next chunk's plan (its file reads, and the
+    /// wait for pass 0) is prepared while the current one runs.
+    fn produce(&self, engine: &Engine) {
+        let mut prepared: Option<(u64, Plan)> = None;
+        loop {
+            let c = {
+                let mut st = self.state.lock().unwrap();
+                loop {
+                    if st.stop || st.error.is_some() {
+                        return;
+                    }
+                    let end = st.len.map_or(u64::MAX, |l| l.div_ceil(CHUNK as u64));
+                    if let Some(c) = (st.want..(st.want + AHEAD).min(end)).find(|c| !st.chunks.contains_key(c)) {
+                        break c;
+                    }
+                    st = self.cv.wait(st).unwrap();
+                }
+            };
+            match self.compute_chunk(engine, c, &mut prepared) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.state.lock().unwrap().error = Some(format!("{e:#}"));
+                    self.cv.notify_all();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn compute_chunk(&self, engine: &Engine, c: u64, prepared: &mut Option<(u64, Plan)>) -> Result<()> {
+        let s0 = c * CHUNK as u64;
+        // Wait for pass 0 to cover the chunk; that also says where the stream
+        // ends once it is known.
+        let len = engine.inner.live.wait_cover((s0 + (CHUNK + LOCK_MARGIN) as u64) as f64)?;
+        let n = len.map_or(CHUNK, |l| (l.saturating_sub(s0) as usize).min(CHUNK));
+        let plan = prepared.take().filter(|(pc, _)| *pc == c).map(|(_, p)| p);
+        let data = if engine.gpu.is_some() {
+            // Prepare the next chunk's plan alongside this chunk's GPU run.
+            let next = c + 1;
+            let next_ok = len.is_none_or(|l| next * (CHUNK as u64) < l);
+            // On the stack's own pool: from this plain thread a bare `join`
+            // would run on the global pool, which the decoders fill and then
+            // block on this very buffer.
+            let (data, next_plan) = engine.pool.install(|| rayon::join(
+                || engine.compute(s0, n, plan),
+                || -> Result<Option<(u64, Plan)>> {
+                    if !next_ok || engine.inner.live.wait_cover(((next + 1) * CHUNK as u64 + LOCK_MARGIN as u64) as f64)?.is_some() {
+                        return Ok(None);
+                    }
+                    Ok(Some((next, engine.gpu_plan(next * CHUNK as u64, CHUNK)?)))
+                },
+            ));
+            *prepared = next_plan?;
+            data?
+        } else {
+            engine.compute(s0, n, None)?
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Some(l) = len {
+            st.len = Some(l);
+        }
+        st.chunks.insert(c, Arc::new(data));
+        let keep_from = st.want.saturating_sub(BEHIND);
+        st.chunks.retain(|&k, _| k >= keep_from);
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    /// Chunk `c`, waiting for the producer; None past the end.
+    fn chunk(&self, c: u64) -> Result<Option<Arc<Vec<f32>>>> {
+        let mut st = self.state.lock().unwrap();
+        if st.want != c {
+            st.want = c;
+            // Drop what a seek has left behind.
+            let keep_from = c.saturating_sub(BEHIND);
+            st.chunks.retain(|&k, _| k >= keep_from);
+            self.cv.notify_all();
+        }
+        loop {
+            if let Some(e) = &st.error {
+                bail!("{e}");
+            }
+            if let Some(d) = st.chunks.get(&c) {
+                return Ok(Some(Arc::clone(d)));
+            }
+            if st.len.is_some_and(|l| c * CHUNK as u64 >= l) {
+                return Ok(None);
+            }
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+}
+
+/// The read-time corrected (and, with several inputs, combined) RF stream.
+pub struct VirtualSource {
+    live: Arc<Live>,
+    ahead: Arc<Ahead>,
+    producer: Option<std::thread::JoinHandle<()>>,
+    pos: u64,
 }
 
 impl VirtualSource {
@@ -833,30 +996,15 @@ impl VirtualSource {
             hi_lut.iter().map(|c| c.re as f32).collect(),
             hi_lut.iter().map(|c| c.im as f32).collect(),
         ];
-        let inner = Inner { inputs, live, weight, hi_lut, fir };
+        let inner = Inner { inputs, live: Arc::clone(&live), weight, hi_lut, fir };
         let gpu = if opencl { Some(crate::opencl::StackGpu::new(&inner)?) } else { None };
-        Ok(Self { inner: Arc::new(inner), pos: 0, pool, gpu })
-    }
-
-    fn compute(&self, s0: u64, out: &mut [f32]) -> Result<()> {
-        let inner = &self.inner;
-        self.pool.install(|| match &self.gpu {
-            Some(gpu) => {
-                let m = LOCK_MARGIN;
-                let t0 = std::time::Instant::now();
-                let plan = inner.plan(s0 as f64 - m as f64, out.len() + 2 * m, inner.has_codes())?;
-                let t1 = std::time::Instant::now();
-                gpu.run(&plan, m, out)?;
-                if std::env::var_os("LD_TIMING").is_some() {
-                    ld_decode::teeprintln!("STACKGPU plan_us={} gpu_us={}", (t1 - t0).as_micros(), t1.elapsed().as_micros());
-                }
-                Ok(())
-            }
-            None => out
-                .par_chunks_mut(TASK)
-                .enumerate()
-                .try_for_each(|(c, chunk)| compute_task(inner, s0 + (c * TASK) as u64, chunk)),
-        })
+        let engine = Engine { inner: Arc::new(inner), pool, gpu };
+        let ahead = Arc::new(Ahead { state: Mutex::new(AheadState::default()), cv: Condvar::new() });
+        let producer = {
+            let ahead = Arc::clone(&ahead);
+            std::thread::Builder::new().name("stack-ahead".into()).spawn(move || ahead.produce(&engine))?
+        };
+        Ok(Self { live, ahead, producer: Some(producer), pos: 0 })
     }
 }
 
@@ -961,32 +1109,35 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
 
 impl Drop for VirtualSource {
     fn drop(&mut self) {
-        self.inner.live.stop();
+        self.live.stop();
+        self.ahead.state.lock().unwrap().stop = true;
+        self.ahead.cv.notify_all();
+        // The producer may be inside a chunk waiting on pass 0, which the
+        // stop above releases; it is not joined, the process is ending.
+        drop(self.producer.take());
     }
 }
 
 impl SampleSource for VirtualSource {
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
-        // Wait until pass 0 has located every input that far (the length is
-        // only known once the primary is fully located).
-        let end = self.pos as f64 + (out.len() + LOCK_MARGIN) as f64;
         let tw = std::time::Instant::now();
-        let cover = self.inner.live.wait_cover(end)?;
-        if std::env::var_os("LD_TIMING").is_some() {
-            ld_decode::teeprintln!("STACKWAIT us={}", tw.elapsed().as_micros());
-        }
-        let n = match cover {
-            Some(len) => (len.saturating_sub(self.pos) as usize).min(out.len()),
-            None => out.len(),
-        };
-        if n > 0 {
-            let t0 = std::time::Instant::now();
-            self.compute(self.pos, &mut out[..n])?;
-            if std::env::var_os("LD_TIMING").is_some() {
-                ld_decode::teeprintln!("STACK read at={} n={} us={}", self.pos, n, t0.elapsed().as_micros());
+        let mut n = 0;
+        while n < out.len() {
+            let at = self.pos + n as u64;
+            let c = at / CHUNK as u64;
+            let Some(chunk) = self.ahead.chunk(c)? else { break };
+            let from = (at - c * CHUNK as u64) as usize;
+            if from >= chunk.len() {
+                break;
             }
-            self.pos += n as u64;
+            let take = (chunk.len() - from).min(out.len() - n);
+            out[n..n + take].copy_from_slice(&chunk[from..from + take]);
+            n += take;
         }
+        if std::env::var_os("LD_TIMING").is_some() {
+            ld_decode::teeprintln!("STACKWAIT us={} n={}", tw.elapsed().as_micros(), n);
+        }
+        self.pos += n as u64;
         Ok(n)
     }
 
