@@ -1,10 +1,12 @@
 //! Time-base correction at read time (`--tbc read`), and multi-source stacking
 //! built on it.
 //!
-//! Pass 0 decodes every input once and keeps, per field, the VBI frame code,
-//! the parity and the absolute position of each line. Fields of the same frame
-//! are paired across inputs, and the primary's (first input's) lines define a
-//! timeline of nominal-length lines. [`VirtualSource`] serves that timeline as
+//! Pass 0 decodes every input (one decode per input, running alongside the
+//! stacked decode) and keeps, per field, the VBI frame code, the parity and
+//! the absolute position of each line. Fields of the same frame are paired
+//! across inputs, and the primary's (first input's) lines define a timeline of
+//! nominal-length lines, laid down as far as every input is located ([`Live`]);
+//! pass 0 thus stops where the stacked decode stops. [`VirtualSource`] serves that timeline as
 //! an RF stream: every output sample reads each input at its own position for
 //! that instant, the inputs are combined with 1/sigma^2 weights, and the
 //! ordinary decoder then runs on it unchanged, so its sync, VBI, dropout and
@@ -21,7 +23,8 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{bail, Context as _, Result};
 use ld_decode::{DecoderMetadata, WriteableField};
@@ -72,44 +75,317 @@ pub struct FieldRec {
     pub lines: Vec<f64>,
 }
 
-/// Pass-0 sink: keeps the field records, writes nothing.
-#[derive(Default)]
+/// Pass-0 sink of one input: turns each decoded field into a record and hands
+/// it to the live timeline.
 pub struct Pass0Collector {
-    pub fields: Vec<FieldRec>,
+    live: Arc<Live>,
+    input: usize,
+    /// Parity and frame code of the previous field.
+    last: Option<(bool, Option<Vec<i64>>)>,
 }
 
 impl Pass0Collector {
-    pub fn put(&mut self, field: &WriteableField) {
+    pub fn new(live: Arc<Live>, input: usize) -> Self {
+        Self { live, input, last: None }
+    }
+
+    pub fn put(&mut self, field: &WriteableField) -> Result<()> {
+        if self.live.stop.load(Ordering::Relaxed) {
+            bail!("stack: pass 0 no longer needed");
+        }
         let info = field.info();
         let code = if info.is_first_field {
             info.vbi.as_ref().map(|v| frame_code(&v.vbi_data)).filter(|c| !c.is_empty())
         } else {
             // A second field belongs to the frame its first field opened.
-            self.fields.last().filter(|p| p.first).and_then(|p| p.code.clone())
+            self.last.as_ref().filter(|p| p.0).and_then(|p| p.1.clone())
         };
+        self.last = Some((info.is_first_field, code.clone()));
         let base = info.file_loc as f64;
-        self.fields.push(FieldRec {
-            first: info.is_first_field,
-            code,
-            lines: field.linelocs.iter().map(|l| base + l).collect(),
-        });
+        self.live.push(
+            self.input,
+            FieldRec { first: info.is_first_field, code, lines: field.linelocs.iter().map(|l| base + l).collect() },
+        );
+        Ok(())
     }
 
     pub fn finish(&mut self, _metadata: Option<DecoderMetadata>) {}
+}
 
-    /// Text dump of the records (`LD_DUMP_PASS0`), exact to the bit.
-    pub fn dump(&self, path: &std::path::Path) -> Result<()> {
-        use std::fmt::Write as _;
-        let mut s = String::new();
-        for f in &self.fields {
-            let _ = write!(s, "{} {:?}", f.first, f.code);
-            for l in &f.lines {
-                let _ = write!(s, " {:016x}", l.to_bits());
-            }
-            s.push('\n');
+/// Text dump of pass-0 records (`LD_DUMP_PASS0`), exact to the bit.
+fn dump_records(fields: &[FieldRec], path: &std::path::Path) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for f in fields {
+        let _ = write!(s, "{} {:?}", f.first, f.code);
+        for l in &f.lines {
+            let _ = write!(s, " {:016x}", l.to_bits());
         }
-        std::fs::write(path, s)?;
-        Ok(())
+        s.push('\n');
+    }
+    std::fs::write(path, s)
+}
+
+/// Frame code and parity: what pairs a field across inputs.
+type Key = (Vec<i64>, bool);
+
+/// A secondary input's field is paired only once this many later fields of
+/// that input are known, so a frame code it repeats within them (a skip back
+/// in that capture) is seen as ambiguous and left out, as a whole-file pass
+/// would.
+const PAIR_LOOKAHEAD: usize = 16;
+
+/// The timeline, built while pass 0 runs: one pass-0 decode per input feeds
+/// its field records in, and the anchors are laid down as far as every input
+/// has been located. The virtual source waits on it, so pass 0 runs alongside
+/// the decode of the stacked stream and only as far as that decode goes.
+pub struct Live {
+    state: Mutex<LiveState>,
+    cv: Condvar,
+    stop: AtomicBool,
+    paths: Vec<String>,
+    linelen: f64,
+    /// Primary capture length (samples): the stream's tail ends there.
+    prim_len: f64,
+}
+
+struct LiveState {
+    fields: Vec<Vec<FieldRec>>,
+    done: Vec<bool>,
+    error: Option<String>,
+    /// Primary field index of each key (first occurrence).
+    prim_map: HashMap<Key, usize>,
+    /// Paired fields of each secondary (None: code repeated, ambiguous).
+    sec_map: Vec<HashMap<Key, Option<usize>>>,
+    /// Secondary fields examined for pairing so far.
+    confirmed: Vec<usize>,
+    /// 1 + the furthest primary field each secondary has been paired with.
+    progress: Vec<usize>,
+    paired: Vec<usize>,
+    next_primary: usize,
+    last: f64,
+    tl: Timeline,
+    finalized: bool,
+}
+
+impl Live {
+    pub fn new(paths: Vec<String>, prim_len: u64, linelen: f64) -> Arc<Self> {
+        let n = paths.len();
+        Arc::new(Self {
+            state: Mutex::new(LiveState {
+                fields: vec![Vec::new(); n],
+                done: vec![false; n],
+                error: None,
+                prim_map: HashMap::new(),
+                sec_map: vec![HashMap::new(); n],
+                confirmed: vec![0; n],
+                progress: vec![0; n],
+                paired: vec![0; n],
+                next_primary: 0,
+                last: f64::NEG_INFINITY,
+                tl: Timeline { t: Vec::new(), pos: vec![Vec::new(); n] },
+                finalized: false,
+            }),
+            cv: Condvar::new(),
+            stop: AtomicBool::new(false),
+            paths,
+            linelen,
+            prim_len: prim_len as f64,
+        })
+    }
+
+    fn push(&self, input: usize, rec: FieldRec) {
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        if input == 0 {
+            if let Some(c) = &rec.code {
+                let key = (c.clone(), rec.first);
+                let idx = *st.prim_map.entry(key.clone()).or_insert(st.fields[0].len());
+                for s in 1..self.paths.len() {
+                    if st.sec_map[s].contains_key(&key) {
+                        st.progress[s] = st.progress[s].max(idx + 1);
+                    }
+                }
+            }
+        }
+        st.fields[input].push(rec);
+        self.advance(st);
+        self.cv.notify_all();
+    }
+
+    /// Pass 0 of `input` ended (Err: it failed, unless the stack stopped it).
+    pub fn finish(&self, input: usize, result: Result<()>) {
+        let mut st = self.state.lock().unwrap();
+        st.done[input] = true;
+        match result {
+            Err(e) if !self.stop.load(Ordering::Relaxed) => {
+                st.error.get_or_insert_with(|| format!("pass 0 of {}: {e:#}", self.paths[input]));
+            }
+            _ => tracing::info!("read-time TBC pass 0: {} fields in {}", st.fields[input].len(), self.paths[input]),
+        }
+        if let Some(dir) = std::env::var_os("LD_DUMP_PASS0") {
+            let path = std::path::Path::new(&dir).join(format!("pass0_{input}.txt"));
+            if let Err(e) = dump_records(&st.fields[input], &path) {
+                tracing::warn!("LD_DUMP_PASS0: {e}");
+            }
+        }
+        self.advance(&mut st);
+        self.cv.notify_all();
+    }
+
+    /// Lay down every anchor all inputs are located for.
+    fn advance(&self, st: &mut LiveState) {
+        let n = self.paths.len();
+        let linelen = self.linelen;
+        for s in 1..n {
+            while st.confirmed[s] < st.fields[s].len()
+                && (st.done[s] || st.fields[s].len() - st.confirmed[s] > PAIR_LOOKAHEAD)
+            {
+                let k = st.confirmed[s];
+                st.confirmed[s] += 1;
+                let f = &st.fields[s][k];
+                let Some(c) = &f.code else { continue };
+                let key = (c.clone(), f.first);
+                let end = (k + 1 + PAIR_LOOKAHEAD).min(st.fields[s].len());
+                let repeated = st.fields[s][k + 1..end].iter().any(|g| g.first == f.first && g.code.as_ref() == Some(c));
+                st.sec_map[s]
+                    .entry(key.clone())
+                    .and_modify(|e| *e = None)
+                    .or_insert(if repeated { None } else { Some(k) });
+                if let Some(&q) = st.prim_map.get(&key) {
+                    st.progress[s] = st.progress[s].max(q + 1);
+                }
+            }
+        }
+
+        while let Some(f) = st.fields[0].get(st.next_primary) {
+            let pf = st.next_primary;
+            let key = f.code.as_ref().map(|c| (c.clone(), f.first));
+            // Each secondary has this frame paired, or is past it (it has
+            // been paired with a later primary field), or is finished.
+            let ready = (1..n).all(|s| {
+                st.done[s]
+                    || key.as_ref().is_none_or(|k| st.sec_map[s].contains_key(k))
+                    || st.progress[s] > pf + 1
+            });
+            if !ready {
+                break;
+            }
+            let matched: Vec<Option<usize>> = (0..n)
+                .map(|s| if s == 0 { None } else { key.as_ref().and_then(|k| st.sec_map[s].get(k).copied().flatten()) })
+                .collect();
+            for s in 1..n {
+                st.paired[s] += usize::from(matched[s].is_some());
+            }
+            let f = &st.fields[0][pf];
+            for (l, &a) in f.lines.iter().enumerate() {
+                // Fields overlap by a few lines; keep each line once, in order.
+                if a <= st.last + 0.25 * linelen {
+                    continue;
+                }
+                let tk = match st.tl.t.last() {
+                    // The timeline starts at the primary's own first line;
+                    // before it, the primary alone at its own rate (the
+                    // decoder needs that lead-in to find the first field).
+                    None => {
+                        if a >= 1.0 {
+                            st.tl.t.push(0.0);
+                            st.tl.pos[0].push(0.0);
+                            for p in st.tl.pos.iter_mut().skip(1) {
+                                p.push(f64::NAN);
+                            }
+                        }
+                        a
+                    }
+                    Some(&tp) => {
+                        let lines = ((2.0 * (a - st.last) / linelen).round() / 2.0).max(0.5);
+                        tp + lines * linelen
+                    }
+                };
+                st.tl.t.push(tk);
+                st.tl.pos[0].push(a);
+                for s in 1..n {
+                    let p = matched[s].and_then(|g| st.fields[s][g].lines.get(l).copied()).unwrap_or(f64::NAN);
+                    st.tl.pos[s].push(p);
+                }
+                st.last = a;
+            }
+            st.next_primary += 1;
+        }
+
+        if !st.finalized && st.done[0] && st.next_primary == st.fields[0].len() {
+            st.finalized = true;
+            if st.tl.t.len() < 2 {
+                st.error.get_or_insert_with(|| "pass 0 found no usable lines in the primary input".to_string());
+                return;
+            }
+            // After the last line, the primary alone again (the tail).
+            let (t_last, a_last) = (*st.tl.t.last().unwrap(), *st.tl.pos[0].last().unwrap());
+            let tail = self.prim_len - a_last;
+            if tail >= 1.0 {
+                st.tl.t.push(t_last + tail);
+                st.tl.pos[0].push(a_last + tail);
+                for p in st.tl.pos.iter_mut().skip(1) {
+                    p.push(f64::NAN);
+                }
+            }
+            for s in 1..n {
+                tracing::info!(
+                    "stack: {} paired {} of the primary's {} fields",
+                    self.paths[s],
+                    st.paired[s],
+                    st.fields[0].len()
+                );
+            }
+        }
+    }
+
+    /// Block until the timeline reaches ideal time `end`, or is complete;
+    /// then the stream length if it is known.
+    fn wait_cover(&self, end: f64) -> Result<Option<u64>> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(e) = &st.error {
+                bail!("{e}");
+            }
+            if st.finalized {
+                return Ok(Some(*st.tl.t.last().unwrap() as u64));
+            }
+            if st.tl.t.last().is_some_and(|&t| t >= end) {
+                return Ok(None);
+            }
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    /// The anchors around `[s0, s0 + len)`, copied out.
+    fn slice(&self, s0: f64, len: usize) -> Result<Timeline> {
+        self.wait_cover(s0 + len as f64)?;
+        let st = self.state.lock().unwrap();
+        let tl = &st.tl;
+        let a = tl.segment(s0);
+        let b = (tl.segment(s0 + len as f64 - 1.0) + 1).min(tl.t.len() - 1);
+        Ok(Timeline { t: tl.t[a..=b].to_vec(), pos: tl.pos.iter().map(|p| p[a..=b].to_vec()).collect() })
+    }
+
+    /// Absolute position of each input's first located line (waits for it).
+    fn first_lines(&self) -> Result<Vec<Option<f64>>> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(e) = &st.error {
+                bail!("{e}");
+            }
+            if (0..self.paths.len()).all(|i| st.done[i] || !st.fields[i].is_empty()) {
+                return Ok(st.fields.iter().map(|f| f.first().and_then(|f| f.lines.first().copied())).collect());
+            }
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    /// Stop the pass-0 decodes (the stacked decode is over).
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.cv.notify_all();
     }
 }
 
@@ -128,16 +404,20 @@ fn frame_code(words: &[i64]) -> Vec<i64> {
     v
 }
 
-/// One input: its pass-0 fields and a random-access reader.
+/// One input: a random-access reader.
 pub struct StackInput {
     pub path: String,
-    pub fields: Vec<FieldRec>,
     reader: RawFile,
 }
 
 impl StackInput {
-    pub fn new(path: &str, format: SampleFormat, fields: Vec<FieldRec>) -> Result<Self> {
-        Ok(Self { path: path.to_string(), fields, reader: RawFile::open(path, format)? })
+    pub fn new(path: &str, format: SampleFormat) -> Result<Self> {
+        Ok(Self { path: path.to_string(), reader: RawFile::open(path, format)? })
+    }
+
+    /// Length in samples.
+    pub fn len(&self) -> u64 {
+        self.reader.len
     }
 }
 
@@ -202,94 +482,6 @@ struct Timeline {
 }
 
 impl Timeline {
-    fn build(inputs: &[StackInput], linelen: f64) -> Result<Self> {
-        // Pair every input's fields with the primary's by (frame code, parity);
-        // a code seen twice in one input is ambiguous and left out.
-        let index = |fields: &[FieldRec]| {
-            let mut m: HashMap<(Vec<i64>, bool), Option<usize>> = HashMap::new();
-            for (j, f) in fields.iter().enumerate() {
-                if let Some(c) = &f.code {
-                    m.entry((c.clone(), f.first)).and_modify(|e| *e = None).or_insert(Some(j));
-                }
-            }
-            m
-        };
-        let maps: Vec<_> = inputs.iter().map(|s| index(&s.fields)).collect();
-        let prim = &inputs[0].fields;
-
-        let mut t = Vec::new();
-        let mut pos: Vec<Vec<f64>> = vec![Vec::new(); inputs.len()];
-        let mut last = f64::NEG_INFINITY;
-        let mut paired = vec![0usize; inputs.len()];
-        for f in prim {
-            let matched: Vec<Option<&FieldRec>> = inputs
-                .iter()
-                .zip(&maps)
-                .map(|(s, m)| {
-                    let j = *f.code.as_ref().and_then(|c| m.get(&(c.clone(), f.first)))?;
-                    j.map(|j| &s.fields[j])
-                })
-                .collect();
-            for (i, m) in matched.iter().enumerate() {
-                paired[i] += usize::from(m.is_some());
-            }
-            for (l, &a) in f.lines.iter().enumerate() {
-                // Fields overlap by a few lines; keep each line once, in order.
-                if a <= last + 0.25 * linelen {
-                    continue;
-                }
-                // The timeline starts at the primary's own first line, so
-                // before it virtual time is the primary's file position.
-                let tk = match t.last() {
-                    None => a,
-                    Some(&tp) => {
-                        let lines = ((2.0 * (a - last) / linelen).round() / 2.0).max(0.5);
-                        tp + lines * linelen
-                    }
-                };
-                t.push(tk);
-                pos[0].push(a);
-                for i in 1..inputs.len() {
-                    pos[i].push(matched[i].and_then(|g| g.lines.get(l).copied()).unwrap_or(f64::NAN));
-                }
-                last = a;
-            }
-        }
-        if t.len() < 2 {
-            bail!("pass 0 found no usable lines in the primary input");
-        }
-        // Before the first line and after the last, the stream is the primary
-        // alone read at its own rate: the decoder needs that lead-in to find
-        // the first field (and the tail for the last ones), which a timeline
-        // cut at the first and last located lines left out.
-        let ni = inputs.len();
-        if t[0] >= 1.0 {
-            t.insert(0, 0.0);
-            pos[0].insert(0, 0.0);
-            for p in pos.iter_mut().skip(1) {
-                p.insert(0, f64::NAN);
-            }
-        }
-        let (t_last, a_last) = (*t.last().unwrap(), *pos[0].last().unwrap());
-        let tail = inputs[0].reader.len as f64 - a_last;
-        if tail >= 1.0 {
-            t.push(t_last + tail);
-            pos[0].push(a_last + tail);
-            for p in pos.iter_mut().skip(1).take(ni - 1) {
-                p.push(f64::NAN);
-            }
-        }
-        for (i, s) in inputs.iter().enumerate().skip(1) {
-            tracing::info!(
-                "stack: {} paired {} of the primary's {} fields",
-                s.path,
-                paired[i],
-                prim.len()
-            );
-        }
-        Ok(Self { t, pos })
-    }
-
     /// Anchor segment containing ideal time `s` (last segment past the end).
     fn segment(&self, s: f64) -> usize {
         match self.t.partition_point(|&x| x <= s) {
@@ -412,9 +604,8 @@ fn split_pos(p: f64) -> (i64, usize) {
 
 pub(crate) struct Inner {
     inputs: Vec<StackInput>,
-    timeline: Timeline,
+    live: Arc<Live>,
     pub(crate) weight: Vec<f64>,
-    len: u64,
     /// Video-band filter table (see [`video_band_lut`]).
     pub(crate) hi_lut: Vec<Complex64>,
     /// The CPU path's single-precision copies: sinc, video band re and im.
@@ -466,7 +657,7 @@ impl InputSpan {
 
 impl Inner {
     fn plan(&self, s0: f64, len: usize) -> Result<Plan> {
-        let tl = &self.timeline;
+        let tl = &self.live.slice(s0, len)?;
         let k_first = tl.segment(s0);
         let mut seg = Vec::with_capacity(len);
         let mut k = k_first;
@@ -543,25 +734,17 @@ pub struct VirtualSource {
 }
 
 impl VirtualSource {
-    pub fn new(inputs: Vec<StackInput>, fs: f64, linelen: f64, opencl: bool) -> Result<Self> {
-        let timeline = Timeline::build(&inputs, linelen)?;
-        let len = *timeline.t.last().unwrap() as u64;
-        // 1/sigma^2 from each input's noise floor, measured mid-way through
-        // the part of it that the timeline uses.
+    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, opencl: bool) -> Result<Self> {
+        // 1/sigma^2 from each input's noise floor, measured where pass 0
+        // first located it (the stream starts before the rest is known).
         let mut weight = Vec::new();
-        for (i, s) in inputs.iter().enumerate() {
-            let used: Vec<f64> = timeline.pos[i].iter().copied().filter(|p| p.is_finite()).collect();
-            let mid = used.get(used.len() / 2).copied().unwrap_or(0.0) as i64;
-            let sig2 = noise_floor(&s.reader, mid - (NOISE_FFT / 2) as i64, fs)?;
+        for (s, first) in inputs.iter().zip(live.first_lines()?) {
+            let at = first.unwrap_or(0.0) as i64;
+            let sig2 = noise_floor(&s.reader, at, fs)?;
             tracing::info!("stack: {} noise floor {:.4e} (weight {:.4e})", s.path, sig2, 1.0 / sig2);
             weight.push(1.0 / sig2);
         }
-        tracing::info!(
-            "stack: {} input(s), read-time TBC over {} lines ({:.2} s)",
-            inputs.len(),
-            timeline.t.len(),
-            len as f64 / fs
-        );
+        tracing::info!("stack: {} input(s), read-time TBC as pass 0 locates the lines", inputs.len());
         let hi_lut = video_band_lut(fs);
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
@@ -570,7 +753,7 @@ impl VirtualSource {
             hi_lut.iter().map(|c| c.re as f32).collect(),
             hi_lut.iter().map(|c| c.im as f32).collect(),
         ];
-        let inner = Inner { inputs, timeline, weight, len, hi_lut, fir };
+        let inner = Inner { inputs, live, weight, hi_lut, fir };
         let gpu = if opencl { Some(crate::opencl::StackGpu::new(&inner)?) } else { None };
         Ok(Self { inner: Arc::new(inner), pos: 0, pool, gpu })
     }
@@ -696,9 +879,21 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+impl Drop for VirtualSource {
+    fn drop(&mut self) {
+        self.inner.live.stop();
+    }
+}
+
 impl SampleSource for VirtualSource {
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
-        let n = (self.inner.len.saturating_sub(self.pos) as usize).min(out.len());
+        // Wait until pass 0 has located every input that far (the length is
+        // only known once the primary is fully located).
+        let end = self.pos as f64 + (out.len() + LOCK_MARGIN) as f64;
+        let n = match self.inner.live.wait_cover(end)? {
+            Some(len) => (len.saturating_sub(self.pos) as usize).min(out.len()),
+            None => out.len(),
+        };
         if n > 0 {
             let t0 = std::time::Instant::now();
             self.compute(self.pos, &mut out[..n])?;
@@ -711,7 +906,7 @@ impl SampleSource for VirtualSource {
     }
 
     fn seek_samples(&mut self, sample: u64) -> Result<()> {
-        self.pos = sample.min(self.inner.len);
+        self.pos = sample;
         Ok(())
     }
 
