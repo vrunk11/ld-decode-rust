@@ -580,6 +580,9 @@ pub struct Decoder {
     digital_audio: bool,
     /// Output lines the TBC picture is limited to (see [`Decoder::set_locate_only`]).
     locate_rows: Option<Vec<usize>>,
+    /// Experimental pass-0 shortcuts (`LD_PASS0_FAST`, locate-only decodes):
+    /// (no MTF calibration, no burst refinement of the line positions).
+    pass0_fast: (bool, bool),
 }
 
 
@@ -700,6 +703,7 @@ impl Decoder {
             analog_audio_freq: 44100.0,
             digital_audio: true,
             locate_rows: None,
+            pass0_fast: (false, false),
         }
     }
 
@@ -732,6 +736,8 @@ impl Decoder {
     /// and dropouts are not detected. The picture and metadata written are
     /// then not a usable decode.
     pub fn set_locate_only(&mut self, on: bool) {
+        let fast = std::env::var("LD_PASS0_FAST").unwrap_or_default();
+        self.pass0_fast = (on && fast.contains("nomtf"), on && fast.contains("noburst"));
         self.locate_rows = on.then(|| {
             let mut rows: Vec<usize> = self
                 .spec
@@ -916,85 +922,95 @@ impl Decoder {
                             efm_pre = Some(input);
                         }
                     }
-                    let luma = field.downscale(
-                        self.output_lines,
-                        self.spec.sys_outlinelen,
-                        0,
-                        true,
-                        self.analog_audio_freq,
-                        audio_offset,
-                        &self.side_pool,
-                        efm_pre.as_ref().map(|v| v.as_slice()),
-                        self.locate_rows.as_deref(),
-                    )?;
-                    // downscale(final_=true) already encoded the luma into
-                    // field.dspicture with the same levels; reuse it instead of
-                    // recomputing the identical 1M-sample conversion.
-                    picture = Some(LumaOutput::Encoded(Arc::new(field.dspicture.clone())));
-                    self.metadata = Some(MetadataFieldState {
-                        out_scale: field.out_scale,
-                        outlinecount: field.outlinecount,
-                    });
+                    // Experimental fast pass 0 (`LD_PASS0_FAST=nomtf`): no MTF
+                    // calibration, so no TBC picture, VITS metrics or redo.
+                    if self.pass0_fast.0 {
+                        self.metadata = Some(MetadataFieldState {
+                            out_scale: field.out_scale,
+                            outlinecount: field.outlinecount,
+                        });
+                        redo = None;
+                    } else {
+                        let luma = field.downscale(
+                            self.output_lines,
+                            self.spec.sys_outlinelen,
+                            0,
+                            true,
+                            self.analog_audio_freq,
+                            audio_offset,
+                            &self.side_pool,
+                            efm_pre.as_ref().map(|v| v.as_slice()),
+                            self.locate_rows.as_deref(),
+                        )?;
+                        // downscale(final_=true) already encoded the luma into
+                        // field.dspicture with the same levels; reuse it instead of
+                        // recomputing the identical 1M-sample conversion.
+                        picture = Some(LumaOutput::Encoded(Arc::new(field.dspicture.clone())));
+                        self.metadata = Some(MetadataFieldState {
+                            out_scale: field.out_scale,
+                            outlinecount: field.outlinecount,
+                        });
 
-                    t_down += t_d0.elapsed().as_nanos() as u64;
-                    let t_v0 = std::time::Instant::now();
-                    let metrics = vits::compute_vits_metrics(&self.spec, field, None);
-                    // Cache for buildmetadata: wSNR/bPSNR don't depend on the
-                    // previous field, so the second call in buildmetadata is a
-                    // pure duplicate for this field.
-                    self.cached_vits = Some(metrics.clone());
-                    if let Some(p) = std::env::var_os("LD_DUMP_BWRATIO") {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-                            let _ = writeln!(f, "{} {:.17} {:.17} {:?} {:?}", self.fields_written, metrics.black_to_white_rf_ratio.unwrap_or(-1.0), self.mtf_level, metrics.white_rf_level, metrics.black_line_rf_level);
-                        }
-                    }
-                    if let Some(ratio) = metrics.black_to_white_rf_ratio {
-                        // Python only records the ratio on the first pass (it
-                        // runs inside `if ... and adjusted is False`); the
-                        // redo pass would otherwise double-count the same
-                        // field and skew the MTF calibration.
-                        if !adjusted {
-                            let keep = if self.is_clv { 900 } else { 30 };
-                            self.bw_ratios.push(ratio);
-                            if self.bw_ratios.len() > keep {
-                                self.bw_ratios.drain(..self.bw_ratios.len() - keep);
+                        t_down += t_d0.elapsed().as_nanos() as u64;
+                        let t_v0 = std::time::Instant::now();
+                        let metrics = vits::compute_vits_metrics(&self.spec, field, None);
+                        // Cache for buildmetadata: wSNR/bPSNR don't depend on the
+                        // previous field, so the second call in buildmetadata is a
+                        // pure duplicate for this field.
+                        self.cached_vits = Some(metrics.clone());
+                        if let Some(p) = std::env::var_os("LD_DUMP_BWRATIO") {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+                                let _ = writeln!(f, "{} {:.17} {:.17} {:?} {:?}", self.fields_written, metrics.black_to_white_rf_ratio.unwrap_or(-1.0), self.mtf_level, metrics.white_rf_level, metrics.black_line_rf_level);
                             }
-                            if let Some(p) = std::env::var_os("LD_DUMP_ISCLV") {
-                                use std::io::Write;
-                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(&p)
-                                {
-                                    let _ = writeln!(
-                                        f,
-                                        "fw={} is_clv={} keep={} rl={} lc={:?}",
-                                        self.fields_written,
-                                        self.is_clv,
-                                        keep,
-                                        self.fdoffset_abs(),
-                                        field.linecode
-                                    );
+                        }
+                        if let Some(ratio) = metrics.black_to_white_rf_ratio {
+                            // Python only records the ratio on the first pass (it
+                            // runs inside `if ... and adjusted is False`); the
+                            // redo pass would otherwise double-count the same
+                            // field and skew the MTF calibration.
+                            if !adjusted {
+                                let keep = if self.is_clv { 900 } else { 30 };
+                                self.bw_ratios.push(ratio);
+                                if self.bw_ratios.len() > keep {
+                                    self.bw_ratios.drain(..self.bw_ratios.len() - keep);
+                                }
+                                if let Some(p) = std::env::var_os("LD_DUMP_ISCLV") {
+                                    use std::io::Write;
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&p)
+                                    {
+                                        let _ = writeln!(
+                                            f,
+                                            "fw={} is_clv={} keep={} rl={} lc={:?}",
+                                            self.fields_written,
+                                            self.is_clv,
+                                            keep,
+                                            self.fdoffset_abs(),
+                                            field.linecode
+                                        );
+                                    }
                                 }
                             }
                         }
+
+                        redo = if !self.check_mtf() {
+                            // Python: `redo = self.fdoffset - offset`, then every
+                            // redo test (`if redo:`, `if adjusted is False and
+                            // redo:`) is a truthiness test — a target of 0.0 is
+                            // FALSY, so a redo of the very first field (fdoffset
+                            // == offset == 0) is silently cancelled and the field
+                            // is written with its first-pass content. Replicating
+                            // that here; Option::Some(0.0) would be truthy.
+                            py_falsy_redo(self.fdoffset_abs() - offset.unwrap_or(0.0))
+                        } else {
+                            None
+                        };
+
+                        t_vits += t_v0.elapsed().as_nanos() as u64;
                     }
-
-                    redo = if !self.check_mtf() {
-                        // Python: `redo = self.fdoffset - offset`, then every
-                        // redo test (`if redo:`, `if adjusted is False and
-                        // redo:`) is a truthiness test — a target of 0.0 is
-                        // FALSY, so a redo of the very first field (fdoffset
-                        // == offset == 0) is silently cancelled and the field
-                        // is written with its first-pass content. Replicating
-                        // that here; Option::Some(0.0) would be truthy.
-                        py_falsy_redo(self.fdoffset_abs() - offset.unwrap_or(0.0))
-                    } else {
-                        None
-                    };
-
-                    t_vits += t_v0.elapsed().as_nanos() as u64;
                     let t_v1 = std::time::Instant::now();
 
                     // Perform AGC changes on first fields only to prevent luma
@@ -1963,7 +1979,7 @@ impl Decoder {
             }
             self.dbg.df_new = rest;
         }
-        let field = Field::new(
+        let mut field = Field::new(
             self.spec.clone(),
             self.levels,
             rawdecode,
@@ -1976,6 +1992,7 @@ impl Decoder {
             false,
             mtf_level,
         );
+        field.skip_burst_refine = self.pass0_fast.1;
         Ok(AssembleOutcome::Field(AssembledField {
             field,
             readloc,

@@ -137,6 +137,9 @@ pub(crate) struct Field {
     pub fields_written: usize,
     pub readloc: u64,
     pub initphase: bool,
+    /// Keep the hsync-refined line positions, without the burst refinement
+    /// (experimental fast pass 0).
+    pub skip_burst_refine: bool,
 
     pub inlinelen: usize,
     pub outlinelen: usize,
@@ -455,6 +458,7 @@ impl Field {
         let linelen = spec.linelen;
         let outlinelen = spec.sys_outlinelen;
         let mut field = Field {
+            skip_burst_refine: false,
             spec,
             levels,
             data,
@@ -2737,7 +2741,7 @@ impl Field {
 
         let linelocs2 = self.linelocs2.clone();
         let t_a = std::time::Instant::now();
-        let linelocs3 = self.refine_linelocs_burst(&spec, &linelocs2);
+        let linelocs3 = if self.skip_burst_refine { linelocs2.clone() } else { self.refine_linelocs_burst(&spec, &linelocs2) };
         let t_burst = t_a.elapsed().as_nanos() as u64;
         let t_a = std::time::Instant::now();
         let linelocs4 = self.fix_badlines(&spec, &linelocs3, Some(&linelocs2));
