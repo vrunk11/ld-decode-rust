@@ -60,16 +60,17 @@ struct Args {
     #[arg(long, value_enum, default_value = "cpu")]
     device: Device,
     /// Speed/exactness preset. `slow`: nothing traded for speed (GPU demod in
-    /// double precision, pass 0 with its MTF calibration, stack FIRs and
-    /// phase lock in double precision in one fixed order, so the GPU gives the
-    /// CPU's output). `fast`: the shortcuts measured without visible loss
-    /// (pass 0 without MTF calibration, stack FIRs in single precision).
+    /// double precision, a decoding pass 0 with its MTF calibration, stack
+    /// FIRs and phase lock in double precision in one fixed order, so the GPU
+    /// gives the CPU's output). `fast`: the shortcuts measured without visible
+    /// loss (a decoding pass 0 without MTF calibration, stack FIRs in single
+    /// precision).
     #[arg(long, value_enum, default_value = "slow")]
     preset: Preset,
-    /// How pass 0 locates each input's lines for `--tbc read`: `decode` (a
-    /// demodulating decode of every input), or `rf` (sync pulses and colour
-    /// burst measured straight on the RF, without demodulating).
-    #[arg(long, value_enum, default_value = "decode")]
+    /// How pass 0 locates each input's lines for `--tbc read`: `rf` (sync
+    /// pulses and colour burst measured straight on the RF, without
+    /// demodulating), or `decode` (a demodulating decode of every input).
+    #[arg(long, value_enum, default_value = "rf")]
     pass0: Pass0,
     /// Precision of the GPU demodulation (`--device opencl`); default double
     /// (byte-identical to the CPU on a whole test capture, at no speed cost).
@@ -557,9 +558,10 @@ fn read_tbc_source(
     let fs = inputfreq * 1e6;
     // NTSC line: 286 lines per 4.5 MHz.
     let live = stack::Live::new(inputs.to_vec(), stacked[0].len(), fs * 286.0 / 4.5e6);
-    // Pass 0, one decode per input running alongside the stacked decode: it
-    // locates the lines and reads the VBI codes, and the timeline is laid
-    // down as it goes, so it stops where the stacked decode stops.
+    // Pass 0, one per input running alongside the stacked decode (from the RF,
+    // or a decode with --pass0 decode): it locates the lines and reads the VBI
+    // codes, and the timeline is laid down as it goes, so it stops where the
+    // stacked decode stops.
     for (i, (path, &fmt)) in inputs.iter().zip(&fmts).enumerate() {
         let (spec, live, path) = (Arc::clone(spec), Arc::clone(&live), path.clone());
         if pass0 == Pass0::Rf {

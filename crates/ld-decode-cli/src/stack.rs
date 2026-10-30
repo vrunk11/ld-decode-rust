@@ -1,8 +1,8 @@
 //! Time-base correction at read time (`--tbc read`), and multi-source stacking
 //! built on it.
 //!
-//! Pass 0 decodes every input (one decode per input, running alongside the
-//! stacked decode) and keeps, per field, the VBI frame code, the parity and
+//! Pass 0 locates every input (one per input, running alongside the stacked
+//! decode: straight from the RF, `rfsync.rs`, or a decode) and keeps, per field, the VBI frame code, the parity and
 //! the absolute position of each line. Fields of the same frame are paired
 //! across inputs, and the primary's (first input's) lines define a timeline of
 //! nominal-length lines, laid down as far as every input is located ([`Live`]);
