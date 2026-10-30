@@ -30,11 +30,12 @@ __kernel void read_input(
     const int len,
     const int base,
     const long raw_off,
+    const long start,
     const int seg_off,
-    __global const float* sinc,
-    __global const float2* hil,
-    __global float* full,
-    __global float2* hi,
+    __global const REAL* sinc,
+    __global const REAL2* hil,
+    __global REAL* full,
+    __global REAL2* hi,
     __global uchar* cov)
 {
     int j = get_global_id(0);
@@ -46,26 +47,27 @@ __kernel void read_input(
     uint k = seg[j];
     double a = a0[k];
     if (isnan(a)) {
-        full[base + j] = 0.0f;
-        hi[base + j] = (float2)(0.0f, 0.0f);
+        full[base + j] = (REAL)0;
+        hi[base + j] = (REAL2)((REAL)0, (REAL)0);
         cov[base + j] = 0;
         return;
     }
+    // Absolute position, then the span index (see `InputSpan::a0`).
     double p = a + ((s0 + (double)j) - seg_t0[k]) * slope[k];
     double kf = floor(p);
-    int k0 = (int)kf;
+    int k0 = (int)((long)kf - start);
     int ph = (int)round((p - kf) * (double)PHASES);
     int xs = k0 - (SINC_TAPS / 2 - 1), xh = k0 - (HI_TAPS / 2 - 1);
-    __global const float* hs = sinc + ph * SINC_TAPS;
-    __global const float2* hh = hil + ph * HI_TAPS;
-    float f = 0.0f;
-    float2 h = (float2)(0.0f, 0.0f);
+    __global const REAL* hs = sinc + ph * SINC_TAPS;
+    __global const REAL2* hh = hil + ph * HI_TAPS;
+    REAL f = (REAL)0;
+    REAL2 h = (REAL2)((REAL)0, (REAL)0);
     if (use_codes) {
-        for (int d = 0; d < SINC_TAPS; d++) f += hs[d] * ((float)codes[xs + d] + off);
-        for (int d = 0; d < HI_TAPS; d++) h += hh[d] * ((float)codes[xh + d] + off);
+        for (int d = 0; d < SINC_TAPS; d++) f += hs[d] * ((REAL)codes[xs + d] + (REAL)off);
+        for (int d = 0; d < HI_TAPS; d++) h += hh[d] * ((REAL)codes[xh + d] + (REAL)off);
     } else {
-        for (int d = 0; d < SINC_TAPS; d++) f += hs[d] * raw[xs + d];
-        for (int d = 0; d < HI_TAPS; d++) h += hh[d] * raw[xh + d];
+        for (int d = 0; d < SINC_TAPS; d++) f += hs[d] * (REAL)raw[xs + d];
+        for (int d = 0; d < HI_TAPS; d++) h += hh[d] * (REAL)raw[xh + d];
     }
     full[base + j] = f;
     hi[base + j] = h;
@@ -82,45 +84,45 @@ __kernel void combine(
     const int len,
     const int m,
     const int n,
-    __global const float* full,
-    __global const float2* hi,
+    __global const REAL* full,
+    __global const REAL2* hi,
     __global const uchar* cov,
-    __global const float* weight,
+    __global const REAL* weight,
     __global float* out)
 {
-    __local float2 prod[TILE + LOCK_WIN];
+    __local REAL2 prod[TILE + LOCK_WIN];
     int lid = get_local_id(0);
     int jo = get_global_id(0);
     int j = jo + m;
     int t0 = (int)get_group_id(0) * TILE + m - LOCK_WIN / 2;
     bool active = jo < n;
-    float acc = 0.0f, wsum = 0.0f;
+    REAL acc = (REAL)0, wsum = (REAL)0;
     if (active && cov[j]) { acc += full[j] * weight[0]; wsum += weight[0]; }
     for (int i = 1; i < ni; i++) {
         int b = i * len;
         for (int u = lid; u < TILE + LOCK_WIN; u += TILE) {
             int t = t0 + u;
-            float2 v = (float2)(0.0f, 0.0f);
+            REAL2 v = (REAL2)((REAL)0, (REAL)0);
             if (t >= 0 && t < len && cov[t] && cov[b + t]) {
-                float2 x = hi[t], y = hi[b + t];
-                v = (float2)(x.x * y.x + x.y * y.y, x.y * y.x - x.x * y.y);
+                REAL2 x = hi[t], y = hi[b + t];
+                v = (REAL2)(x.x * y.x + x.y * y.y, x.y * y.x - x.x * y.y);
             }
             prod[u] = v;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         if (active && cov[b + j]) {
-            float2 r = (float2)(0.0f, 0.0f);
+            REAL2 r = (REAL2)((REAL)0, (REAL)0);
             for (int u = 0; u < LOCK_WIN; u++) r += prod[lid + u];
-            float a = length(r);
-            float2 rot = a > 0.0f ? r / a : (float2)(1.0f, 0.0f);
-            float2 d = rot - (float2)(1.0f, 0.0f);
-            float2 z = hi[b + j];
+            REAL a = sqrt(r.x * r.x + r.y * r.y);
+            REAL2 rot = a > (REAL)0 ? r / a : (REAL2)((REAL)1, (REAL)0);
+            REAL2 d = (REAL2)(rot.x - (REAL)1, rot.y);
+            REAL2 z = hi[b + j];
             acc += (full[b + j] + (z.x * d.x - z.y * d.y)) * weight[i];
             wsum += weight[i];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (active) out[jo] = wsum > 0.0f ? acc / wsum : 0.0f;
+    if (active) out[jo] = wsum > (REAL)0 ? (float)(acc / wsum) : 0.0f;
 }
 "#;
 
@@ -147,6 +149,8 @@ struct State {
 
 pub struct StackGpu {
     ni: usize,
+    /// Double precision (`Inner::exact`).
+    f64: bool,
     state: Mutex<State>,
 }
 
@@ -157,21 +161,32 @@ impl StackGpu {
         let mut ks = gpu
             .kernels(
                 SOURCE,
-                &format!("-DPHASES={SINC_PHASES} -DSINC_TAPS={SINC_TAPS} -DHI_TAPS={HI_TAPS} -DLOCK_WIN={LOCK_WIN}"),
+                &format!(
+                    "-DPHASES={SINC_PHASES} -DSINC_TAPS={SINC_TAPS} -DHI_TAPS={HI_TAPS} -DLOCK_WIN={LOCK_WIN} {}",
+                    if inner.exact { "-DREAL=double -DREAL2=double2" } else { "-DREAL=float -DREAL2=float2" }
+                ),
                 &["read_input", "combine"],
             )?
             .into_iter();
         let (k_read, k_combine) = (ks.next().unwrap(), ks.next().unwrap());
         let q = gpu.queue()?;
-        let constant = |data: &[f32]| -> Result<Buffer> {
-            let b = gpu.buffer(std::mem::size_of_val(data))?;
-            q.write(&b, 0, data)?;
+        let f64 = inner.exact;
+        // Tables and weights as the kernels' REAL.
+        let constant = |data: &[f64]| -> Result<Buffer> {
+            let bytes: Vec<u8> = if f64 {
+                data.iter().flat_map(|v| v.to_ne_bytes()).collect()
+            } else {
+                data.iter().flat_map(|&v| (v as f32).to_ne_bytes()).collect()
+            };
+            let b = gpu.buffer(bytes.len())?;
+            q.write(&b, 0, &bytes)?;
             Ok(b)
         };
-        let sinc: Vec<f32> = sinc_lut().iter().map(|&v| v as f32).collect();
-        let hil: Vec<f32> = inner.hi_lut.iter().flat_map(|c| [c.re as f32, c.im as f32]).collect();
-        let wmax = inner.weight.iter().copied().fold(0.0, f64::max);
-        let weight: Vec<f32> = inner.weight.iter().map(|&w| (w / wmax) as f32).collect();
+        let sinc: Vec<f64> = sinc_lut().to_vec();
+        let hil: Vec<f64> = inner.hi_lut.iter().flat_map(|c| [c.re, c.im]).collect();
+        // Single precision: weights scaled to 1 at most (exact: as they are).
+        let wmax = if f64 { 1.0 } else { inner.weight.iter().copied().fold(0.0, f64::max) };
+        let weight: Vec<f64> = inner.weight.iter().map(|&w| w / wmax).collect();
         let state = State {
             sinc: constant(&sinc)?,
             hil: constant(&hil)?,
@@ -191,7 +206,7 @@ impl StackGpu {
             k_read,
             k_combine,
         };
-        Ok(Self { ni: inner.weight.len(), state: Mutex::new(state) })
+        Ok(Self { ni: inner.weight.len(), f64, state: Mutex::new(state) })
     }
 
     /// Fill `out` with plan samples `m..m + out.len()`.
@@ -201,8 +216,9 @@ impl StackGpu {
         let (len, ni) = (plan.len, self.ni);
         st.seg.ensure(len * 4)?;
         st.seg_t0.ensure(plan.seg_t0.len() * 8)?;
-        st.full.ensure(ni * len * 4)?;
-        st.hi.ensure(ni * len * 8)?;
+        let rsz = if self.f64 { 8 } else { 4 };
+        st.full.ensure(ni * len * rsz)?;
+        st.hi.ensure(ni * len * 2 * rsz)?;
         st.cov.ensure(ni * len)?;
         st.out.ensure(out.len() * 4)?;
         st.q.write(&st.seg, 0, &plan.seg)?;
@@ -219,7 +235,7 @@ impl StackGpu {
         let mut slope = vec![0.0f64; ni * nseg];
         let mut at = 0usize;
         for (i, span) in plan.inputs.iter().enumerate() {
-            offs.push((at as i64, span.as_ref().map_or(0.0, |sp| sp.off)));
+            offs.push((at as i64, span.as_ref().map_or(0.0, |sp| sp.off), span.as_ref().map_or(0, |sp| sp.start)));
             if let Some(span) = span {
                 if codes {
                     st.up.slice_mut::<u16>(total)[at..at + span.codes.len()].copy_from_slice(&span.codes);
@@ -241,7 +257,7 @@ impl StackGpu {
         st.slope.ensure(slope.len() * 8)?;
         st.q.write(&st.a0, 0, &a0)?;
         st.q.write(&st.slope, 0, &slope)?;
-        for (i, &(off, sample_off)) in offs.iter().enumerate() {
+        for (i, &(off, sample_off, start)) in offs.iter().enumerate() {
             st.k_read.args(&[
                 Arg::Buf(&st.raw),
                 Arg::Buf(&st.codes),
@@ -255,6 +271,7 @@ impl StackGpu {
                 Arg::I32(len as i32),
                 Arg::I32((i * len) as i32),
                 Arg::I64(off),
+                Arg::I64(start),
                 Arg::I32((i * nseg) as i32),
                 Arg::Buf(&st.sinc),
                 Arg::Buf(&st.hil),

@@ -731,18 +731,19 @@ impl Decoder {
         Ok(())
     }
 
-    /// Decode only what locating the lines and reading the VBI needs: no MTF
-    /// calibration (so no TBC picture, VITS metrics or redo) and no dropout
-    /// detection. The picture and metadata written are then not a usable
-    /// decode. Without the MTF calibration the line positions move by ~0.015
-    /// samples rms against a full decode (18 captures; stack noise and
-    /// sharpness unchanged); `LD_PASS0_FAST=mtf` keeps it, the TBC picture
-    /// then being resampled only on the VITS lines it reads (positions
-    /// bit-identical). `LD_PASS0_FAST=noburst` also drops the burst refinement
-    /// (measured worse: 0.16 samples, kept for experiments).
-    pub fn set_locate_only(&mut self, on: bool) {
+    /// Decode only what locating the lines and reading the VBI needs: no
+    /// dropout detection, and with `mtf` the MTF calibration on a TBC picture
+    /// resampled only on the VITS lines it reads (line positions
+    /// bit-identical to a full decode); without it, no TBC picture, VITS
+    /// metrics or redo at all (positions move by ~0.015 samples rms; stack
+    /// noise and sharpness unchanged on 18 captures). The picture and
+    /// metadata written are not a usable decode. `LD_PASS0_FAST` overrides
+    /// for experiments: `mtf` / `nomtf`, and `noburst` (no burst refinement,
+    /// measured worse: 0.16 samples).
+    pub fn set_locate_only(&mut self, on: bool, mtf: bool) {
         let fast = std::env::var("LD_PASS0_FAST").unwrap_or_default();
-        self.pass0_fast = (on && !fast.contains("mtf") || on && fast.contains("nomtf"), on && fast.contains("noburst"));
+        let mtf = if fast.contains("nomtf") { false } else if fast.contains("mtf") { true } else { mtf };
+        self.pass0_fast = (on && !mtf, on && fast.contains("noburst"));
         self.locate_rows = on.then(|| {
             let mut rows: Vec<usize> = self
                 .spec

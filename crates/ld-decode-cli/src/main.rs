@@ -58,11 +58,17 @@ struct Args {
     /// OpenCL runtime; see --gpu-precision).
     #[arg(long, value_enum, default_value = "cpu")]
     device: Device,
-    /// Precision of the GPU demodulation (`--device opencl`): `double` gave
-    /// output byte-identical to the CPU on a whole test capture at no speed
-    /// cost; `single` differs by up to 1 LSB on ~1.6% of the pixels.
-    #[arg(long, value_enum, default_value = "double")]
-    gpu_precision: GpuPrecision,
+    /// Speed/exactness preset. `slow`: nothing traded for speed (GPU demod in
+    /// double precision, pass 0 with its MTF calibration, stack FIRs and
+    /// phase lock in double precision in one fixed order, so the GPU gives the
+    /// CPU's output). `fast`: the shortcuts measured without visible loss
+    /// (pass 0 without MTF calibration, stack FIRs in single precision).
+    #[arg(long, value_enum, default_value = "slow")]
+    preset: Preset,
+    /// Precision of the GPU demodulation (`--device opencl`); default double
+    /// (byte-identical to the CPU on a whole test capture, at no speed cost).
+    #[arg(long, value_enum)]
+    gpu_precision: Option<GpuPrecision>,
     /// Input sample format; default: inferred from the file extension
     #[arg(long, value_enum)]
     format: Option<reader::SampleFormat>,
@@ -124,6 +130,12 @@ struct Args {
 enum TbcMode {
     Read,
     Resample,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Preset {
+    Slow,
+    Fast,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -319,7 +331,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.device, args.gpu_precision == GpuPrecision::Double)?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.device, args.gpu_precision != Some(GpuPrecision::Single), args.preset)?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -388,7 +400,7 @@ fn main() -> Result<()> {
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
-    decoder.set_gpu_demod(args.device == Device::Opencl, args.gpu_precision == GpuPrecision::Double)?;
+    decoder.set_gpu_demod(args.device == Device::Opencl, args.gpu_precision != Some(GpuPrecision::Single))?;
     // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
     // decoder itself starts at 0, exactly like `LDdecode.__init__`.
     decoder.set_black_ire(if args.ntscj { 0.0 } else { 7.5 });
@@ -522,6 +534,7 @@ fn read_tbc_source(
     inputfreq: f64,
     device: Device,
     gpu_f64: bool,
+    preset: Preset,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
         .iter()
@@ -549,7 +562,7 @@ fn read_tbc_source(
                 decoder.set_digital_audio(false);
                 // Only the line positions and VBI codes are kept; LD_PASS0_FULL
                 // runs the complete decode instead (for comparisons).
-                decoder.set_locate_only(std::env::var_os("LD_PASS0_FULL").is_none());
+                decoder.set_locate_only(std::env::var_os("LD_PASS0_FULL").is_none(), preset == Preset::Slow);
                 let mut collector = stack::Pass0Collector::new(Arc::clone(&live), i);
                 decode_all(&mut rd, &mut Sink::Collect(&mut collector), spec, decoder, None, 0, seekable)?;
                 Ok(())
@@ -557,7 +570,7 @@ fn read_tbc_source(
             live.finish(i, run());
         })?;
     }
-    stack::VirtualSource::new(stacked, live, fs, device == Device::Opencl)
+    stack::VirtualSource::new(stacked, live, fs, device == Device::Opencl, preset == Preset::Slow)
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF

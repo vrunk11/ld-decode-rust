@@ -675,6 +675,10 @@ pub(crate) struct Inner {
     pub(crate) hi_lut: Vec<Complex64>,
     /// The CPU path's single-precision copies: sinc, video band re and im.
     fir: [Vec<f32>; 3],
+    /// Exact arithmetic (`--preset slow`): the FIRs and the phase lock in
+    /// double precision, in one fixed order on the CPU and the GPU, so both
+    /// give the same output.
+    pub(crate) exact: bool,
 }
 
 /// `sum(h[i] * x[i])` over 8 single-precision lanes (as the OpenCL kernel,
@@ -710,13 +714,17 @@ pub(crate) struct InputSpan {
     pub(crate) raw: Vec<f32>,
     pub(crate) codes: Vec<u16>,
     pub(crate) off: f32,
-    /// Per segment: position (relative to the span) at `seg_t0`, NaN where the
-    /// input does not cover it, and input samples per virtual sample.
+    /// Input sample of `raw[0]` / `codes[0]`.
+    pub(crate) start: i64,
+    /// Per segment: absolute position at `seg_t0`, NaN where the input does
+    /// not cover it, and input samples per virtual sample. Absolute, so a
+    /// position rounds the same whatever span or chunk it is computed in.
     pub(crate) a0: Vec<f64>,
     pub(crate) slope: Vec<f64>,
 }
 
 impl InputSpan {
+    /// Absolute input position of plan sample `j`.
     #[inline]
     fn position(&self, plan: &Plan, j: usize) -> f64 {
         let k = plan.seg[j] as usize;
@@ -793,10 +801,7 @@ impl Inner {
                     raw = vec![0f32; (end - start) as usize];
                     self.inputs[i].reader.read_at(start, &mut raw)?;
                 }
-                for v in &mut a0 {
-                    *v -= start as f64;
-                }
-                Ok(Some(InputSpan { raw, codes: codes16, off, a0, slope }))
+                Ok(Some(InputSpan { raw, codes: codes16, off, start, a0, slope }))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Plan { s0, len, seg, seg_t0, inputs })
@@ -977,7 +982,7 @@ pub struct VirtualSource {
 }
 
 impl VirtualSource {
-    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, opencl: bool) -> Result<Self> {
+    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, opencl: bool, exact: bool) -> Result<Self> {
         // 1/sigma^2 from each input's noise floor, measured where pass 0
         // first located it (the stream starts before the rest is known).
         let mut weight = Vec::new();
@@ -996,7 +1001,7 @@ impl VirtualSource {
             hi_lut.iter().map(|c| c.re as f32).collect(),
             hi_lut.iter().map(|c| c.im as f32).collect(),
         ];
-        let inner = Inner { inputs, live: Arc::clone(&live), weight, hi_lut, fir };
+        let inner = Inner { inputs, live: Arc::clone(&live), weight, hi_lut, fir, exact };
         let gpu = if opencl { Some(crate::opencl::StackGpu::new(&inner)?) } else { None };
         let engine = Engine { inner: Arc::new(inner), pool, gpu };
         let ahead = Arc::new(Ahead { state: Mutex::new(AheadState::default()), cv: Condvar::new() });
@@ -1035,6 +1040,7 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
     let len = n + 2 * m;
     let plan = inner.plan(s0 as f64 - m as f64, len, false)?;
     let [sinc, hi_re, hi_im] = &inner.fir;
+    let (sinc64, hi64) = (sinc_lut(), &inner.hi_lut);
 
     // Each input read at its own positions: the full signal (sinc) and the
     // analytic video band (the low band is their difference).
@@ -1053,14 +1059,27 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
                     continue;
                 }
                 let (k0, ph) = split_pos(p);
+                let k0 = k0 - span.start;
                 let xs = &span.raw[(k0 - (SINC_TAPS / 2 - 1) as i64) as usize..][..SINC_TAPS];
-                full[j] = f64::from(dot8(&sinc[ph * SINC_TAPS..][..SINC_TAPS], xs));
-                let xs = &span.raw[(k0 - (HI_TAPS / 2 - 1) as i64) as usize..][..HI_TAPS];
+                let xh = &span.raw[(k0 - (HI_TAPS / 2 - 1) as i64) as usize..][..HI_TAPS];
                 let row = ph * HI_TAPS..(ph + 1) * HI_TAPS;
-                hi[j] = Complex64::new(
-                    f64::from(dot8(&hi_re[row.clone()], xs)),
-                    f64::from(dot8(&hi_im[row], xs)),
-                );
+                if inner.exact {
+                    // Plain sequential f64 sums: the OpenCL kernel's order.
+                    let mut f = 0.0f64;
+                    for (h, &x) in sinc64[ph * SINC_TAPS..][..SINC_TAPS].iter().zip(xs) {
+                        f += h * f64::from(x);
+                    }
+                    let mut acc = Complex64::new(0.0, 0.0);
+                    for (h, &x) in hi64[row].iter().zip(xh) {
+                        acc.re += h.re * f64::from(x);
+                        acc.im += h.im * f64::from(x);
+                    }
+                    full[j] = f;
+                    hi[j] = acc;
+                } else {
+                    full[j] = f64::from(dot8(&sinc[ph * SINC_TAPS..][..SINC_TAPS], xs));
+                    hi[j] = Complex64::new(f64::from(dot8(&hi_re[row.clone()], xh)), f64::from(dot8(&hi_im[row], xh)));
+                }
                 cov[j] = true;
             }
             (full, hi, cov)
@@ -1081,6 +1100,30 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
         }
     }
     for (i, (full, hi, cov)) in reads.iter().enumerate().skip(1) {
+        if inner.exact {
+            // The window sums directly, in ascending order (the OpenCL
+            // kernel's), instead of running-sum differences whose rounding
+            // depends on where the task starts.
+            for j in m..m + n {
+                if !cov[j] {
+                    continue;
+                }
+                let mut r = Complex64::new(0.0, 0.0);
+                for t in j.saturating_sub(half)..(j + half).min(len) {
+                    if cov0[t] && cov[t] {
+                        let (x, y) = (hi0[t], hi[t]);
+                        r.re += x.re * y.re + x.im * y.im;
+                        r.im += x.im * y.re - x.re * y.im;
+                    }
+                }
+                let a = (r.re * r.re + r.im * r.im).sqrt();
+                let rot = if a > 0.0 { Complex64::new(r.re / a, r.im / a) } else { Complex64::new(1.0, 0.0) };
+                let d = Complex64::new(rot.re - 1.0, rot.im);
+                acc[j - m] += (full[j] + (hi[j].re * d.re - hi[j].im * d.im)) * inner.weight[i];
+                wsum[j - m] += inner.weight[i];
+            }
+            continue;
+        }
         let mut cs = Vec::with_capacity(len + 1);
         let mut run = Complex64::new(0.0, 0.0);
         cs.push(run);
