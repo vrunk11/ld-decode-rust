@@ -488,7 +488,10 @@ fn refine(x: &[f32], s: f64, fir: &Fir, fs: f64, vbi: bool, sys: &System) -> Fin
     let us = fs / 1e6;
     let half = fir.half();
     let c0 = (s - 1.2 * us) as isize;
-    let span = if vbi { 64.0 } else { 12.0 };
+    // Up to the end of the porch window as seen from an edge up to 1.5 us
+    // late (the tip search), plus the average's reach: every sample read
+    // below, and no more (this is the bulk of pass 0's work).
+    let span = if vbi { 64.0 } else { sys.porch_us.1 + 1.6 };
     let c1 = (s + span * us) as isize;
     if c0 < half as isize + 1 || c1 as usize + half + 8 >= x.len() {
         return Fine::default();
