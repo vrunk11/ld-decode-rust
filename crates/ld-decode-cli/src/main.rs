@@ -536,7 +536,7 @@ fn read_tbc_source(
                 decoder.set_analog_audio(0.0);
                 decoder.set_digital_audio(false);
                 // Only the line positions and VBI codes are kept; LD_PASS0_FULL
-                // runs the complete decode instead (they are identical).
+                // runs the complete decode instead (for comparisons).
                 decoder.set_locate_only(std::env::var_os("LD_PASS0_FULL").is_none());
                 let mut collector = stack::Pass0Collector::new(Arc::clone(&live), i);
                 decode_all(&mut rd, &mut Sink::Collect(&mut collector), spec, decoder, None, 0, seekable)?;

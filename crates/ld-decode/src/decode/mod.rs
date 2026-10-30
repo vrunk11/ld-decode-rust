@@ -580,8 +580,8 @@ pub struct Decoder {
     digital_audio: bool,
     /// Output lines the TBC picture is limited to (see [`Decoder::set_locate_only`]).
     locate_rows: Option<Vec<usize>>,
-    /// Experimental pass-0 shortcuts (`LD_PASS0_FAST`, locate-only decodes):
-    /// (no MTF calibration, no burst refinement of the line positions).
+    /// Pass-0 shortcuts of locate-only decodes (see `set_locate_only`): no
+    /// MTF calibration (default), no burst refinement (`LD_PASS0_FAST`).
     pass0_fast: (bool, bool),
 }
 
@@ -730,14 +730,18 @@ impl Decoder {
         Ok(())
     }
 
-    /// Decode only what locating the lines and reading the VBI needs: the TBC
-    /// picture is resampled only on the VITS lines the MTF calibration reads
-    /// (so its decisions, and every field's line positions, stay identical),
-    /// and dropouts are not detected. The picture and metadata written are
-    /// then not a usable decode.
+    /// Decode only what locating the lines and reading the VBI needs: no MTF
+    /// calibration (so no TBC picture, VITS metrics or redo) and no dropout
+    /// detection. The picture and metadata written are then not a usable
+    /// decode. Without the MTF calibration the line positions move by ~0.015
+    /// samples rms against a full decode (18 captures; stack noise and
+    /// sharpness unchanged); `LD_PASS0_FAST=mtf` keeps it, the TBC picture
+    /// then being resampled only on the VITS lines it reads (positions
+    /// bit-identical). `LD_PASS0_FAST=noburst` also drops the burst refinement
+    /// (measured worse: 0.16 samples, kept for experiments).
     pub fn set_locate_only(&mut self, on: bool) {
         let fast = std::env::var("LD_PASS0_FAST").unwrap_or_default();
-        self.pass0_fast = (on && fast.contains("nomtf"), on && fast.contains("noburst"));
+        self.pass0_fast = (on && !fast.contains("mtf") || on && fast.contains("nomtf"), on && fast.contains("noburst"));
         self.locate_rows = on.then(|| {
             let mut rows: Vec<usize> = self
                 .spec
@@ -922,8 +926,8 @@ impl Decoder {
                             efm_pre = Some(input);
                         }
                     }
-                    // Experimental fast pass 0 (`LD_PASS0_FAST=nomtf`): no MTF
-                    // calibration, so no TBC picture, VITS metrics or redo.
+                    // Locate-only decodes skip the MTF calibration (see
+                    // `set_locate_only`): no TBC picture, VITS metrics or redo.
                     if self.pass0_fast.0 {
                         self.metadata = Some(MetadataFieldState {
                             out_scale: field.out_scale,
