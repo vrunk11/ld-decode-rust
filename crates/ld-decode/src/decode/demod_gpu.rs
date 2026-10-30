@@ -18,7 +18,7 @@
 //! `c * H(0)` is added back to each filtered channel: the filters are linear,
 //! so it is the same quantity, now resolved to ~0.1 Hz.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use anyhow::Result;
 use rustfft::num_complex::Complex64;
@@ -566,6 +566,3 @@ impl GpuDemod {
         Ok(res)
     }
 }
-
-/// Shared per-decoder handle.
-pub(crate) type GpuDemodRef = Arc<GpuDemod>;

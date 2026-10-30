@@ -405,7 +405,12 @@ fn main() -> Result<()> {
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
-    decoder.set_gpu_demod(args.device == Device::Opencl, args.gpu_precision != Some(GpuPrecision::Single))?;
+    if args.device == Device::Opencl {
+        match decoder.enable_gpu(args.gpu_precision != Some(GpuPrecision::Single)) {
+            Ok(what) => tracing::info!("GPU demodulator: {what}"),
+            Err(e) => anyhow::bail!("--device opencl: {e}"),
+        }
+    }
     // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
     // decoder itself starts at 0, exactly like `LDdecode.__init__`.
     // PAL has no setup: black is blanking.
