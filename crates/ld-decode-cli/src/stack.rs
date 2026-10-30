@@ -19,7 +19,7 @@
 //! video band: EFM and the analog audio carriers) is summed as read, since a
 //! phase lock tuned on the video carrier would be wrong there. Both filters are
 //! plain dot products, so the same plan runs on the CPU or, with
-//! `--stack-device opencl`, on a GPU (`opencl.rs`).
+//! `--device opencl`, on a GPU (`opencl.rs`).
 
 use std::collections::HashMap;
 use std::fs::File;

@@ -53,10 +53,11 @@ struct Args {
     /// sources always use read.
     #[arg(long, value_enum)]
     tbc: Option<TbcMode>,
-    /// Where the read-time TBC / stack computes the corrected RF: `cpu`, or
-    /// `opencl` (a GPU, through the OpenCL runtime of its driver).
+    /// Where the FM demodulation and the read-time TBC / stack run: `cpu`
+    /// (bit-exact to the reference), or `opencl` (a GPU through its driver's
+    /// OpenCL runtime; single precision, not bit-identical).
     #[arg(long, value_enum, default_value = "cpu")]
-    stack_device: StackDevice,
+    device: Device,
     /// Input sample format; default: inferred from the file extension
     #[arg(long, value_enum)]
     format: Option<reader::SampleFormat>,
@@ -121,7 +122,7 @@ enum TbcMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum StackDevice {
+enum Device {
     Cpu,
     Opencl,
 }
@@ -307,7 +308,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.stack_device)?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, &spec, args.ntscj, request.inputfreq, args.device)?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -376,6 +377,7 @@ fn main() -> Result<()> {
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
+    decoder.set_gpu_demod(args.device == Device::Opencl)?;
     // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
     // decoder itself starts at 0, exactly like `LDdecode.__init__`.
     decoder.set_black_ire(if args.ntscj { 0.0 } else { 7.5 });
@@ -507,7 +509,7 @@ fn read_tbc_source(
     spec: &Arc<DecoderSpec>,
     ntscj: bool,
     inputfreq: f64,
-    device: StackDevice,
+    device: Device,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
         .iter()
@@ -529,6 +531,7 @@ fn read_tbc_source(
                 let mut rd = DecodeReader::new(input.source);
                 let seekable = rd.is_seekable();
                 let mut decoder = Decoder::new(Arc::clone(&spec), 0);
+                decoder.set_gpu_demod(device == Device::Opencl)?;
                 decoder.set_black_ire(if ntscj { 0.0 } else { 7.5 });
                 decoder.set_analog_audio(0.0);
                 decoder.set_digital_audio(false);
@@ -542,7 +545,7 @@ fn read_tbc_source(
             live.finish(i, run());
         })?;
     }
-    stack::VirtualSource::new(stacked, live, fs, device == StackDevice::Opencl)
+    stack::VirtualSource::new(stacked, live, fs, device == Device::Opencl)
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF

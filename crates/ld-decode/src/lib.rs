@@ -5,6 +5,7 @@ mod envflag;
 pub mod ffi_ducc;
 pub mod logging;
 mod optimized;
+pub mod opencl;
 mod request;
 mod spec;
 mod vec_utils;

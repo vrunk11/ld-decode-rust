@@ -12,6 +12,7 @@
 
 mod audio;
 mod demodblock;
+mod demod_gpu;
 #[cfg(test)]
 mod probe_test;
 mod dropouts;
@@ -546,6 +547,8 @@ pub struct Decoder {
     /// dropouts, audio phase 2) join-block behind the long prefetch tasks;
     /// a dedicated pool lets both run concurrently.
     pf_pool: Option<Arc<rayon::ThreadPool>>,
+    /// GPU demodulator ([`Decoder::set_gpu_demod`]); None = the CPU kernel.
+    gpu_demod: Option<Arc<demod_gpu::GpuDemod>>,
     /// Small pool for the serial tail's side computations (dropout detection,
     /// stage-2 audio). These are pure, self-contained jobs whose results are
     /// only needed a few stages later, so running them here keeps the *global*
@@ -645,6 +648,7 @@ impl Decoder {
             // Dedicated prefetch pool: default mirrors the global pool's size
             // (so `-j` keeps meaning the total parallelism); `LD_PF_POOL=0`
             // falls back to the global pool, any other value overrides.
+            gpu_demod: None,
             pf_pool: match std::env::var("LD_PF_POOL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -707,6 +711,19 @@ impl Decoder {
     /// Enable/disable EFM output.
     pub fn set_digital_audio(&mut self, enabled: bool) {
         self.digital_audio = enabled;
+    }
+
+    /// Demodulate on the GPU (OpenCL, single precision; see `demod_gpu.rs`)
+    /// instead of the CPU kernel. Not bit-identical to the reference.
+    pub fn set_gpu_demod(&mut self, on: bool) -> Result<()> {
+        self.gpu_demod = if on {
+            let spec = &self.spec;
+            let dspec = DemodSpecRef::with_plans(spec.freq, spec.freq_half, spec.freq_hz, spec.blocklen, &spec.filters, &self.levels);
+            Some(Arc::new(demod_gpu::GpuDemod::new(&dspec)?))
+        } else {
+            None
+        };
+        Ok(())
     }
 
     /// Decode only what locating the lines and reading the VBI needs: the TBC
@@ -1468,9 +1485,8 @@ impl Decoder {
             let mtf_pow: OnceLock<Option<Vec<Complex64>>> = OnceLock::new();
             let t_demod0 = std::time::Instant::now();
             self.dbg.missing_blocks = missing.len() as u64;
-            let computed: Vec<BlockDecode> = missing
-                .par_iter()
-                .map(|&(bnum, off)| {
+            let computed: Vec<BlockDecode> = match &self.gpu_demod {
+                Some(g) if !missing.is_empty() => {
                     let pow = mtf_pow.get_or_init(|| {
                         if mtf != 0.0 {
                             Some(compute_mtf_pow(&spec.filters.mtf, mtf))
@@ -1478,9 +1494,24 @@ impl Decoder {
                             None
                         }
                     });
-                    demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pow.as_deref(), spec.delays.video_rot, bnum)
-                })
-                .collect();
+                    let blocks: Vec<(u64, &[f32])> =
+                        missing.iter().map(|&(bnum, off)| (bnum, &data[off..off + spec.blocklen])).collect();
+                    gpu_demod_blocks(g, &blocks, mtf, pow.as_deref(), &dspec, spec.delays.video_rot)
+                }
+                _ => missing
+                    .par_iter()
+                    .map(|&(bnum, off)| {
+                        let pow = mtf_pow.get_or_init(|| {
+                            if mtf != 0.0 {
+                                Some(compute_mtf_pow(&spec.filters.mtf, mtf))
+                            } else {
+                                None
+                            }
+                        });
+                        demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pow.as_deref(), spec.delays.video_rot, bnum)
+                    })
+                    .collect(),
+            };
             self.dbg.demod = t_demod0.elapsed().as_nanos() as u64;
             let t_asm0 = std::time::Instant::now();
             for (&(bnum, _), bd) in missing.iter().zip(computed) {
@@ -1538,6 +1569,7 @@ impl Decoder {
                     self.dbg.df_plan = t_pf0.elapsed().as_nanos() as u64;
                     let f_mtf = mtf;
                     let memo = Arc::clone(&self.mtf_pow_memo);
+                    let gpu = self.gpu_demod.clone();
                     let (tx, rx) = std::sync::mpsc::channel();
                     // `install` (not just `spawn`) sets the thread-local pool
                     // so the inner par_iter dispatches onto the dedicated
@@ -1600,7 +1632,11 @@ impl Decoder {
                                 pf_tl_push(7, us, us, 0);
                             }
                         }
-                        let results: Vec<(u64, BlockDecode)> = inputs
+                        let results: Vec<(u64, BlockDecode)> = if let Some(g) = &gpu {
+                            let blocks: Vec<(u64, &[f32])> = inputs.iter().map(|(b, v)| (*b, v.as_slice())).collect();
+                            let out = gpu_demod_blocks(g, &blocks, f_mtf, mtf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec_arc.delays.video_rot);
+                            inputs.iter().map(|(b, _)| *b).zip(out).collect()
+                        } else { inputs
                             .into_par_iter()
                             .enumerate()
                             .map(|(i, (bnum, buf))| {
@@ -1623,7 +1659,7 @@ impl Decoder {
                                 }
                                 r
                             })
-                            .collect();
+                            .collect() };
                         if tl_on {
                             let mut rows = PF_TIMELINE.lock().unwrap().take().unwrap_or_default();
                             rows.sort_by_key(|r| r.2);
@@ -1658,12 +1694,19 @@ impl Decoder {
                     self.pending_prefetch = Some(PendingPrefetch { mtf, recv: rx });
                 } else {
                     let pf_pow = mtf_pow_memo_get(&self.mtf_pow_memo, &spec.filters.mtf, mtf);
-                    let computed: Vec<BlockDecode> = prefetch
-                        .par_iter()
-                        .map(|&(bnum, off)| {
-                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref().map(|v| v.as_slice()), spec.delays.video_rot, bnum)
-                        })
-                        .collect();
+                    let computed: Vec<BlockDecode> = match &self.gpu_demod {
+                        Some(g) if !prefetch.is_empty() => {
+                            let blocks: Vec<(u64, &[f32])> =
+                                prefetch.iter().map(|&(bnum, off)| (bnum, &data[off..off + spec.blocklen])).collect();
+                            gpu_demod_blocks(g, &blocks, mtf, pf_pow.as_deref().map(|v| v.as_slice()), &dspec, spec.delays.video_rot)
+                        }
+                        _ => prefetch
+                            .par_iter()
+                            .map(|&(bnum, off)| {
+                                demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref().map(|v| v.as_slice()), spec.delays.video_rot, bnum)
+                            })
+                            .collect(),
+                    };
                     for ((bnum, _), bd) in prefetch.into_iter().zip(computed) {
                         self.cache_insert(bnum, mtf, bd);
                     }
@@ -2487,4 +2530,56 @@ fn write_par_concat<T: Copy + Send + Sync>(dst: &mut Vec<T>, parts: &[&[T]]) {
         .into_par_iter()
         .zip(parts.par_iter())
         .for_each(|(d, p)| d.copy_from_slice(p));
+}
+
+/// Demodulate `blocks` on the GPU. A GPU failure falls back to the CPU kernel
+/// (once reported); `LD_GPU_CHECK` also runs the CPU kernel and logs how far
+/// apart the two are.
+fn gpu_demod_blocks(
+    gpu: &demod_gpu::GpuDemod,
+    blocks: &[(u64, &[f32])],
+    mtf: f64,
+    pow: Option<&[Complex64]>,
+    dspec: &DemodSpecRef,
+    rotdelay: i64,
+) -> Vec<BlockDecode> {
+    let cpu = || -> Vec<BlockDecode> {
+        blocks.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect()
+    };
+    let data: Vec<&[f32]> = blocks.iter().map(|b| b.1).collect();
+    let out = match gpu.demod(&data, mtf, pow, rotdelay, dspec) {
+        Ok(v) => v,
+        Err(e) => {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("GPU demod failed, using the CPU: {e:#}");
+            }
+            return cpu();
+        }
+    };
+    if std::env::var_os("LD_GPU_CHECK").is_some() {
+        let reference = cpu();
+        let worst = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let rms = |a: &[f32], b: &[f32]| {
+            (a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum::<f64>() / a.len().max(1) as f64).sqrt()
+        };
+        for (g, c) in out.iter().zip(&reference) {
+            let e = g.video.efm.iter().zip(&c.video.efm).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap_or(0);
+            crate::teeprintln!(
+                "GPUCHECK len {}/{} demod max {:.2} rms {:.3} Hz | 05 max {:.2} | burst max {:.2} | raw max {:.2} | rfhpf max {:.3} rms {:.4} | efm max {} | audio max {:.2}",
+                g.video.demod.len(),
+                c.video.demod.len(),
+                worst(&g.video.demod, &c.video.demod),
+                rms(&g.video.demod, &c.video.demod),
+                worst(&g.video.demod_05, &c.video.demod_05),
+                worst(&g.video.demod_burst, &c.video.demod_burst),
+                worst(&g.video.demod_raw, &c.video.demod_raw),
+                worst(&g.rfhpf, &c.rfhpf),
+                rms(&g.rfhpf, &c.rfhpf),
+                e,
+                worst(&g.video.audio[0], &c.video.audio[0]),
+            );
+        }
+    }
+    out
 }

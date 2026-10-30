@@ -318,6 +318,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cc",
+ "libloading",
  "num-traits",
  "rayon",
  "realfft",
@@ -335,7 +336,6 @@ dependencies = [
  "clap",
  "claxon",
  "ld-decode",
- "libloading",
  "mimalloc",
  "ogg",
  "rayon",
