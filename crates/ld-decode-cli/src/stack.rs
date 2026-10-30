@@ -427,7 +427,35 @@ struct RawFile {
     file: File,
     bytes: usize,
     widen: fn(&[u8], &mut [f32]),
+    /// 16-bit code of each sample and the offset back to its value (`value =
+    /// code + offset`, exact), for the formats whose values fit in 65536
+    /// steps: the GPU path moves these instead of f32.
+    code: Option<(fn(&[u8], &mut [u16]), f32)>,
     len: u64,
+}
+
+fn code_s16(b: &[u8], out: &mut [u16]) {
+    for (o, w) in out.iter_mut().zip(b.chunks_exact(2)) {
+        *o = u16::from_le_bytes([w[0], w[1]]) ^ 0x8000;
+    }
+}
+
+fn code_u16(b: &[u8], out: &mut [u16]) {
+    for (o, w) in out.iter_mut().zip(b.chunks_exact(2)) {
+        *o = u16::from_le_bytes([w[0], w[1]]);
+    }
+}
+
+fn code_u8(b: &[u8], out: &mut [u16]) {
+    for (o, &v) in out.iter_mut().zip(b) {
+        *o = u16::from(v);
+    }
+}
+
+fn code_s8(b: &[u8], out: &mut [u16]) {
+    for (o, &v) in out.iter_mut().zip(b) {
+        *o = (i32::from(v as i8) * 256 + 32768) as u16;
+    }
 }
 
 impl RawFile {
@@ -437,7 +465,44 @@ impl RawFile {
         };
         let file = File::open(path).with_context(|| format!("opening {path}"))?;
         let len = file.metadata()?.len() / bytes as u64;
-        Ok(Self { file, bytes, widen, len })
+        let code = match format {
+            SampleFormat::S16Le => Some((code_s16 as fn(&[u8], &mut [u16]), -32768.0)),
+            SampleFormat::U16Le => Some((code_u16 as fn(&[u8], &mut [u16]), 0.0)),
+            SampleFormat::U8Le => Some((code_u8 as fn(&[u8], &mut [u16]), 0.0)),
+            SampleFormat::S8Le => Some((code_s8 as fn(&[u8], &mut [u16]), -32768.0)),
+            _ => None,
+        };
+        Ok(Self { file, bytes, widen, code, len })
+    }
+
+    /// The file's bytes for samples `[lo, hi)` (clipped to the file).
+    fn bytes_at(&self, lo: u64, hi: u64) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; (hi - lo) as usize * self.bytes];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let got = read_at(&self.file, &mut buf[filled..], lo * self.bytes as u64 + filled as u64)?;
+            if got == 0 {
+                break;
+            }
+            filled += got;
+        }
+        buf.truncate(filled / self.bytes * self.bytes);
+        Ok(buf)
+    }
+
+    /// 16-bit codes of samples `[start, start + out.len())` (see `code`);
+    /// the code of 0 outside the file.
+    fn read_codes_at(&self, start: i64, out: &mut [u16]) -> Result<f32> {
+        let (code, off) = self.code.expect("a format with 16-bit codes");
+        out.fill((-off) as u16);
+        let lo = start.max(0) as u64;
+        let hi = ((start + out.len() as i64).max(0) as u64).min(self.len);
+        if hi > lo {
+            let buf = self.bytes_at(lo, hi)?;
+            let at = (lo as i64 - start) as usize;
+            code(&buf, &mut out[at..at + buf.len() / self.bytes]);
+        }
+        Ok(off)
     }
 
     /// Samples `[start, start + out.len())`; zeros outside the file.
@@ -640,7 +705,11 @@ pub(crate) struct Plan {
 }
 
 pub(crate) struct InputSpan {
+    /// The span's samples: as f32, or (`codes` plans) as 16-bit codes with
+    /// `value = code + off`.
     pub(crate) raw: Vec<f32>,
+    pub(crate) codes: Vec<u16>,
+    pub(crate) off: f32,
     /// Per segment: position (relative to the span) at `seg_t0`, NaN where the
     /// input does not cover it, and input samples per virtual sample.
     pub(crate) a0: Vec<f64>,
@@ -656,7 +725,12 @@ impl InputSpan {
 }
 
 impl Inner {
-    fn plan(&self, s0: f64, len: usize) -> Result<Plan> {
+    /// Whether every input has 16-bit codes (see `RawFile::code`).
+    pub(crate) fn has_codes(&self) -> bool {
+        self.inputs.iter().all(|s| s.reader.code.is_some())
+    }
+
+    fn plan(&self, s0: f64, len: usize, codes: bool) -> Result<Plan> {
         let tl = &self.live.slice(s0, len)?;
         let k_first = tl.segment(s0);
         let mut seg = Vec::with_capacity(len);
@@ -711,12 +785,18 @@ impl Inner {
                     );
                     return Ok(None);
                 }
-                let mut raw = vec![0f32; (end - start) as usize];
-                self.inputs[i].reader.read_at(start, &mut raw)?;
+                let (mut raw, mut codes16, mut off) = (Vec::new(), Vec::new(), 0.0);
+                if codes {
+                    codes16 = vec![0u16; (end - start) as usize];
+                    off = self.inputs[i].reader.read_codes_at(start, &mut codes16)?;
+                } else {
+                    raw = vec![0f32; (end - start) as usize];
+                    self.inputs[i].reader.read_at(start, &mut raw)?;
+                }
                 for v in &mut a0 {
                     *v -= start as f64;
                 }
-                Ok(Some(InputSpan { raw, a0, slope }))
+                Ok(Some(InputSpan { raw, codes: codes16, off, a0, slope }))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Plan { s0, len, seg, seg_t0, inputs })
@@ -764,7 +844,7 @@ impl VirtualSource {
             Some(gpu) => {
                 let m = LOCK_MARGIN;
                 let t0 = std::time::Instant::now();
-                let plan = inner.plan(s0 as f64 - m as f64, out.len() + 2 * m)?;
+                let plan = inner.plan(s0 as f64 - m as f64, out.len() + 2 * m, inner.has_codes())?;
                 let t1 = std::time::Instant::now();
                 gpu.run(&plan, m, out)?;
                 if std::env::var_os("LD_TIMING").is_some() {
@@ -805,7 +885,7 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
     let n = out.len();
     let m = LOCK_MARGIN;
     let len = n + 2 * m;
-    let plan = inner.plan(s0 as f64 - m as f64, len)?;
+    let plan = inner.plan(s0 as f64 - m as f64, len, false)?;
     let [sinc, hi_re, hi_im] = &inner.fir;
 
     // Each input read at its own positions: the full signal (sinc) and the
@@ -890,7 +970,12 @@ impl SampleSource for VirtualSource {
         // Wait until pass 0 has located every input that far (the length is
         // only known once the primary is fully located).
         let end = self.pos as f64 + (out.len() + LOCK_MARGIN) as f64;
-        let n = match self.inner.live.wait_cover(end)? {
+        let tw = std::time::Instant::now();
+        let cover = self.inner.live.wait_cover(end)?;
+        if std::env::var_os("LD_TIMING").is_some() {
+            ld_decode::teeprintln!("STACKWAIT us={}", tw.elapsed().as_micros());
+        }
+        let n = match cover {
             Some(len) => (len.saturating_sub(self.pos) as usize).min(out.len()),
             None => out.len(),
         };

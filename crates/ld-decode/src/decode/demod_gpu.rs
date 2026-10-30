@@ -21,7 +21,7 @@ use anyhow::Result;
 use rustfft::num_complex::Complex64;
 
 use super::demodblock::{audio_stage1, BlockDecode, DemodSpecRef, VideoChannels};
-use crate::opencl::{Arg, Buffer, Gpu, Kernel, Queue};
+use crate::opencl::{Arg, Buffer, Gpu, Kernel, Pinned, Queue};
 
 /// Blocks per GPU submission (bounds the device memory: ~10 buffers of
 /// `MAX_BATCH * blocklen` complex values).
@@ -38,6 +38,13 @@ __kernel void load_real(__global const float* in, __global float2* out) {
     int i = get_global_id(0), b = get_global_id(1);
     if (i >= N) return;
     out[b * N + i] = (float2)(in[b * N + i], 0.0f);
+}
+
+// The same from 16-bit codes: sample = code + off (exact for integers).
+__kernel void load_u16(__global const ushort* in, const float off, __global float2* out) {
+    int i = get_global_id(0), b = get_global_id(1);
+    if (i >= N) return;
+    out[b * N + i] = (float2)((float)in[b * N + i] + off, 0.0f);
 }
 
 // v * exp(s * i * pi/4 * k) for k = 1, 2, 3 (s = -1 forward, +1 inverse).
@@ -173,6 +180,7 @@ __kernel void gather_bins(__global const float2* X, __global const int* starts, 
 struct State {
     q: Queue,
     k_load: Kernel,
+    k_load16: Kernel,
     k_fft: Kernel,
     k_rf: Kernel,
     k_disc: Kernel,
@@ -190,6 +198,10 @@ struct State {
     /// from these as the pipeline goes.
     rows: [Buffer; 6],
     raw: Buffer,
+    in16: Buffer,
+    /// Page-locked staging for the input and for the outputs.
+    up: Pinned,
+    down: Pinned,
     out_f: [Buffer; 5],
     out_efm: Buffer,
     bins: Buffer,
@@ -217,11 +229,11 @@ impl GpuDemod {
             .kernels(
                 SOURCE,
                 &format!("-DN={n}"),
-                &["load_real", "fft_pass", "rf_products", "discriminate", "video_products", "extract", "gather_bins"],
+                &["load_real", "fft_pass", "rf_products", "discriminate", "video_products", "extract", "gather_bins", "load_u16"],
             )?
             .into_iter();
         let mut k = || ks.next().unwrap();
-        let (k_load, k_fft, k_rf, k_disc, k_video, k_extract, k_bins) = (k(), k(), k(), k(), k(), k(), k());
+        let (k_load, k_fft, k_rf, k_disc, k_video, k_extract, k_bins, k_load16) = (k(), k(), k(), k(), k(), k(), k(), k());
         let q = gpu.queue()?;
         let f = spec.filters;
         let upload = |data: &[[f32; 2]]| -> Result<Buffer> {
@@ -249,12 +261,16 @@ impl GpuDemod {
             starts: gpu.buffer(16)?,
             rows: [gpu.buffer(8)?, gpu.buffer(8)?, gpu.buffer(8)?, gpu.buffer(8)?, gpu.buffer(8)?, gpu.buffer(8)?],
             raw: gpu.buffer(4)?,
+            in16: gpu.buffer(2)?,
+            up: gpu.pinned(4)?,
+            down: gpu.pinned(4)?,
             out_f: [gpu.buffer(4)?, gpu.buffer(4)?, gpu.buffer(4)?, gpu.buffer(4)?, gpu.buffer(4)?],
             out_efm: gpu.buffer(2)?,
             bins: gpu.buffer(8)?,
             pow_level: None,
             q,
             k_load,
+            k_load16,
             k_fft,
             k_rf,
             k_disc,
@@ -302,14 +318,33 @@ impl GpuDemod {
         st.raw.ensure(nb * n * 4)?;
         let q = &st.q;
 
-        // Input, as complex rows (rows[0] = staging, then rows[1] = X).
-        let mut flat = Vec::with_capacity(nb * n);
-        for b in blocks {
-            flat.extend_from_slice(&b[..n]);
+        // Input, as complex rows (rows[0] = staging, then rows[1] = X). Integer
+        // samples spanning at most 65536 values (every 16-bit or 8-bit
+        // capture) go up as 16-bit codes from their minimum: half the bytes,
+        // the same values.
+        let (lo, hi) = blocks.iter().flat_map(|b| &b[..n]).fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &v| (l.min(v), h.max(v)));
+        let integral = hi - lo <= 65535.0 && blocks.iter().all(|b| b[..n].iter().all(|v| v.fract() == 0.0));
+        if integral {
+            st.up.ensure(nb * n * 2)?;
+            let codes = st.up.slice_mut::<u16>(nb * n);
+            for (dst, b) in codes.chunks_exact_mut(n).zip(blocks) {
+                for (d, &v) in dst.iter_mut().zip(&b[..n]) {
+                    *d = (v - lo) as u16;
+                }
+            }
+            st.in16.ensure(nb * n * 2)?;
+            q.upload(&st.in16, 0, &st.up, 0, nb * n * 2)?;
+            st.k_load16.args(&[Arg::Buf(&st.in16), Arg::F32(lo), Arg::Buf(&st.rows[0])])?;
+            q.launch(&st.k_load16, &[n, nb], 256)?;
+        } else {
+            st.up.ensure(nb * n * 4)?;
+            for (dst, b) in st.up.slice_mut::<f32>(nb * n).chunks_exact_mut(n).zip(blocks) {
+                dst.copy_from_slice(&b[..n]);
+            }
+            q.upload(&st.raw, 0, &st.up, 0, nb * n * 4)?;
+            st.k_load.args(&[Arg::Buf(&st.raw), Arg::Buf(&st.rows[0])])?;
+            q.launch(&st.k_load, &[n, nb], 256)?;
         }
-        q.write(&st.raw, 0, &flat)?;
-        st.k_load.args(&[Arg::Buf(&st.raw), Arg::Buf(&st.rows[0])])?;
-        q.launch(&st.k_load, &[n, nb], 256)?;
         // FFT rows[0] -> lands in rows[1] after 5 passes (odd count).
         let fft = |src: usize, tmp: usize, sign: f32| -> Result<usize> {
             let (mut a, mut b) = (src, tmp);
@@ -452,14 +487,32 @@ impl GpuDemod {
         ])?;
         q.launch(&st.k_extract, &[clen.max(rlen), nb], 256)?;
 
-        let mut ch: Vec<Vec<f32>> = (0..5).map(|i| vec![0f32; nb * if i == 4 { rlen } else { clen }]).collect();
-        for (i, v) in ch.iter_mut().enumerate() {
-            q.read(&st.out_f[i], 0, v)?;
+        // Everything back through the pinned buffer, in one wait.
+        let sizes: Vec<usize> = (0..5).map(|i| nb * if i == 4 { rlen } else { clen } * 4).collect();
+        let total = sizes.iter().sum::<usize>() + nb * clen * 2 + nb * 4 * run * 8;
+        st.down.ensure(total)?;
+        let mut off = 0;
+        for (i, &sz) in sizes.iter().enumerate() {
+            q.download(&st.out_f[i], 0, &mut st.down, off, sz)?;
+            off += sz;
         }
-        let mut efm = vec![0i16; nb * clen];
-        q.read(&st.out_efm, 0, &mut efm)?;
-        let mut bins = vec![[0f32; 2]; nb * 4 * run];
-        q.read(&st.bins, 0, &mut bins)?;
+        q.download(&st.out_efm, 0, &mut st.down, off, nb * clen * 2)?;
+        off += nb * clen * 2;
+        q.download(&st.bins, 0, &mut st.down, off, nb * 4 * run * 8)?;
+        q.finish()?;
+        let bytes = st.down.slice::<u8>(total);
+        let mut off = 0;
+        let mut take = |len: usize| {
+            let b = &bytes[off..off + len];
+            off += len;
+            b
+        };
+        let ch: Vec<Vec<f32>> = sizes.iter().map(|&sz| take(sz).chunks_exact(4).map(|w| f32::from_ne_bytes([w[0], w[1], w[2], w[3]])).collect()).collect();
+        let efm: Vec<i16> = take(nb * clen * 2).chunks_exact(2).map(|w| i16::from_ne_bytes([w[0], w[1]])).collect();
+        let bins: Vec<[f32; 2]> = take(nb * 4 * run * 8)
+            .chunks_exact(8)
+            .map(|w| [f32::from_ne_bytes([w[0], w[1], w[2], w[3]]), f32::from_ne_bytes([w[4], w[5], w[6], w[7]])])
+            .collect();
         drop(guard);
 
         // Assemble per block; the analog audio's stage 1 runs on the CPU from

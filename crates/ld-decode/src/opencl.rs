@@ -22,7 +22,11 @@ const CL_DEVICE_NAME: u32 = 0x102B;
 const CL_DEVICE_EXTENSIONS: u32 = 0x1030;
 const CL_PROGRAM_BUILD_LOG: u32 = 0x1183;
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
+const CL_MEM_ALLOC_HOST_PTR: u64 = 1 << 4;
+const CL_MAP_READ: u64 = 1 << 0;
+const CL_MAP_WRITE: u64 = 1 << 1;
 const CL_TRUE: u32 = 1;
+const CL_FALSE: u32 = 0;
 
 /// The OpenCL 1.2 entry points used here.
 struct Api {
@@ -45,6 +49,9 @@ struct Api {
     enqueue_read_buffer: unsafe extern "system" fn(Handle, Handle, u32, usize, usize, *mut c_void, ClUint, *const Handle, *mut Handle) -> ClInt,
     enqueue_nd_range_kernel: unsafe extern "system" fn(Handle, Handle, ClUint, *const usize, *const usize, *const usize, ClUint, *const Handle, *mut Handle) -> ClInt,
     finish: unsafe extern "system" fn(Handle) -> ClInt,
+    enqueue_map_buffer:
+        unsafe extern "system" fn(Handle, Handle, u32, u64, usize, usize, ClUint, *const Handle, *mut Handle, *mut ClInt) -> *mut c_void,
+    enqueue_unmap_mem_object: unsafe extern "system" fn(Handle, Handle, *mut c_void, ClUint, *const Handle, *mut Handle) -> ClInt,
 }
 
 impl Api {
@@ -85,6 +92,8 @@ impl Api {
         let enqueue_read_buffer = sym!("clEnqueueReadBuffer");
         let enqueue_nd_range_kernel = sym!("clEnqueueNDRangeKernel");
         let finish = sym!("clFinish");
+        let enqueue_map_buffer = sym!("clEnqueueMapBuffer");
+        let enqueue_unmap_mem_object = sym!("clEnqueueUnmapMemObject");
         Ok(Self {
             _lib: lib,
             get_platform_ids,
@@ -105,6 +114,8 @@ impl Api {
             enqueue_read_buffer,
             enqueue_nd_range_kernel,
             finish,
+            enqueue_map_buffer,
+            enqueue_unmap_mem_object,
         })
     }
 }
@@ -228,6 +239,13 @@ impl Gpu {
         Ok(Queue { gpu: Arc::clone(self), handle: q })
     }
 
+    /// Page-locked host memory for transfers (see [`Pinned`]).
+    pub fn pinned(self: &Arc<Self>, bytes: usize) -> Result<Pinned> {
+        let mut p = Pinned { q: self.queue()?, mem: null_mut(), ptr: null_mut(), cap: 0 };
+        p.ensure(bytes)?;
+        Ok(p)
+    }
+
     /// A device buffer of at least `bytes` (grown on demand by [`Buffer::ensure`]).
     pub fn buffer(self: &Arc<Self>, bytes: usize) -> Result<Buffer> {
         let mut b = Buffer { gpu: Arc::clone(self), mem: null_mut(), cap: 0 };
@@ -308,6 +326,71 @@ impl Drop for Buffer {
     }
 }
 
+/// Page-locked host memory (an `ALLOC_HOST_PTR` buffer kept mapped): the
+/// driver moves it by DMA, without the extra staging copy a transfer from
+/// ordinary memory pays. Used as the host side of [`Queue::upload`] and
+/// [`Queue::download`].
+pub struct Pinned {
+    q: Queue,
+    mem: Handle,
+    ptr: *mut u8,
+    cap: usize,
+}
+
+unsafe impl Send for Pinned {}
+
+impl Pinned {
+    /// Grow to at least `bytes` (contents are lost when it grows).
+    pub fn ensure(&mut self, bytes: usize) -> Result<()> {
+        if self.cap >= bytes.max(1) {
+            return Ok(());
+        }
+        self.release();
+        let cap = bytes.max(1).next_power_of_two();
+        let api = &self.q.gpu.api;
+        let mut err = 0;
+        let mem = unsafe {
+            (api.create_buffer)(self.q.gpu.context, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, cap, null_mut(), &mut err)
+        };
+        check(err, "clCreateBuffer (pinned)")?;
+        let ptr = unsafe {
+            (api.enqueue_map_buffer)(self.q.handle, mem, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, cap, 0, null(), null_mut(), &mut err)
+        };
+        check(err, "clEnqueueMapBuffer")?;
+        (self.mem, self.ptr, self.cap) = (mem, ptr.cast(), cap);
+        Ok(())
+    }
+
+    /// The first `n` elements, as `T` (the mapping is page aligned).
+    pub fn slice_mut<T: Copy>(&mut self, n: usize) -> &mut [T] {
+        assert!(n * std::mem::size_of::<T>() <= self.cap);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), n) }
+    }
+
+    pub fn slice<T: Copy>(&self, n: usize) -> &[T] {
+        assert!(n * std::mem::size_of::<T>() <= self.cap);
+        unsafe { std::slice::from_raw_parts(self.ptr.cast(), n) }
+    }
+
+    fn release(&mut self) {
+        if !self.mem.is_null() {
+            let api = &self.q.gpu.api;
+            unsafe {
+                (api.enqueue_unmap_mem_object)(self.q.handle, self.mem, self.ptr.cast(), 0, null(), null_mut());
+                (api.finish)(self.q.handle);
+                (api.release_mem_object)(self.mem);
+            }
+            self.mem = null_mut();
+        }
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct Queue {
     gpu: Arc<Gpu>,
     handle: Handle,
@@ -359,6 +442,57 @@ impl Queue {
                     offset,
                     std::mem::size_of_val(out),
                     out.as_mut_ptr().cast(),
+                    0,
+                    null(),
+                    null_mut(),
+                )
+            },
+            "clEnqueueReadBuffer",
+        )
+    }
+
+    /// Queue a copy of `bytes` from `src` (at byte `src_off`) to `buf` (at
+    /// `offset`). It is asynchronous: `src` must not change before a
+    /// [`Queue::finish`] or a blocking call on this queue.
+    pub fn upload(&self, buf: &Buffer, offset: usize, src: &Pinned, src_off: usize, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        assert!(src_off + bytes <= src.cap);
+        check(
+            unsafe {
+                (self.gpu.api.enqueue_write_buffer)(
+                    self.handle,
+                    buf.mem,
+                    CL_FALSE,
+                    offset,
+                    bytes,
+                    src.ptr.add(src_off).cast(),
+                    0,
+                    null(),
+                    null_mut(),
+                )
+            },
+            "clEnqueueWriteBuffer",
+        )
+    }
+
+    /// Queue a copy of `bytes` from `buf` (at `offset`) into `dst` (at byte
+    /// `dst_off`); valid after [`Queue::finish`].
+    pub fn download(&self, buf: &Buffer, offset: usize, dst: &mut Pinned, dst_off: usize, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        assert!(dst_off + bytes <= dst.cap);
+        check(
+            unsafe {
+                (self.gpu.api.enqueue_read_buffer)(
+                    self.handle,
+                    buf.mem,
+                    CL_FALSE,
+                    offset,
+                    bytes,
+                    dst.ptr.add(dst_off).cast(),
                     0,
                     null(),
                     null_mut(),

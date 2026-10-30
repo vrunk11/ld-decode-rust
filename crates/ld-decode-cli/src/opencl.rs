@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use anyhow::Result;
-use ld_decode::opencl::{Arg, Buffer, Gpu, Kernel, Queue};
+use ld_decode::opencl::{Arg, Buffer, Gpu, Kernel, Pinned, Queue};
 
 use crate::stack::{sinc_lut, Inner, Plan, HI_TAPS, LOCK_WIN, SINC_PHASES, SINC_TAPS};
 
@@ -19,6 +19,9 @@ const SOURCE: &str = r#"
 // analytic video band, as stack.rs compute_task does.
 __kernel void read_input(
     __global const float* raw_all,
+    __global const ushort* codes_all,
+    const int use_codes,
+    const float off,
     __global const uint* seg,
     __global const double* seg_t0,
     __global const double* a0_all,
@@ -37,6 +40,7 @@ __kernel void read_input(
     int j = get_global_id(0);
     if (j >= len) return;
     __global const float* raw = raw_all + raw_off;
+    __global const ushort* codes = codes_all + raw_off;
     __global const double* a0 = a0_all + seg_off;
     __global const double* slope = slope_all + seg_off;
     uint k = seg[j];
@@ -51,14 +55,18 @@ __kernel void read_input(
     double kf = floor(p);
     int k0 = (int)kf;
     int ph = (int)round((p - kf) * (double)PHASES);
-    __global const float* xs = raw + (k0 - (SINC_TAPS / 2 - 1));
+    int xs = k0 - (SINC_TAPS / 2 - 1), xh = k0 - (HI_TAPS / 2 - 1);
     __global const float* hs = sinc + ph * SINC_TAPS;
-    float f = 0.0f;
-    for (int d = 0; d < SINC_TAPS; d++) f += hs[d] * xs[d];
-    __global const float* xh = raw + (k0 - (HI_TAPS / 2 - 1));
     __global const float2* hh = hil + ph * HI_TAPS;
+    float f = 0.0f;
     float2 h = (float2)(0.0f, 0.0f);
-    for (int d = 0; d < HI_TAPS; d++) h += hh[d] * xh[d];
+    if (use_codes) {
+        for (int d = 0; d < SINC_TAPS; d++) f += hs[d] * ((float)codes[xs + d] + off);
+        for (int d = 0; d < HI_TAPS; d++) h += hh[d] * ((float)codes[xh + d] + off);
+    } else {
+        for (int d = 0; d < SINC_TAPS; d++) f += hs[d] * raw[xs + d];
+        for (int d = 0; d < HI_TAPS; d++) h += hh[d] * raw[xh + d];
+    }
     full[base + j] = f;
     hi[base + j] = h;
     cov[base + j] = 1;
@@ -126,6 +134,9 @@ struct State {
     seg: Buffer,
     seg_t0: Buffer,
     raw: Buffer,
+    codes: Buffer,
+    /// Page-locked staging of the inputs' samples.
+    up: Pinned,
     a0: Buffer,
     slope: Buffer,
     full: Buffer,
@@ -168,6 +179,8 @@ impl StackGpu {
             seg: gpu.buffer(4)?,
             seg_t0: gpu.buffer(8)?,
             raw: gpu.buffer(4)?,
+            codes: gpu.buffer(2)?,
+            up: gpu.pinned(4)?,
             a0: gpu.buffer(8)?,
             slope: gpu.buffer(8)?,
             full: gpu.buffer(4)?,
@@ -197,28 +210,43 @@ impl StackGpu {
         // Every input in one upload: spans back to back, segment laws at
         // `i * nseg` (all NaN for an input this read does not cover).
         let nseg = plan.seg_t0.len();
-        let mut raw = Vec::new();
+        let codes = plan.inputs.iter().flatten().any(|sp| !sp.codes.is_empty());
+        let total: usize = plan.inputs.iter().flatten().map(|sp| if codes { sp.codes.len() } else { sp.raw.len() }).sum();
+        let elem = if codes { 2 } else { 4 };
+        st.up.ensure(total * elem)?;
         let mut offs = Vec::with_capacity(ni);
         let mut a0 = vec![f64::NAN; ni * nseg];
         let mut slope = vec![0.0f64; ni * nseg];
+        let mut at = 0usize;
         for (i, span) in plan.inputs.iter().enumerate() {
-            offs.push(raw.len() as i64);
+            offs.push((at as i64, span.as_ref().map_or(0.0, |sp| sp.off)));
             if let Some(span) = span {
-                raw.extend_from_slice(&span.raw);
+                if codes {
+                    st.up.slice_mut::<u16>(total)[at..at + span.codes.len()].copy_from_slice(&span.codes);
+                    at += span.codes.len();
+                } else {
+                    st.up.slice_mut::<f32>(total)[at..at + span.raw.len()].copy_from_slice(&span.raw);
+                    at += span.raw.len();
+                }
                 a0[i * nseg..(i + 1) * nseg].copy_from_slice(&span.a0);
                 slope[i * nseg..(i + 1) * nseg].copy_from_slice(&span.slope);
             }
         }
         let t0 = std::time::Instant::now();
-        st.raw.ensure(raw.len() * 4)?;
+        let target = if codes { &mut st.codes } else { &mut st.raw };
+        target.ensure(total * elem)?;
+        let target = if codes { &st.codes } else { &st.raw };
+        st.q.upload(target, 0, &st.up, 0, total * elem)?;
         st.a0.ensure(a0.len() * 8)?;
         st.slope.ensure(slope.len() * 8)?;
-        st.q.write(&st.raw, 0, &raw)?;
         st.q.write(&st.a0, 0, &a0)?;
         st.q.write(&st.slope, 0, &slope)?;
-        for (i, &off) in offs.iter().enumerate() {
+        for (i, &(off, sample_off)) in offs.iter().enumerate() {
             st.k_read.args(&[
                 Arg::Buf(&st.raw),
+                Arg::Buf(&st.codes),
+                Arg::I32(codes as i32),
+                Arg::F32(sample_off),
                 Arg::Buf(&st.seg),
                 Arg::Buf(&st.seg_t0),
                 Arg::Buf(&st.a0),
