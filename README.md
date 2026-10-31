@@ -42,7 +42,8 @@ runtime dependency is `ffmpeg` for the FLAC-family inputs.
 
 Prerequisites:
 
-- Rust **nightly** (`rustup toolchain install nightly-2026-08-29`).
+- Rust **nightly** (`rustup toolchain install nightly-2026-10-29`, the
+  toolchain CI and the release artifacts are built with).
 - A C++17 compiler for the vendored ducc0 FFT (`build.rs`):
   - **Windows**: the MSVC toolchain plus LLVM's `clang-cl` on `PATH`.
   - **Linux**: `clang++` (preferred) or `g++`, and the C++ standard library

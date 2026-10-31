@@ -22,7 +22,7 @@ on:
         description: "Rust toolchain to build with"
         required: false
         type: string
-        default: "nightly-2026-08-29"
+        default: "nightly-2026-10-29"
       release_tag:
         description: "Tag to release when manually dispatched (example: v0.2.0)"
         required: false
@@ -92,7 +92,7 @@ jobs:
           # dispatch input exists so an artifact can be built with another
           # toolchain on purpose -- it is empty on a tag push, hence the
           # fallback.
-          toolchain: ${{ github.event.inputs.toolchain || 'nightly-2026-08-29' }}
+          toolchain: ${{ github.event.inputs.toolchain || 'nightly-2026-10-29' }}
           targets: ${{ matrix.target }}
 
       - name: Install C++ toolchain and FFmpeg
