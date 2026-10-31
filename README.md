@@ -30,7 +30,13 @@ is built under.
 - **Roughly 9–20x faster than the Python reference.** About 46 FPS for raw `s16`
   (`-t 8`) and ~45 FPS for `.ldf` (`-t 10`/`11`) on a Ryzen 7 5800X3D over a
   10,000-field window, against ~2–5 FPS for Python 3.12 + numpy + scipy on the
-  same box. The full GGV1069 `.ldf` takes 575 s (44.1 FPS). FPS is only
+  same box. The full GGV1069 `.ldf` takes 575 s (44.1 FPS). **PAL is a little
+  slower:** the full GGV1011 PAL side 1 takes 753 s (32.0 FPS at the default
+  thread count), because a PAL field carries ~20% more pixels and its
+  pilot-based lineloc refinement and burst-phase field numbering add transforms
+  per field. With `--gpu` the whole demodulator runs on an OpenCL device
+  instead: ~62 FPS on a 400-frame window that does 46 on the CPU, and ~48 FPS
+  single-threaded against 10 — see [GPU speeds](#gpu-speeds). FPS is only
   meaningful with the machine otherwise idle and the output disk not full.
 - Produces `.tbc`, `.tbc.json`, `.pcm`, `.efm` and `.tbc.db`, plus a `.log` that
   mirrors the console output.
@@ -135,6 +141,28 @@ with `.pcm`, `.efm`, `.tbc.json` and every `.tbc.db` table identical. The two
 kernels disagree on ~1 sample per 10⁸–10⁹ by exactly 1 ulp of f32 (20 `demod`,
 31 `demod_raw`, 19 `demod_05`, 680 `demod_burst` in 13,000 fields), and the
 16-tap downscale absorbs all but ~1 in 80 of those.
+
+### GPU speeds
+
+Measured on a Ryzen 7 5800X3D with an AMD Radeon RX 9070 XT, 400-frame
+NTSC `.ldf` window (`-s 1000 -l 400`, 800 fields), two interleaved runs each:
+
+| mode | FPS | against CPU |
+| --- | --- | --- |
+| CPU, default threads (10 demod) | 46.2 | — |
+| `--gpu` (bit-exact) | 61.7 | +33% |
+| `--gpu-fast` | 63.4 | +37% |
+| CPU, `-t 1` | 10.1 | — |
+| `--gpu -t 1` | 48.0 | +4.8x |
+
+The full 168,566-field sideA `.ddd.flac` disc reads the same way: 1,816 s on the
+CPU (46.4 FPS), 1,390 s with `--gpu` (60.6) and 1,320 s with `--gpu-fast`
+(63.9). The gain grows as the CPU is thread-starved, because the whole
+demodulator leaves the pool — a single-threaded decode is nearly five times
+quicker on the device, and `--gpu -t 1` still beats a ten-thread CPU run.
+`--gpu-fast` is only ~3–5% above the bit-exact mode. Both GPU modes need an
+OpenCL device with `fp64`; `--gpu-precision single` applies to `--gpu-fast`
+only and helps consumer cards with little f64 throughput.
 
 ## Input formats
 
