@@ -13,19 +13,20 @@ is built under.
 
 ## What it does today
 
-- **NTSC is the byte-parity target.** PAL (`--PAL`) is ported from ld-decode
-  7.4's `FieldPAL` and PAL tables (pilot-based lineloc refinement, 312/313-line
-  fields, burst-based field phase, PAL dropout thresholds and VITS metrics) but
-  is **not** verified byte for byte against the Python reference. It is checked
-  by measurement only — line alignment, noise, field phase and VBI against
-  ld-decode's own decode of the same captures. Nothing in it changes an NTSC
-  output.
-- **Byte-parity verified end-to-end** on five full-disc paths:
+- **NTSC and PAL are both byte-parity targets.** PAL (`--PAL`/`-p`) is ld-decode
+  7.4's `FieldPAL`: pilot-based lineloc refinement, 312/313-line fields,
+  burst-phase field numbering, PAL dropout thresholds, the PAL filter bank and
+  audio carriers, and PAL VITS metrics. Its full-disc byte parity is part of the
+  verified list below; the one PAL option not ported is
+  `--V4300D_notch_filter`.
+- **Byte-parity verified end-to-end** on six full-disc paths:
   - `s16` capture (168,800 fields) — 4/4 outputs identical.
   - `.ddd.flac` from frame 300 (168,566 fields) — 4/4 outputs identical.
   - Pioneer GGV1069 `.ldf` (50,722 fields) — 4/4 outputs identical.
   - Diamond Time CLV `.ldf` (71,710 fields) — 4/4 outputs identical.
   - GGV1016 CAV `.ldf` (108,576 fields) — 4/4 outputs identical.
+  - GGV1011 CAV **PAL** side 1 `.ldf` (48,260 fields) — 4/4 outputs identical,
+    `.tbc.db` content-identical in every table.
 - **Roughly 9–20x faster than the Python reference.** About 46 FPS for raw `s16`
   (`-t 8`) and ~45 FPS for `.ldf` (`-t 10`/`11`) on a Ryzen 7 5800X3D over a
   10,000-field window, against ~2–5 FPS for Python 3.12 + numpy + scipy on the

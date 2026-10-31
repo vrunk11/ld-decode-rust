@@ -7,6 +7,7 @@
 
 use crate::spec::DecoderSpec;
 use rayon::prelude::*;
+use rustfft::num_complex::Complex64;
 
 /// Port of `findpeaks(array, low)` from utils.py (faithful, including its
 /// quirks): values below `low` are zeroed, then the returned indices are
@@ -92,15 +93,43 @@ fn runfilter_audio_phase2(
                 }
             }
 
-        // Zero-pad into an f64 block (Python's `np.zeros_like(audio2_filter)`
-        // upcasts the f32 stage-1 audio to f64), then the ducc FFT matches
-        // `scipy.fft.fft` of the real input bit-for-bit.
-        let mut a2_in = vec![0.0f64; blocklen];
+        // `scipy.fft.fft` keeps the precision of its input, so WHICH branch
+        // core.py's `runfilter_audio_phase2` takes decides the transform:
+        //
+        //  * `len(a2_in_real) < blocklen`: `a2_in = np.zeros_like(
+        //    audio2_filter)` is a **complex128** buffer, so the transform is a
+        //    full complex c2c in double. NTSC's fields (~20 850 stage-1
+        //    samples) take this branch, and it is what the port has always
+        //    done, only via `fft_real_full` (r2c + reflection), which differs
+        //    from a complex c2c at the last bit -- invisible here because the
+        //    result is then quantised to f32.
+        //  * `len(a2_in_real) == blocklen`: `a2_in = a2_in_real` is the
+        //    **float32** buffer itself, so the transform is a single-precision
+        //    real FFT (complex64 output). Every PAL field is 34 685 samples, so
+        //    every PAL stage-2 window takes this branch -- and getting it wrong
+        //    is what made PAL's `.pcm` differ by 1 LSB on ~0.5% of samples.
         let n = raw.len().min(blocklen);
-        for (dst, &s) in a2_in[..n].iter_mut().zip(&raw[..n]) {
-            *dst = f64::from(s);
-        }
-        let mut a2_fft = crate::ffi_ducc::fft_real_full(&a2_in);
+        let mut a2_fft: Vec<Complex64> = if n < blocklen {
+            let mut a2_in = vec![Complex64::new(0.0, 0.0); blocklen];
+            for (dst, &s) in a2_in[..n].iter_mut().zip(&raw[..n]) {
+                *dst = Complex64::new(f64::from(s), 0.0);
+            }
+            crate::ffi_ducc::fft(&a2_in)
+        } else {
+            // f32 r2c, then numpy's `np.concatenate([h, conj(h[-2:0:-1])])`
+            // reflection (exact in f32: the imaginary parts only change sign),
+            // and only then widen to f64 for the filter multiply.
+            let half = crate::ffi_ducc::rfft_f32(&raw[..n]);
+            let mut full = vec![Complex64::new(0.0, 0.0); n];
+            for (dst, &h) in full.iter_mut().zip(&half) {
+                *dst = Complex64::new(f64::from(h.re), f64::from(h.im));
+            }
+            for k in 1..half.len() - 1 {
+                let h = half[k];
+                full[n - k] = Complex64::new(f64::from(h.re), -f64::from(h.im));
+            }
+            full
+        };
         for (v, &f) in a2_fft.iter_mut().zip(&spec.filters.audio[ch].audio2_filter) {
             *v *= f;
         }
@@ -125,7 +154,12 @@ fn runfilter_audio_phase2(
 /// Returns f64: Python's fast path (one block covering the whole field)
 /// returns the raw f64 phase-2 result, and the slow path's f32 array stores
 /// are rounded f64 -> f32 then widened back (same stored values).
-pub(crate) fn audio_phase2(spec: &DecoderSpec, field_audio: &[Vec<f32>; 2]) -> [Vec<f64>; 2] {
+///
+/// The `bool` is whether the result came through the slow path, i.e. is
+/// f32-quantised (Python's `output_audio2` has the dtype of the stage-1 audio
+/// there). `downscale_audio` needs it: `nb_mean` sums in the array's dtype, so
+/// an f32 array gives an f32 mean.
+pub(crate) fn audio_phase2(spec: &DecoderSpec, field_audio: &[Vec<f32>; 2]) -> ([Vec<f64>; 2], bool) {
     let blocklen = spec.blocklen;
     let len = field_audio[0].len();
 
@@ -137,7 +171,7 @@ pub(crate) fn audio_phase2(spec: &DecoderSpec, field_audio: &[Vec<f32>; 2]) -> [
         for ch in 0..2 {
             out[ch] = tmp[ch][..len].to_vec();
         }
-        return out;
+        return (out, false);
     }
     // Slow path: Python's `output_audio2` is an f32 array (dtype of the
     // stage-1 audio), so every store rounds f64 -> f32 (round-half-even).
@@ -183,7 +217,7 @@ pub(crate) fn audio_phase2(spec: &DecoderSpec, field_audio: &[Vec<f32>; 2]) -> [
     for ch in 0..2 {
         out[ch] = output_audio2[ch].iter().map(|&v| f64::from(v)).collect();
     }
-    out
+    (out, true)
 }
 
 /// Port of `_downscale_audio_compute_locs_and_swow`.
@@ -258,6 +292,7 @@ fn downscale_audio_to_output(
     audio_right: &[f64],
     audio_lfreq: f64,
     audio_rfreq: f64,
+    source_f32: bool,
 ) -> (Vec<i16>, bool) {
     let mut output = vec![0i16; 2 * locs.len().saturating_sub(1)];
     let mut failed = false;
@@ -266,10 +301,24 @@ fn downscale_audio_to_output(
         let start = locs[i] as usize;
         let end = locs[i + 1] as usize;
         if end > start && end < audio_left.len() {
-            // numba's `np.mean` on float64: sequential f64 sum divided by the
-            // f64 count.
+            // numba's `np.mean` sums **in the array's dtype** and divides in
+            // that dtype too: a serial f32 accumulation for the f32 array
+            // `audio_phase2`'s slow path produces, a serial f64 one otherwise.
+            // Measured against `nb_mean` over 200 random slices of real audio:
+            // f32-sum/f32-divide matches 200/200, f32-sum/f64-divide 23/200.
+            // Using an f64 mean for the f32 case is not equivalent -- it moves
+            // the pre-rounding value by ~1e-7 relative, which flips the final
+            // i16 by one LSB on ~0.5% of samples.
             let mean = |s: usize, e: usize, data: &[f64]| -> f64 {
-                data[s..e].iter().sum::<f64>() / (e - s) as f64
+                if source_f32 {
+                    let mut acc = 0.0f32;
+                    for &v in &data[s..e] {
+                        acc += v as f32;
+                    }
+                    f64::from(acc / (e - s) as f32)
+                } else {
+                    data[s..e].iter().sum::<f64>() / (e - s) as f64
+                }
             };
             let output_left = mean(start, end, audio_left) * swow[i] - audio_lfreq;
             let output_right = mean(start, end, audio_right) * swow[i] - audio_rfreq;
@@ -293,6 +342,7 @@ pub(crate) fn downscale_audio(
     timeoffset: f64,
     freq: f64,
     startloc: u64,
+    source_f32: bool,
 ) -> (Vec<i16>, f64) {
     let (locs, swow, arange, frametime) = downscale_audio_compute_locs_and_swow(
         lineinfo,
@@ -325,6 +375,7 @@ pub(crate) fn downscale_audio(
         &audio[1],
         spec.audio_lfreq,
         spec.audio_rfreq,
+        source_f32,
     );
     if failed {
         tracing::warn!("Analog audio processing error, muting samples");

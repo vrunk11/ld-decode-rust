@@ -564,6 +564,13 @@ pub struct Decoder {
     fieldinfo: Vec<FieldInfoEntry>,
     /// The last valid field, used as the previous field of the next decode.
     prevfield: Option<PrevField>,
+    /// `fieldstack[0]`: the last field that finished decoding (cleared by
+    /// nothing). The redo path of `readfield` passes this one as the previous
+    /// field, so an AGC/MTF rewind re-decodes against the last *committed*
+    /// field even when the fields in between were junk; `prevfield` cannot do
+    /// that job because an invalid field has to clear it (see its clearing
+    /// site). PAL's `determine_field_number` and `getLine0` both read it.
+    fieldstack_prev: Option<PrevField>,
     /// Line codes of the last decoded *first* field, for VBI frame decoding.
     firstfield_linecode: Option<Vec<Option<i64>>>,
     lastvalidfield: [Option<WriteableField>; 2],
@@ -721,6 +728,7 @@ impl Decoder {
             fields_written: 0,
             fieldinfo: Vec::new(),
             prevfield: None,
+            fieldstack_prev: None,
             firstfield_linecode: None,
             lastvalidfield: [None, None],
             last_written: None,
@@ -897,7 +905,7 @@ impl Decoder {
                 *self.mtf_hist.front().unwrap_or(&self.mtf_level)
             };
             let (start, prevfield) = if let Some(redo_loc) = redo {
-                (redo_loc, self.prevfield.clone())
+                (redo_loc, self.fieldstack_prev.clone())
             } else {
                 (self.fdoffset_abs(), self.prevfield.clone())
             };
@@ -1168,6 +1176,7 @@ impl Decoder {
             // and returns without running buildmetadata, so the next field
             // sees the post-getLine0 confidence (no syncconf min yet).
             self.prevfield = Some(field.to_prevfield());
+            self.fieldstack_prev = self.prevfield.clone();
             return Ok((self.fdoffset, output));
         }
 
@@ -1177,6 +1186,7 @@ impl Decoder {
         // reads sync_confidence AFTER compute_syncconf has min'd it with the
         // line-spacing score. Snapshot here, post-buildmetadata, to match.
         self.prevfield = Some(field.to_prevfield());
+        self.fieldstack_prev = self.prevfield.clone();
         t_meta += t_m0.elapsed().as_nanos() as u64;
         let idx = usize::from(field.is_first_field());
         let luma = picture.unwrap_or_else(|| LumaOutput::Encoded(Arc::new(Vec::new())));
@@ -1445,6 +1455,7 @@ impl Decoder {
             rfhpf: Vec::new(),
             audio: [Vec::new(), Vec::new()],
             audio_pend: None,
+            audio_f32: false,
             efm: Vec::new(),
             startloc: block_begin as u64,
         };
@@ -1794,6 +1805,7 @@ impl Decoder {
                 rfhpf: Vec::with_capacity(numblocks_read * per_block),
                 audio: [Vec::new(), Vec::new()],
                 audio_pend: None,
+                audio_f32: false,
                 efm: Vec::new(),
                 startloc: block_begin as u64,
             };
@@ -1956,7 +1968,7 @@ impl Decoder {
             let ph2_audio0 = raw.video.audio[0].clone();
             let ph2_audio1 = raw.video.audio[1].clone();
             let ph2_spec = Arc::clone(&self.spec);
-            let ph2_cell: Arc<std::sync::OnceLock<Result<[Vec<f64>; 2], ()>>> =
+            let ph2_cell: Arc<std::sync::OnceLock<Result<([Vec<f64>; 2], bool), ()>>> =
                 Arc::new(std::sync::OnceLock::new());
             let ph2_cell2 = Arc::clone(&ph2_cell);
             rayon::spawn(move || {

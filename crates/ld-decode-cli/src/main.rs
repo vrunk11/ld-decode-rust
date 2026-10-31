@@ -82,8 +82,9 @@ struct Args {
     /// 0 IRE level instead of NTSC's 7.5 IRE setup.
     #[arg(long = "NTSCJ", short = 'j', visible_aliases = ["ntscj", "ntsc-j"])]
     ntscj: bool,
-    /// Source is PAL (not covered by the byte-parity target: follows the
-    /// newer ld-decode's PAL processing).
+    /// Source is PAL (625/25): pilot-based lineloc refinement, 312/313-line
+    /// fields, burst-phase field numbering and the PAL filter bank, byte-exact
+    /// against the Python reference.
     #[arg(long = "PAL", short = 'p', visible_aliases = ["pal"])]
     pal: bool,
     /// De-emphasis strength multiplier
