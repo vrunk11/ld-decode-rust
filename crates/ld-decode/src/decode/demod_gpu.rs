@@ -3,12 +3,37 @@
 //! kernels are built with `REAL` = `float` or `double`).
 //!
 //! Same signal path and the same filters as the CPU kernel (see the header of
-//! `demodblock.rs`); the FFTs are a radix-8 Stockham transform with twiddles
-//! tabulated in double precision. Its FFTs are not the reference's, so it is
-//! not bit-identical by construction; in double precision the differences
-//! stay far below the f32/16-bit roundings of the outputs (a whole test
-//! capture decoded byte-identical to the CPU). `LD_GPU_CHECK` compares the
-//! two kernels block by block.
+//! `demodblock.rs`), but **not** the reference's arithmetic: the FFTs are a
+//! radix-8 Stockham transform with twiddles tabulated in double precision, the
+//! discriminator calls the device's `atan2` (the CPU calls the UCRT port), and
+//! the `f - c` / `+ c*H(0)` shift below rounds differently from the reference's
+//! single transform. So it is not bit-identical by construction, and on a full
+//! disc it is not byte-identical either: 50 722 fields of `Pioneer_GGV1069` at
+//! double precision differ from the CPU -- and so from Python 7.4.0 -- in **1
+//! byte of the 24.3 GB `.tbc`** (1 LSB, one pixel at field 4326 y=103 x=254),
+//! with `.pcm`, `.efm`, `.tbc.json` and every table of the `.tbc.db`
+//! (field records, dropouts, VITS) identical.
+//!
+//! The mechanism is rounding at the f32 cast, not a signal-path difference. In
+//! 13 000 fields the two kernels disagree on 20 `demod`, 31 `demod_raw`, 19
+//! `demod_05` and 680 `demod_burst` samples -- every one of them **1 ulp** of
+//! f32 (`LD_GPU_CHECK`, 2026-10-31) -- because the f64 values differ in their
+//! own last bits (FFT pass order, device `atan2`). The 16-tap sinc downscale
+//! then turns roughly 1 in 80 of those into a different u16, which is the 1
+//! pixel above. Do not "fix" this by widening anything:
+//! matching ducc's rounding decisions needs ducc's values, not more precision.
+//! Byte-exactness needs the device to run ducc's plan, which this repository
+//! had: `decode/ducc_plan.rs` (a bit-exact replica of ducc's 1-D plan) plus
+//! `gpu_bitexact_probe` measured **0 differing bits** on the device at
+//! n = 32768, and the previous `--gpu` (head on the CPU, late group on the
+//! device running that plan) was byte-identical at full-disc length. Commit
+//! `9d0e2e9` traded that away for this whole-demodulator path (and the ~+47%
+//! it buys); restoring it for the video channels also needs a device port of
+//! `optimized::ucrt_atan2` and of `np_cmul`'s FMA products, and would drop the
+//! `f - c` trick in f64.
+//!
+//! `LD_GPU_CHECK` compares the two kernels block by block and prints only the
+//! blocks that are not bit-identical, as `n/ulp` per channel.
 //!
 //! Single precision: the FM discriminator's output is a frequency near 8 MHz that
 //! moves ~7 kHz per IRE. Carried as is in single precision, that constant

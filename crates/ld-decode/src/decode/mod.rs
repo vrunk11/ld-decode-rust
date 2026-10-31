@@ -2584,9 +2584,41 @@ fn write_par_concat<T: Copy + Send + Sync>(dst: &mut Vec<T>, parts: &[&[T]]) {
         .for_each(|(d, p)| d.copy_from_slice(p));
 }
 
+/// Values whose f32 bit patterns differ, and the largest ULP distance between
+/// the two sequences (NaN payloads are not compared as numbers; the decoder's
+/// channels never carry one).
+fn ulp_span(a: &[f32], b: &[f32]) -> (usize, u32) {
+    fn ordered(bits: u32) -> i64 {
+        if bits >> 31 == 0 {
+            i64::from(bits)
+        } else {
+            -i64::from(bits & 0x7fff_ffff)
+        }
+    }
+    let mut n = 0usize;
+    let mut worst = 0u32;
+    for (x, y) in a.iter().zip(b) {
+        if x.to_bits() != y.to_bits() {
+            n += 1;
+            worst = worst.max((ordered(x.to_bits()) - ordered(y.to_bits())).unsigned_abs().min(u32::MAX as u64) as u32);
+        }
+    }
+    (n, worst)
+}
+
+/// `n/ulp` as the `LD_GPU_CHECK` line prints it.
+fn fmt_span((n, ulp): (usize, u32)) -> String {
+    if n == 0 {
+        "0".to_string()
+    } else {
+        format!("{n}/{ulp}ulp")
+    }
+}
+
 /// Demodulate `blocks` on the GPU. A GPU failure falls back to the CPU kernel
 /// (once reported); `LD_GPU_CHECK` also runs the CPU kernel and logs how far
-/// apart the two are.
+/// apart the two are -- per block, and only when they are not bit-identical
+/// (`n/ulp`: how many samples moved and by how many f32 units).
 fn gpu_demod_blocks(
     gpu: &demod_gpu::GpuDemod,
     blocks: &[(u64, &[f32])],
@@ -2611,26 +2643,40 @@ fn gpu_demod_blocks(
     };
     if std::env::var_os("LD_GPU_CHECK").is_some() {
         let reference = cpu();
-        let worst = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let rms = |a: &[f32], b: &[f32]| {
-            (a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum::<f64>() / a.len().max(1) as f64).sqrt()
-        };
-        for (g, c) in out.iter().zip(&reference) {
-            let e = g.video.efm.iter().zip(&c.video.efm).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap_or(0);
-            crate::teeprintln!(
-                "GPUCHECK len {}/{} demod max {:.2} rms {:.3} Hz | 05 max {:.2} | burst max {:.2} | raw max {:.2} | rfhpf max {:.3} rms {:.4} | efm max {} | audio max {:.2}",
-                g.video.demod.len(),
-                c.video.demod.len(),
-                worst(&g.video.demod, &c.video.demod),
-                rms(&g.video.demod, &c.video.demod),
-                worst(&g.video.demod_05, &c.video.demod_05),
-                worst(&g.video.demod_burst, &c.video.demod_burst),
-                worst(&g.video.demod_raw, &c.video.demod_raw),
-                worst(&g.rfhpf, &c.rfhpf),
-                rms(&g.rfhpf, &c.rfhpf),
-                e,
-                worst(&g.video.audio[0], &c.video.audio[0]),
-            );
+        for (i, (g, c)) in out.iter().zip(&reference).enumerate() {
+            let d = ulp_span(&g.video.demod, &c.video.demod);
+            let d05 = ulp_span(&g.video.demod_05, &c.video.demod_05);
+            let dburst = ulp_span(&g.video.demod_burst, &c.video.demod_burst);
+            let draw = ulp_span(&g.video.demod_raw, &c.video.demod_raw);
+            let drf = ulp_span(&g.rfhpf, &c.rfhpf);
+            let efm = g
+                .video
+                .efm
+                .iter()
+                .zip(&c.video.efm)
+                .map(|(x, y)| (i32::from(*x) - i32::from(*y)).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            let aud = ulp_span(&g.video.audio[0], &c.video.audio[0]);
+            // Only the blocks that are not bit-identical are worth a line: a
+            // silent "0 everywhere" per block buries the one block that moved.
+            // Parenthesised on purpose: in Rust `|` binds tighter than `!=`
+            // (the opposite of C), so without them this would still be right --
+            // but it reads wrong.
+            if (d.0 | d05.0 | dburst.0 | draw.0 | drf.0 | efm as usize | aud.0) != 0 {
+                crate::teeprintln!(
+                    "GPUCHECK block {} len {}: demod {} | 05 {} | burst {} | raw {} | rfhpf {} | efm {} | audio {}",
+                    blocks.get(i).map(|b| b.0).unwrap_or(i as u64),
+                    g.video.demod.len(),
+                    fmt_span(d),
+                    fmt_span(d05),
+                    fmt_span(dburst),
+                    fmt_span(draw),
+                    fmt_span(drf),
+                    efm,
+                    fmt_span(aud),
+                );
+            }
         }
     }
     out

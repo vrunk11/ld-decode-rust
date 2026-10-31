@@ -62,8 +62,11 @@ struct Args {
     #[arg(long)]
     lowband: bool,
     /// Run the FM demodulator on an OpenCL device (the driver's OpenCL
-    /// runtime, loaded at start-up). In double precision (the default) it
-    /// gave the CPU's bytes on whole test captures; see --gpu-precision.
+    /// runtime, loaded at start-up). Not a parity mode: the device FFT and
+    /// `atan2` are not the reference's arithmetic, so the output rounds
+    /// differently at the last bit (measured: 1 byte of a 24.3 GB `.tbc` over
+    /// 50 722 fields, with `.pcm`/`.efm`/`.tbc.json` identical). See
+    /// --gpu-precision and `LD_GPU_CHECK`.
     #[arg(long)]
     gpu: bool,
     /// Precision of the --gpu demodulator: `double` (default) or `single`
@@ -353,7 +356,9 @@ fn main() -> Result<()> {
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
     if args.gpu {
         match decoder.enable_gpu(args.gpu_precision == GpuPrecision::Double) {
-            Ok(what) => tracing::info!("GPU demodulator: {what}"),
+            // Say it where a decode log will show it: this is a speed knob, not
+            // a parity mode (1 byte of a 24.3 GB `.tbc` over 50 722 fields).
+            Ok(what) => tracing::info!("GPU demodulator: {what} (not byte-exact; see --help)"),
             Err(e) => anyhow::bail!("--gpu: {e}"),
         }
     }
