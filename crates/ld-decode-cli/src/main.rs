@@ -62,17 +62,22 @@ struct Args {
     #[arg(long)]
     lowband: bool,
     /// Run the FM demodulator on an OpenCL device (the driver's OpenCL
-    /// runtime, loaded at start-up). Not a parity mode: the device FFT and
-    /// `atan2` are not the reference's arithmetic, so the output rounds
-    /// differently at the last bit (measured: 1 byte of a 24.3 GB `.tbc` over
-    /// 50 722 fields, with `.pcm`/`.efm`/`.tbc.json` identical). See
-    /// --gpu-precision and `LD_GPU_CHECK`.
+    /// runtime, loaded at start-up), with the reference's arithmetic: ducc's
+    /// FFT plan and a port of the UCRT `atan2` run on the device, so the output
+    /// is byte-identical to the CPU kernel -- and therefore to Python 7.4.0.
     #[arg(long)]
     gpu: bool,
-    /// Precision of the --gpu demodulator: `double` (default) or `single`
-    /// (faster on consumer GPUs, not byte-identical).
-    #[arg(long, value_enum, default_value = "double")]
-    gpu_precision: GpuPrecision,
+    /// Run the *fast* GPU demodulator instead: a Stockham FFT and the device's
+    /// `atan2`. About 5% quicker than --gpu on a full disc (1390 -> 1320 s for
+    /// 168 566 fields) and not byte-identical (measured: 1 LSB on one pixel per
+    /// ~25 GB of `.tbc`, with `.pcm`/`.efm`/`.tbc.json` identical). See
+    /// --gpu-precision and `LD_GPU_CHECK`.
+    #[arg(long)]
+    gpu_fast: bool,
+    /// Precision of --gpu-fast: `double` (default) or `single` (faster on
+    /// consumer GPUs, further from the reference). --gpu is always double.
+    #[arg(long, value_enum)]
+    gpu_precision: Option<GpuPrecision>,
     /// Source is in NTSC-J format (IRE 0 black): `black16bIre` stays at the
     /// 0 IRE level instead of NTSC's 7.5 IRE setup.
     #[arg(long = "NTSCJ", short = 'j', visible_aliases = ["ntscj", "ntsc-j"])]
@@ -354,11 +359,16 @@ fn main() -> Result<()> {
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
-    if args.gpu {
-        match decoder.enable_gpu(args.gpu_precision == GpuPrecision::Double) {
-            // Say it where a decode log will show it: this is a speed knob, not
-            // a parity mode (1 byte of a 24.3 GB `.tbc` over 50 722 fields).
-            Ok(what) => tracing::info!("GPU demodulator: {what} (not byte-exact; see --help)"),
+    if args.gpu && args.gpu_fast {
+        anyhow::bail!("--gpu and --gpu-fast are different demodulators; pick one");
+    }
+    if args.gpu && args.gpu_precision.is_some() {
+        anyhow::bail!("--gpu-precision applies to --gpu-fast only (--gpu is always double)");
+    }
+    if args.gpu || args.gpu_fast {
+        let f64 = args.gpu_precision != Some(GpuPrecision::Single);
+        match decoder.enable_gpu(args.gpu, f64) {
+            Ok(what) => tracing::info!("GPU demodulator: {what}"),
             Err(e) => anyhow::bail!("--gpu: {e}"),
         }
     }

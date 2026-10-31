@@ -12,9 +12,14 @@
 
 mod audio;
 mod demodblock;
-// `--gpu`: the whole FM demodulator on an OpenCL device (`demod_gpu`). The
-// OpenCL runtime is loaded at run time, so the code is always compiled in.
+// `--gpu`: the whole FM demodulator on an OpenCL device (`demod_gpu`, the
+// reference's arithmetic via `ducc_gpu`/`ducc_plan`) or, with `--gpu-fast`, the
+// Stockham/`atan2` path that is quicker but rounds differently. The OpenCL
+// runtime is loaded at run time, so the code is always compiled in.
 mod demod_gpu;
+mod demod_gpu_exact;
+mod ducc_gpu;
+mod ducc_plan;
 #[cfg(test)]
 mod probe_test;
 mod dropouts;
@@ -527,7 +532,7 @@ struct DbgMeta {
 /// the whole demodulator on the device (`demod_gpu`). A device failure falls
 /// back to the CPU kernel.
 fn demod_batch(
-    gpu: Option<&Arc<demod_gpu::GpuDemod>>,
+    gpu: Option<&Arc<demod_gpu::Backend>>,
     blocks: &[(u64, &[f32])],
     mtf: f64,
     dspec: &DemodSpecRef,
@@ -618,9 +623,10 @@ pub struct Decoder {
     /// pool free for the tail's own data-parallel sections (the sinc gather),
     /// which otherwise lose half their threads to the side work.
     side_pool: Arc<rayon::ThreadPool>,
-    /// `--gpu`: the FM demodulator on an OpenCL device. `None` is the CPU
-    /// kernel (and the fallback if the device fails mid-decode).
-    gpu: Option<Arc<demod_gpu::GpuDemod>>,
+    /// `--gpu` (the reference's arithmetic) or `--gpu-fast` (Stockham): the FM
+    /// demodulator on an OpenCL device. `None` is the CPU kernel (and the
+    /// fallback if the device fails mid-decode).
+    gpu: Option<Arc<demod_gpu::Backend>>,
     /// Memo of `MTF ** mtf_level` per mtf value (keyed by f64 bits). mtf is a
     /// slowly-varying scalar — constant for thousands of fields in steady
     /// state — and the pow spectrum is a pure function of (mtf filter, mtf),
@@ -648,17 +654,33 @@ pub struct Decoder {
 
 
 impl Decoder {
-    /// Turn on the `--gpu` demodulator, in double (`f64`) or single precision.
+    /// Turn on the GPU demodulator: `--gpu` (`exact`, the reference's
+    /// arithmetic) or `--gpu-fast` (Stockham, in double or single precision).
     /// Opening the device is done eagerly so a host without OpenCL fails at
     /// start-up with a reason instead of decoding half a disc on one path and
     /// the rest on the other.
-    pub fn enable_gpu(&mut self, f64: bool) -> Result<String, String> {
+    pub fn enable_gpu(&mut self, exact: bool, f64: bool) -> Result<String, String> {
         let spec = &self.spec;
         let dspec = DemodSpecRef::with_plans(spec.freq, spec.freq_half, spec.freq_hz, spec.blocklen, &spec.filters, &self.levels);
-        let dev = demod_gpu::GpuDemod::new(&dspec, f64).map_err(|e| format!("{e:#}"))?;
+        let dev = if exact {
+            demod_gpu::Backend::Exact(
+                demod_gpu_exact::GpuDemodExact::new(&dspec).map_err(|e| format!("{e:#}"))?,
+            )
+        } else {
+            demod_gpu::Backend::Fast(
+                demod_gpu::GpuDemod::new(&dspec, f64).map_err(|e| format!("{e:#}"))?,
+            )
+        };
         let name = crate::opencl::Gpu::get().map(|g| g.name.clone()).unwrap_or_default();
         self.gpu = Some(Arc::new(dev));
-        Ok(format!("{name} ({} precision)", if f64 { "double" } else { "single" }))
+        Ok(if exact {
+            format!("{name} (reference arithmetic)")
+        } else {
+            format!(
+                "{name} ({} precision, Stockham FFT: not byte-exact)",
+                if f64 { "double" } else { "single" }
+            )
+        })
     }
 
     pub fn new(spec: Arc<DecoderSpec>, fdoffset: u64) -> Self {
@@ -2620,7 +2642,7 @@ fn fmt_span((n, ulp): (usize, u32)) -> String {
 /// apart the two are -- per block, and only when they are not bit-identical
 /// (`n/ulp`: how many samples moved and by how many f32 units).
 fn gpu_demod_blocks(
-    gpu: &demod_gpu::GpuDemod,
+    gpu: &demod_gpu::Backend,
     blocks: &[(u64, &[f32])],
     mtf: f64,
     pow: Option<&[Complex64]>,
@@ -2630,8 +2652,7 @@ fn gpu_demod_blocks(
     let cpu = || -> Vec<BlockDecode> {
         blocks.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect()
     };
-    let data: Vec<&[f32]> = blocks.iter().map(|b| b.1).collect();
-    let out = match gpu.demod(&data, mtf, pow, rotdelay, dspec) {
+    let out = match gpu.demod(blocks, mtf, pow, rotdelay, dspec) {
         Ok(v) => v,
         Err(e) => {
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

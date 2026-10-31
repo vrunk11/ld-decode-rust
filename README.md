@@ -1,36 +1,35 @@
 # ld-decode-rust
 
 A from-scratch Rust port of the NTSC LaserDisc RF decoder from
-[ld-decode](https://github.com/happycube/ld-decode) 7.4.0, byte-identical on
-`.tbc`/`.pcm`/`.efm`.
+[ld-decode](https://github.com/happycube/ld-decode) 7.4.0, byte-identical to the
+Python original on `.tbc`, `.pcm` and `.efm`.
 
-The goal is not "a decoder that produces similar pictures". The goal is a
-decoder that produces **byte-identical output files** to the Python original:
-same `.tbc` luma, same `.pcm` audio, same `.efm` digital-audio bits, same
-`.tbc.json` metadata. Any change is measured against that bar, and a change that
-moves a single byte is a bug, not a rounding detail. Speed is the reason the port
-exists; parity is the constraint it is built under.
+The goal is not "a decoder that produces similar pictures" but one that produces
+**byte-identical output files**: the same `.tbc` luma, the same `.pcm` audio, the
+same `.efm` digital-audio bits, the same `.tbc.json` metadata. Every change is
+measured against that bar, and a change that moves a single byte is a bug, not a
+rounding detail. Speed is the reason the port exists; parity is the constraint it
+is built under.
 
 ## What it does today
 
 - **NTSC is the byte-parity target.** PAL (`--PAL`) is ported from ld-decode
   7.4's `FieldPAL` and PAL tables (pilot-based lineloc refinement, 312/313-line
   fields, burst-based field phase, PAL dropout thresholds and VITS metrics) but
-  is **not** verified byte for byte against the Python reference: it is checked
-  by measurement only (line alignment, noise, field phase and VBI against
-  ld-decode's own decode of the same captures). Nothing in it changes an NTSC
+  is **not** verified byte for byte against the Python reference. It is checked
+  by measurement only — line alignment, noise, field phase and VBI against
+  ld-decode's own decode of the same captures. Nothing in it changes an NTSC
   output.
 - **Byte-parity verified end-to-end** on five full-disc paths:
-  - `s16` capture (168,800 fields) — 4/4 outputs identical,
-  - `.ddd.flac` from frame 300 (168,566 fields) — 4/4 outputs identical,
-  - Pioneer GGV1069 `.ldf` (50,722 fields) — 4/4 outputs identical to the
-    Python **7.4.0** release,
-  - Diamond Time CLV `.ldf` (71,710 fields) — 4/4 outputs identical,
-  - GGV1016 CAV `.ldf` (108,576 fields) — 4/4 outputs identical, JSON included.
-- **Roughly 9–20x faster than the Python reference.** About 46 FPS for raw
-  `s16` (`-t 8`) and ~45 FPS for `.ldf` (`-t 10`/`11`) on a Ryzen 7 5800X3D
-  (10,000-field window), against ~2–5 FPS for Python 3.12 + numpy + scipy on the
-  same box; the full GGV1069 `.ldf` takes 575 s (44.1 FPS). FPS is only
+  - `s16` capture (168,800 fields) — 4/4 outputs identical.
+  - `.ddd.flac` from frame 300 (168,566 fields) — 4/4 outputs identical.
+  - Pioneer GGV1069 `.ldf` (50,722 fields) — 4/4 outputs identical.
+  - Diamond Time CLV `.ldf` (71,710 fields) — 4/4 outputs identical.
+  - GGV1016 CAV `.ldf` (108,576 fields) — 4/4 outputs identical.
+- **Roughly 9–20x faster than the Python reference.** About 46 FPS for raw `s16`
+  (`-t 8`) and ~45 FPS for `.ldf` (`-t 10`/`11`) on a Ryzen 7 5800X3D over a
+  10,000-field window, against ~2–5 FPS for Python 3.12 + numpy + scipy on the
+  same box. The full GGV1069 `.ldf` takes 575 s (44.1 FPS). FPS is only
   meaningful with the machine otherwise idle and the output disk not full.
 - Produces `.tbc`, `.tbc.json`, `.pcm`, `.efm` and `.tbc.db`, plus a `.log` that
   mirrors the console output.
@@ -102,14 +101,38 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--no-dod` | off | Disable dropout detection. |
 | `--ntsc-color-notch` | off | Notch filter on the decoded video, reduces colour wobble. |
 | `--lowband` | off | Lower-bandwidth (lowband) decode settings. |
-| `--gpu` | off | Run the whole FM demodulator on an OpenCL device (the driver's OpenCL runtime, loaded at start-up; nothing to install or link). Double precision (the default) is **not** byte-identical, and not by construction: its FFT is a radix-8 Stockham rather than ducc's pass tree and its discriminator calls the device's `atan2` rather than the UCRT port, so the f64 values differ in their last bits. On a 50 722-field NTSC disc (24.3 GB `.tbc`) that is **1 byte** — one pixel, 1 LSB, at field 4326 — with `.pcm`, `.efm`, `.tbc.json` and every `.tbc.db` table identical; the two kernels disagree on ~1 sample per 10⁸–10⁹ by exactly 1 ulp of f32 (20 `demod`, 31 `demod_raw`, 19 `demod_05`, 680 `demod_burst` in 13 000 fields), and the 16-tap downscale absorbs all but ~1 in 80 of those. `LD_GPU_CHECK=1` runs the CPU kernel alongside and logs only the blocks that are not bit-identical, as `n/ulp` per channel. Byte-exactness would need ducc's plan on the device (this repo measured 0 differing bits for that at n = 32768 before the whole-demodulator rewrite) plus an `atan2` port. A device failure falls back to the CPU for that batch. Measured on an RTX 5080 Laptop GPU (MSVC build, 645-field 75 MHz capture): 11.0 s on the CPU, 7.5 s with `--gpu`. |
-| `--gpu-precision` | `double` | `single` runs the `--gpu` demodulator in f32: faster on consumer cards with little f64 throughput, not byte-identical. |
+| `--gpu` | off | Run the whole FM demodulator on an OpenCL device, bit-identical to the CPU kernel. See [GPU demodulation](#gpu-demodulation). |
+| `--gpu-fast` | off | The quicker, differently-rounded GPU demodulator; not bit-exact. See below. |
+| `--gpu-precision <p>` | `double` | `single` runs the `--gpu-fast` demodulator in f32: faster on consumer cards with little f64 throughput, further from the reference. `--gpu` is always double. |
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
 
 Short flags are the reference's exactly: `-t` is threads and `-j` is NTSC-J
 (`-j` was `--threads` in this port before 2026-10-17, so older command lines
 need `-t`).
+
+### GPU demodulation
+
+`--gpu` runs the whole FM demodulator on an OpenCL device (the driver's OpenCL
+runtime, loaded at start-up; nothing to install or link), with the reference's
+arithmetic: every transform runs ducc's own 1-D plan (`decode/ducc_plan.rs`,
+encoded as OpenCL), and the discriminator runs a device port of the UCRT `atan2`.
+The output is therefore byte-identical to the CPU kernel and to Python 7.4.0 —
+verified on the full 168,566-field sideA disc, all three bit-compared outputs. A
+block whose `atan2` operand falls outside the port's covered class is recomputed
+by the CPU kernel, so a declined operand cannot change a byte.
+`LD_GPU_CHECK=1` runs the CPU kernel alongside and logs only the blocks that are
+not bit-identical, as `n/ulp` per channel. A device failure falls back to the CPU
+for that batch.
+
+`--gpu-fast` is the quicker, differently-rounded path: a radix-8 Stockham FFT
+instead of ducc's pass tree, and the device's `atan2` instead of the UCRT port,
+so the f64 values differ in their last bits. On a 50,722-field NTSC disc
+(24.3 GB `.tbc`) that comes to **1 byte** — one pixel, 1 LSB, at field 4326 —
+with `.pcm`, `.efm`, `.tbc.json` and every `.tbc.db` table identical. The two
+kernels disagree on ~1 sample per 10⁸–10⁹ by exactly 1 ulp of f32 (20 `demod`,
+31 `demod_raw`, 19 `demod_05`, 680 `demod_burst` in 13,000 fields), and the
+16-tap downscale absorbs all but ~1 in 80 of those.
 
 ## Input formats
 
