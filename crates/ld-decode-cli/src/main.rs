@@ -59,6 +59,14 @@ struct Args {
     /// corrected capture with one. Needs `--tbc read` (the default with it).
     #[arg(long, value_name = "FILE")]
     rf_out: Option<String>,
+    /// How the stack weighs its inputs. `adaptive` (default): each input at
+    /// each sample by its carrier amplitude, so an input in a dropout gives
+    /// way to the others, with a guard against a misaligned input. `fixed`:
+    /// one weight per input for the whole run, from its noise floor measured
+    /// once at the start; captures from one player measure within a few
+    /// percent, so this is close to a plain average (the earlier stack).
+    #[arg(long, value_enum, default_value = "adaptive")]
+    stack_weight: StackWeight,
     /// Where the FM demodulation and the read-time TBC / stack run: `cpu`
     /// (bit-exact to the reference), or `opencl` (a GPU through its driver's
     /// OpenCL runtime; see --gpu-precision).
@@ -142,6 +150,12 @@ struct Args {
 enum TbcMode {
     Read,
     Resample,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum StackWeight {
+    Adaptive,
+    Fixed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -347,7 +361,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.rf_out.as_deref())?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, args.rf_out.as_deref())?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -535,6 +549,7 @@ fn read_tbc_source(
     pal: bool,
     device: Device,
     preset: Preset,
+    stack_weight: StackWeight,
     rf_out: Option<&str>,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
@@ -562,7 +577,7 @@ fn read_tbc_source(
         })?;
     }
     let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
-    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, rf_out)
+    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, rf_out)
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF

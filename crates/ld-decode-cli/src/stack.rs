@@ -67,6 +67,111 @@ const NOISE_BAND_HZ: (f64, f64) = (16.0e6, 19.5e6);
 /// A paired line whose length differs from the primary's by more than this
 /// ratio is treated as a skip in that input (not covered).
 const MAX_LINE_RATIO_DEV: f64 = 0.02;
+/// Amplitude weight floor, as a fraction of the input's video-band noise RMS:
+/// where every input has lost its carrier the sum still has weights.
+const AMP_FLOOR: f64 = 0.05;
+/// Weight of the zero-phase prior of the phase lock, against the window's
+/// `samples * snr` (an ordinary lock is ~10^3 or more): pass 0 aligns the
+/// carriers within a few hundredths of a radian, so where the measured
+/// rotation is noise (a dropout in either input) the lock holds still.
+pub(crate) const LOCK_PRIOR: f64 = 10.0;
+/// Alignment guard: the coherence with the primary over the lock window, as
+/// a fraction of what the two inputs' carrier fractions allow, below which an
+/// input is left out (fading in over `KAPPA_SPAN`). It applies once that
+/// expected coherence squared exceeds `Q_LO` (fully from `Q_LO + Q_SPAN`):
+/// unless both carriers are clean over the whole window (a dropout in either
+/// lowers the coherence as a misalignment would) the coherence says nothing
+/// about alignment.
+pub(crate) const KAPPA_LO: f64 = 0.5;
+pub(crate) const KAPPA_SPAN: f64 = 0.3;
+pub(crate) const Q_LO: f64 = 0.7;
+pub(crate) const Q_SPAN: f64 = 0.15;
+/// The lock follows its measured rotation above this expected coherence
+/// squared, and holds still (`LOCK_PRIOR`) below.
+pub(crate) const Q_ROT: f64 = 0.5;
+/// The guard applies only where the primary keeps at the sample (carrier
+/// window) at least this fraction of its carrier over the lock window, fully
+/// from `H_LO + H_SPAN`.
+pub(crate) const H_LO: f64 = 0.5;
+pub(crate) const H_SPAN: f64 = 0.3;
+/// Window of the carrier measure behind the weights, centred on the sample:
+/// short, so an input weighs little as soon as the sample itself is in a
+/// dropout (over the lock window, a part of healthy carrier would dominate).
+pub(crate) const CARRIER_WIN: usize = 64;
+/// Ceiling of a carrier fraction (the lock's `snr` stays finite).
+pub(crate) const Q_MAX: f64 = 0.999;
+/// What the carrier measure reads on noise alone, over the lock window and
+/// over the carrier window (about its 99th and 90th percentiles on the video
+/// band's noise; a carrier reads ~0.99): taken out, so a dropout reads no
+/// carrier.
+pub(crate) const QN_LOCK: f64 = 0.4;
+pub(crate) const QN_CARRIER: f64 = 0.5;
+
+/// Band width the carrier lag is set from: the video band's noise decorrelates
+/// after about `fs / CARRIER_BW` samples.
+const CARRIER_BW: f64 = 15.0e6;
+
+/// The carrier lag at a sample rate (see [`carrier`]).
+pub(crate) fn carrier_lag(fs: f64) -> usize {
+    ((fs / CARRIER_BW).round() as usize).max(1)
+}
+
+/// Carrier power and carrier fraction of an input's video band over the lock
+/// window, from `rl = sum(z[t] conj(z[t - lag]))`, the energy `e` of those
+/// `z[t]` and their count `n`. Over the lag the FM carrier keeps its
+/// coherence (its phase advance barely changes within the window) while the
+/// band's noise has lost it, so `|rl|` measures the carrier alone, blind to
+/// the noise level: a dropout's noise, however loud, does not pass for
+/// carrier. What noise alone reads over the window (`qn` of the energy) is
+/// taken out of both. The OpenCL kernel's arithmetic, in its order.
+#[inline]
+pub(crate) fn carrier(rl: Complex64, e: f64, n: f64, qn: f64) -> (f64, f64) {
+    let a = (rl.re * rl.re + rl.im * rl.im).sqrt();
+    let s = (a - qn * e).max(0.0) / ((1.0 - qn) * n);
+    (s, if e > 0.0 { ((a / e - qn).max(0.0) / (1.0 - qn)).min(Q_MAX) } else { 0.0 })
+}
+
+/// An input's weight at one sample from its carrier power `s`: the carrier
+/// amplitude (floored at `afl`) times `1/sigma^2`, the maximal ratio
+/// combining weight. The OpenCL kernel's arithmetic, in its order.
+#[inline]
+pub(crate) fn amp_weight(s: f64, afl: f64, w: f64) -> f64 {
+    s.sqrt().max(afl) * w
+}
+
+/// Phase lock of an input onto the primary over the lock window, from the
+/// correlation `r`, both energies over the `nj` samples they share and both
+/// carrier fractions: the rotation, pulled toward zero as the carriers
+/// weaken, and the alignment guard's factor on the weight. The OpenCL
+/// kernel's arithmetic, in its order.
+#[inline]
+pub(crate) fn lock(r: Complex64, ea: f64, eb: f64, nj: f64, q0: f64, qi: f64, h0: f64) -> (Complex64, f64) {
+    // Squared coherence the two carrier fractions allow.
+    let q = q0 * qi;
+    let a = (r.re * r.re + r.im * r.im).sqrt();
+    let mut g = 1.0;
+    if q > Q_LO {
+        let kappa = a / (ea * eb).sqrt() / q.sqrt();
+        let gk = ((kappa - KAPPA_LO) / KAPPA_SPAN).clamp(0.0, 1.0);
+        // Only with the primary's carrier at the sample itself (`h0`): at
+        // the edge of a dropout of the primary the window still reads its
+        // carrier, but the coherence falls, and the input left out would be
+        // the healthy one.
+        let hp = ((h0 - H_LO) / H_SPAN).clamp(0.0, 1.0);
+        g = 1.0 - (1.0 - gk) * ((q - Q_LO) / Q_SPAN).min(1.0) * hp;
+    }
+    if a <= 0.0 {
+        return (Complex64::new(1.0, 0.0), g);
+    }
+    // The measured rotation counts only where both carriers are clearly
+    // healthy (`Q_ROT`): a window part noise gives a rotation part noise.
+    let qr = ((q - Q_ROT) / (1.0 - Q_ROT)).max(0.0);
+    let wm = nj * qr / (1.0 - qr);
+    let vx = r.re / a * wm + LOCK_PRIOR;
+    let vy = r.im / a * wm;
+    let b = (vx * vx + vy * vy).sqrt();
+    (Complex64::new(vx / b, vy / b), g)
+}
 
 /// Per-field record kept from pass 0.
 #[derive(Clone)]
@@ -647,6 +752,10 @@ pub(crate) struct Inner {
     inputs: Vec<StackInput>,
     live: Arc<Live>,
     pub(crate) weight: Vec<f64>,
+    /// Per input: the amplitude weight floor (see [`amp_weight`]).
+    pub(crate) afloor: Vec<f64>,
+    /// Lag of the carrier measure (see [`carrier`]).
+    pub(crate) lag: usize,
     /// Video-band filter table (see [`video_band_lut`]).
     pub(crate) hi_lut: Vec<Complex64>,
     /// The CPU path's single-precision copies: sinc, video band re and im.
@@ -655,6 +764,11 @@ pub(crate) struct Inner {
     /// double precision, in one fixed order on the CPU and the GPU, so both
     /// give the same output.
     pub(crate) exact: bool,
+    /// `--stack-weight adaptive`: every input weighted at every sample by its
+    /// carrier amplitude, with the alignment guard (`compute_task`). Off
+    /// (`fixed`): the fixed `1/sigma^2` weights and the plain phase lock
+    /// (`combine_fixed`).
+    pub(crate) carrier: bool,
 }
 
 /// `sum(h[i] * x[i])` over 8 single-precision lanes (as the OpenCL kernel,
@@ -1007,7 +1121,7 @@ pub struct VirtualSource {
 }
 
 impl VirtualSource {
-    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, rf_out: Option<RfOut>) -> Result<Self> {
+    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, carrier: bool, rf_out: Option<RfOut>) -> Result<Self> {
         // 1/sigma^2 from each input's noise floor, measured where pass 0
         // first located it (the stream starts before the rest is known).
         let mut weight = Vec::new();
@@ -1019,6 +1133,10 @@ impl VirtualSource {
         }
         tracing::info!("stack: {} input(s), read-time TBC as pass 0 locates the lines", inputs.len());
         let hi_lut = video_band_lut(fs, if pal { PAL_SPLIT_HZ } else { (SPLIT_LO_HZ, SPLIT_HI_HZ) });
+        // The noise floor is a per-sample variance (white); through the video
+        // band it is scaled by the filter's energy.
+        let gain: f64 = hi_lut[..HI_TAPS].iter().map(|h| h.norm_sqr()).sum();
+        let afloor = weight.iter().map(|w| AMP_FLOOR * (gain / w).sqrt()).collect();
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
         let fir = [
@@ -1026,7 +1144,7 @@ impl VirtualSource {
             hi_lut.iter().map(|c| c.re as f32).collect(),
             hi_lut.iter().map(|c| c.im as f32).collect(),
         ];
-        let inner = Inner { inputs, live: Arc::clone(&live), weight, hi_lut, fir, exact };
+        let inner = Inner { inputs, live: Arc::clone(&live), weight, afloor, lag: carrier_lag(fs), hi_lut, fir, exact, carrier };
         let gpu = if opencl { Some(crate::opencl::StackGpu::new(&inner)?) } else { None };
         let engine = Engine { inner: Arc::new(inner), pool, gpu, rf_out };
         let ahead = Arc::new(Ahead { state: Mutex::new(AheadState::default()), cv: Condvar::new() });
@@ -1110,10 +1228,175 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
             (full, hi, cov)
         })
         .collect();
+    if !inner.carrier {
+        combine_fixed(inner, &reads, m, out);
+        return Ok(());
+    }
 
-    // Phase lock of the video band onto the primary: the correlation with the
-    // primary summed over a LOCK_WIN window (running sums), normalized. The
-    // rest of each input (full minus video band) is summed as read.
+    // Every input weighted at every sample by its carrier amplitude over a
+    // CARRIER_WIN window (`carrier`, `amp_weight`), and its video band
+    // phase-locked onto the primary's over a LOCK_WIN window (`lock`, with the
+    // alignment guard). The rest of each input (full minus video band) is
+    // summed as read.
+    let (half, ch) = (LOCK_WIN / 2, CARRIER_WIN / 2);
+    let win = |j: usize| j.saturating_sub(half)..(j + half).min(len);
+    let short = |j: usize, t: usize| t + ch >= j && t < j + ch;
+    let p2 = |z: Complex64| z.re * z.re + z.im * z.im;
+    // Running sums of a per-sample quantity (the fast path's windows).
+    let prefix = |f: &dyn Fn(usize) -> f64| {
+        let mut s = Vec::with_capacity(len + 1);
+        let mut run = 0.0;
+        s.push(run);
+        for t in 0..len {
+            run += f(t);
+            s.push(run);
+        }
+        s
+    };
+    let cprefix = |f: &dyn Fn(usize) -> Complex64| {
+        let mut s = Vec::with_capacity(len + 1);
+        let mut run = Complex64::new(0.0, 0.0);
+        s.push(run);
+        for t in 0..len {
+            run += f(t);
+            s.push(run);
+        }
+        s
+    };
+    let wsum_of = |s: &[f64], j: usize, h: usize| s[(j + h).min(len)] - s[j.saturating_sub(h)];
+    let cwsum_of = |s: &[Complex64], j: usize, h: usize| s[(j + h).min(len)] - s[j.saturating_sub(h)];
+    let (afl, wt, lag) = (&inner.afloor, &inner.weight, inner.lag);
+    let (full0, hi0, cov0) = &reads[0];
+    let mut acc = vec![0.0f64; n];
+    let mut wsum = vec![0.0f64; n];
+    // The primary's carrier fraction over the lock window at each sample, for
+    // the others' locks.
+    let mut q0 = vec![0.0f64; n];
+    // And how much of its carrier it keeps at the sample itself (carrier
+    // window against lock window), for the alignment guard.
+    let mut h0 = vec![0.0f64; n];
+    // An input's carrier terms at `t`: the lag product, `|z[t]|^2`, 1 (zero
+    // where `t` or `t - lag` is not covered).
+    let lagged = |hi: &[Complex64], cov: &[bool], t: usize| {
+        if t >= lag && cov[t] && cov[t - lag] {
+            let (x, y) = (hi[t], hi[t - lag]);
+            (Complex64::new(x.re * y.re + x.im * y.im, x.im * y.re - x.re * y.im), p2(x), 1.0)
+        } else {
+            (Complex64::new(0.0, 0.0), 0.0, 0.0)
+        }
+    };
+    // An input's carrier sums at `j` over the lock window and the carrier
+    // window. Exact: directly, in ascending order (the OpenCL kernel's),
+    // instead of running-sum differences whose rounding depends on where the
+    // task starts.
+    type Carrier = ((Complex64, f64, f64), (Complex64, f64, f64));
+    let carrier_sums = |hi: &[Complex64], cov: &[bool], pre: &Option<(Vec<Complex64>, Vec<f64>, Vec<f64>)>, j: usize| -> Carrier {
+        match pre {
+            Some((sr, se, sc)) => (
+                (cwsum_of(sr, j, half), wsum_of(se, j, half), wsum_of(sc, j, half)),
+                (cwsum_of(sr, j, ch), wsum_of(se, j, ch), wsum_of(sc, j, ch)),
+            ),
+            None => {
+                let (mut l, mut s) = ((Complex64::new(0.0, 0.0), 0.0, 0.0), (Complex64::new(0.0, 0.0), 0.0, 0.0));
+                for t in win(j) {
+                    let (v, p, k) = lagged(hi, cov, t);
+                    l.0.re += v.re;
+                    l.0.im += v.im;
+                    l.1 += p;
+                    l.2 += k;
+                    if short(j, t) {
+                        s.0.re += v.re;
+                        s.0.im += v.im;
+                        s.1 += p;
+                        s.2 += k;
+                    }
+                }
+                (l, s)
+            }
+        }
+    };
+    let carrier_pre = |hi: &[Complex64], cov: &[bool]| {
+        (!inner.exact).then(|| {
+            (cprefix(&|t| lagged(hi, cov, t).0), prefix(&|t| lagged(hi, cov, t).1), prefix(&|t| lagged(hi, cov, t).2))
+        })
+    };
+    let pre0 = carrier_pre(hi0, cov0);
+    for j in m..m + n {
+        let ((rl, e, c), (rs, es, cs)) = carrier_sums(hi0, cov0, &pre0, j);
+        let s = if cs > 0.0 { carrier(rs, es, cs, QN_CARRIER).0 } else { 0.0 };
+        if c > 0.0 {
+            let (sl, q) = carrier(rl, e, c, QN_LOCK);
+            q0[j - m] = q;
+            h0[j - m] = if sl > 0.0 { s / sl } else { 0.0 };
+        }
+        if cov0[j] {
+            let w = amp_weight(s, afl[0], wt[0]);
+            acc[j - m] += full0[j] * w;
+            wsum[j - m] += w;
+        }
+    }
+    for (i, (full, hi, cov)) in reads.iter().enumerate().skip(1) {
+        let joint = |t: usize| cov0[t] && cov[t];
+        let cross = |t: usize| {
+            let (x, y) = (hi0[t], hi[t]);
+            Complex64::new(x.re * y.re + x.im * y.im, x.im * y.re - x.re * y.im)
+        };
+        // Running sums: the correlation, both energies and the count over the
+        // shared samples.
+        let sums = (!inner.exact).then(|| {
+            (
+                cprefix(&|t| if joint(t) { cross(t) } else { Complex64::new(0.0, 0.0) }),
+                prefix(&|t| if joint(t) { p2(hi0[t]) } else { 0.0 }),
+                prefix(&|t| if joint(t) { p2(hi[t]) } else { 0.0 }),
+                prefix(&|t| if joint(t) { 1.0 } else { 0.0 }),
+            )
+        });
+        let pre = carrier_pre(hi, cov);
+        for j in m..m + n {
+            if !cov[j] {
+                continue;
+            }
+            let (r, ea, eb, nj) = match &sums {
+                Some((cs, sa, sb, sj)) => (cwsum_of(cs, j, half), wsum_of(sa, j, half), wsum_of(sb, j, half), wsum_of(sj, j, half)),
+                None => {
+                    let mut r = Complex64::new(0.0, 0.0);
+                    let (mut ea, mut eb, mut nj) = (0.0, 0.0, 0.0);
+                    for t in win(j) {
+                        if joint(t) {
+                            let v = cross(t);
+                            r.re += v.re;
+                            r.im += v.im;
+                            ea += p2(hi0[t]);
+                            eb += p2(hi[t]);
+                            nj += 1.0;
+                        }
+                    }
+                    (r, ea, eb, nj)
+                }
+            };
+            let ((rl, eo, no), (rs, es, cs)) = carrier_sums(hi, cov, &pre, j);
+            let qi = if no > 0.0 { carrier(rl, eo, no, QN_LOCK).1 } else { 0.0 };
+            let s = if cs > 0.0 { carrier(rs, es, cs, QN_CARRIER).0 } else { 0.0 };
+            let (rot, g) = if nj > 0.0 { lock(r, ea, eb, nj, q0[j - m], qi, h0[j - m]) } else { (Complex64::new(1.0, 0.0), 1.0) };
+            let w = amp_weight(s, afl[i], wt[i]) * g;
+            let d = Complex64::new(rot.re - 1.0, rot.im);
+            acc[j - m] += (full[j] + (hi[j].re * d.re - hi[j].im * d.im)) * w;
+            wsum[j - m] += w;
+        }
+    }
+    for (o, (a, w)) in out.iter_mut().zip(acc.iter().zip(&wsum)) {
+        *o = if *w > 0.0 { (a / w) as f32 } else { 0.0 };
+    }
+    Ok(())
+}
+
+/// `--stack-weight fixed`: the video band phase-locked onto the primary's
+/// over a LOCK_WIN window (running sums, normalized) and every input summed
+/// with its fixed `1/sigma^2` weight. The rest of each input (full minus
+/// video band) is summed as read.
+fn combine_fixed(inner: &Inner, reads: &[(Vec<f64>, Vec<Complex64>, Vec<bool>)], m: usize, out: &mut [f32]) {
+    let n = out.len();
+    let len = n + 2 * m;
     let half = LOCK_WIN / 2;
     let (full0, hi0, cov0) = &reads[0];
     let mut acc = vec![0.0f64; n];
@@ -1172,7 +1455,6 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
     for (o, (a, w)) in out.iter_mut().zip(acc.iter().zip(&wsum)) {
         *o = if *w > 0.0 { (a / w) as f32 } else { 0.0 };
     }
-    Ok(())
 }
 
 impl Drop for VirtualSource {

@@ -9,7 +9,10 @@ use std::sync::Mutex;
 use anyhow::Result;
 use ld_decode::opencl::{Arg, Buffer, Gpu, Kernel, Pinned, Queue};
 
-use crate::stack::{sinc_lut, Inner, Plan, HI_TAPS, LOCK_WIN, SINC_PHASES, SINC_TAPS};
+use crate::stack::{
+    sinc_lut, Inner, Plan, CARRIER_WIN, HI_TAPS, H_LO, H_SPAN, KAPPA_LO, KAPPA_SPAN, LOCK_PRIOR, LOCK_WIN, QN_CARRIER, QN_LOCK, Q_LO, Q_ROT,
+    Q_MAX, Q_SPAN, SINC_PHASES, SINC_TAPS,
+};
 
 const SOURCE: &str = r#"
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
@@ -74,11 +77,61 @@ __kernel void read_input(
     cov[base + j] = 1;
 }
 
-// Phase-lock every input's video band onto the primary's over LOCK_WIN
-// samples and sum with the weights (the rest of each input as read). A
-// work-group of TILE outputs stages the window products of each input in
-// local memory once, so the 128-sample sums read it instead of global memory.
+// stack.rs carrier, amp_weight and lock, in their order.
+REAL carrier(REAL2 rl, REAL e, REAL n, REAL qn, REAL* q)
+{
+    REAL a = sqrt(rl.x * rl.x + rl.y * rl.y);
+    *q = e > (REAL)0 ? fmin(fmax(a / e - qn, (REAL)0) / ((REAL)1 - qn), (REAL)Q_MAX) : (REAL)0;
+    return fmax(a - qn * e, (REAL)0) / (((REAL)1 - qn) * n);
+}
+
+REAL amp_weight(REAL s, REAL afl, REAL w)
+{
+    return fmax(sqrt(s), afl) * w;
+}
+
+REAL2 lock(REAL2 r, REAL ea, REAL eb, REAL nj, REAL q0, REAL qi, REAL h0, REAL* g)
+{
+    REAL q = q0 * qi;
+    REAL a = sqrt(r.x * r.x + r.y * r.y);
+    *g = (REAL)1;
+    if (q > (REAL)Q_LO) {
+        REAL kappa = a / sqrt(ea * eb) / sqrt(q);
+        REAL gk = clamp((kappa - (REAL)KAPPA_LO) / (REAL)KAPPA_SPAN, (REAL)0, (REAL)1);
+        REAL hp = clamp((h0 - (REAL)H_LO) / (REAL)H_SPAN, (REAL)0, (REAL)1);
+        *g = (REAL)1 - ((REAL)1 - gk) * fmin((q - (REAL)Q_LO) / (REAL)Q_SPAN, (REAL)1) * hp;
+    }
+    if (a <= (REAL)0) return (REAL2)((REAL)1, (REAL)0);
+    REAL qr = fmax((q - (REAL)Q_ROT) / ((REAL)1 - (REAL)Q_ROT), (REAL)0);
+    REAL wm = nj * qr / ((REAL)1 - qr);
+    REAL vx = r.x / a * wm + (REAL)LOCK_PRIOR;
+    REAL vy = r.y / a * wm;
+    REAL b = sqrt(vx * vx + vy * vy);
+    return (REAL2)(vx / b, vy / b);
+}
+
+// An input's carrier terms at t (stack.rs compute_task `lagged`): the lag
+// product, |z[t]|^2, 1; zero where t or t - LAG is not covered.
+void lagged(__global const REAL2* hi, __global const uchar* cov, int t, int len, REAL2* v, REAL* p, REAL* k)
+{
+    *v = (REAL2)((REAL)0, (REAL)0);
+    *p = (REAL)0;
+    *k = (REAL)0;
+    if (t >= LAG && t < len && cov[t] && cov[t - LAG]) {
+        REAL2 x = hi[t], y = hi[t - LAG];
+        *v = (REAL2)(x.x * y.x + x.y * y.y, x.y * y.x - x.x * y.y);
+        *p = x.x * x.x + x.y * x.y;
+        *k = (REAL)1;
+    }
+}
+
 #define TILE 256
+#ifdef CARRIER_COMBINE
+// Weight every input by its carrier amplitude over LOCK_WIN samples,
+// phase-lock its video band onto the primary's over the same window (the
+// rest of each input as read), and sum. A work-group of TILE outputs stages
+// the window terms of each input in local memory once, so the 128-sample
+// sums read it instead of global memory.
 __kernel void combine(
     const int ni,
     const int len,
@@ -88,6 +141,118 @@ __kernel void combine(
     __global const REAL2* hi,
     __global const uchar* cov,
     __global const REAL* weight,
+    __global const REAL* afloor,
+    __global float* out)
+{
+    // Correlation, both energies and the count over the samples the input
+    // shares with the primary; its own carrier terms.
+    __local REAL2 prod[TILE + LOCK_WIN], pr[TILE + LOCK_WIN];
+    __local REAL pa[TILE + LOCK_WIN], pb[TILE + LOCK_WIN], pj[TILE + LOCK_WIN];
+    __local REAL po[TILE + LOCK_WIN], pn[TILE + LOCK_WIN];
+    int lid = get_local_id(0);
+    int jo = get_global_id(0);
+    int j = jo + m;
+    int t0 = (int)get_group_id(0) * TILE + m - LOCK_WIN / 2;
+    bool active = jo < n;
+    REAL acc = (REAL)0, wsum = (REAL)0, q0 = (REAL)0, h0 = (REAL)0;
+    for (int u = lid; u < TILE + LOCK_WIN; u += TILE) {
+        REAL2 v;
+        REAL p, k;
+        lagged(hi, cov, t0 + u, len, &v, &p, &k);
+        pr[u] = v;
+        po[u] = p;
+        pn[u] = k;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (active) {
+        REAL2 rl = (REAL2)((REAL)0, (REAL)0), rs = (REAL2)((REAL)0, (REAL)0);
+        REAL e = (REAL)0, c = (REAL)0, es = (REAL)0, cs = (REAL)0, q;
+        for (int u = 0; u < LOCK_WIN; u++) { rl += pr[lid + u]; e += po[lid + u]; c += pn[lid + u]; }
+        for (int u = LOCK_WIN / 2 - CARRIER_WIN / 2; u < LOCK_WIN / 2 + CARRIER_WIN / 2; u++) {
+            rs += pr[lid + u]; es += po[lid + u]; cs += pn[lid + u];
+        }
+        REAL s = cs > (REAL)0 ? carrier(rs, es, cs, (REAL)QN_CARRIER, &q) : (REAL)0;
+        if (c > (REAL)0) {
+            REAL sl = carrier(rl, e, c, (REAL)QN_LOCK, &q0);
+            h0 = sl > (REAL)0 ? s / sl : (REAL)0;
+        }
+        if (cov[j]) {
+            REAL w = amp_weight(s, afloor[0], weight[0]);
+            acc += full[j] * w;
+            wsum += w;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i = 1; i < ni; i++) {
+        int b = i * len;
+        for (int u = lid; u < TILE + LOCK_WIN; u += TILE) {
+            int t = t0 + u;
+            REAL2 v = (REAL2)((REAL)0, (REAL)0);
+            REAL ea = (REAL)0, eb = (REAL)0, cj = (REAL)0;
+            if (t >= 0 && t < len && cov[t] && cov[b + t]) {
+                REAL2 x = hi[t], y = hi[b + t];
+                v = (REAL2)(x.x * y.x + x.y * y.y, x.y * y.x - x.x * y.y);
+                ea = x.x * x.x + x.y * x.y;
+                eb = y.x * y.x + y.y * y.y;
+                cj = (REAL)1;
+            }
+            prod[u] = v;
+            pa[u] = ea;
+            pb[u] = eb;
+            pj[u] = cj;
+            REAL2 lv;
+            REAL lp, lk;
+            lagged(hi + b, cov + b, t, len, &lv, &lp, &lk);
+            pr[u] = lv;
+            po[u] = lp;
+            pn[u] = lk;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (active && cov[b + j]) {
+            REAL2 r = (REAL2)((REAL)0, (REAL)0), rl = (REAL2)((REAL)0, (REAL)0);
+            REAL ea = (REAL)0, eb = (REAL)0, nj = (REAL)0, eo = (REAL)0, no = (REAL)0;
+            for (int u = 0; u < LOCK_WIN; u++) {
+                r += prod[lid + u];
+                ea += pa[lid + u];
+                eb += pb[lid + u];
+                nj += pj[lid + u];
+                rl += pr[lid + u];
+                eo += po[lid + u];
+                no += pn[lid + u];
+            }
+            REAL2 rs = (REAL2)((REAL)0, (REAL)0);
+            REAL es = (REAL)0, cs = (REAL)0;
+            for (int u = LOCK_WIN / 2 - CARRIER_WIN / 2; u < LOCK_WIN / 2 + CARRIER_WIN / 2; u++) {
+                rs += pr[lid + u]; es += po[lid + u]; cs += pn[lid + u];
+            }
+            REAL qi = (REAL)0, q, s = (REAL)0, g = (REAL)1;
+            if (no > (REAL)0) carrier(rl, eo, no, (REAL)QN_LOCK, &qi);
+            if (cs > (REAL)0) s = carrier(rs, es, cs, (REAL)QN_CARRIER, &q);
+            REAL2 rot = nj > (REAL)0 ? lock(r, ea, eb, nj, q0, qi, h0, &g) : (REAL2)((REAL)1, (REAL)0);
+            REAL w = amp_weight(s, afloor[i], weight[i]) * g;
+            REAL2 d = (REAL2)(rot.x - (REAL)1, rot.y);
+            REAL2 z = hi[b + j];
+            acc += (full[b + j] + (z.x * d.x - z.y * d.y)) * w;
+            wsum += w;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (active) out[jo] = wsum > (REAL)0 ? (float)(acc / wsum) : 0.0f;
+}
+#else
+// --stack-weight fixed: phase-lock every input's video band onto the
+// primary's over LOCK_WIN samples and sum with the fixed weights (the rest of
+// each input as read; `afloor` unused).
+__kernel void combine(
+    const int ni,
+    const int len,
+    const int m,
+    const int n,
+    __global const REAL* full,
+    __global const REAL2* hi,
+    __global const uchar* cov,
+    __global const REAL* weight,
+    __global const REAL* afloor,
     __global float* out)
 {
     __local REAL2 prod[TILE + LOCK_WIN];
@@ -124,6 +289,7 @@ __kernel void combine(
     }
     if (active) out[jo] = wsum > (REAL)0 ? (float)(acc / wsum) : 0.0f;
 }
+#endif
 "#;
 
 struct State {
@@ -133,6 +299,7 @@ struct State {
     sinc: Buffer,
     hil: Buffer,
     weight: Buffer,
+    afloor: Buffer,
     seg: Buffer,
     seg_t0: Buffer,
     raw: Buffer,
@@ -162,7 +329,12 @@ impl StackGpu {
             .kernels(
                 SOURCE,
                 &format!(
-                    "-DPHASES={SINC_PHASES} -DSINC_TAPS={SINC_TAPS} -DHI_TAPS={HI_TAPS} -DLOCK_WIN={LOCK_WIN} {}",
+                    "-DPHASES={SINC_PHASES} -DSINC_TAPS={SINC_TAPS} -DHI_TAPS={HI_TAPS} -DLOCK_WIN={LOCK_WIN} \
+                     -DCARRIER_WIN={CARRIER_WIN} -DQN_LOCK={QN_LOCK:?} -DQN_CARRIER={QN_CARRIER:?} \
+                     -DLOCK_PRIOR={LOCK_PRIOR:?} -DKAPPA_LO={KAPPA_LO:?} -DKAPPA_SPAN={KAPPA_SPAN:?} \
+                     -DQ_LO={Q_LO:?} -DQ_SPAN={Q_SPAN:?} -DQ_MAX={Q_MAX:?} -DQ_ROT={Q_ROT:?} -DH_LO={H_LO:?} -DH_SPAN={H_SPAN:?} -DLAG={} {} {}",
+                    inner.lag,
+                    if inner.carrier { "-DCARRIER_COMBINE" } else { "" },
                     if inner.exact { "-DREAL=double -DREAL2=double2" } else { "-DREAL=float -DREAL2=float2" }
                 ),
                 &["read_input", "combine"],
@@ -191,6 +363,7 @@ impl StackGpu {
             sinc: constant(&sinc)?,
             hil: constant(&hil)?,
             weight: constant(&weight)?,
+            afloor: constant(&inner.afloor)?,
             seg: gpu.buffer(4)?,
             seg_t0: gpu.buffer(8)?,
             raw: gpu.buffer(4)?,
@@ -296,6 +469,7 @@ impl StackGpu {
             Arg::Buf(&st.hi),
             Arg::Buf(&st.cov),
             Arg::Buf(&st.weight),
+            Arg::Buf(&st.afloor),
             Arg::Buf(&st.out),
         ])?;
         st.q.launch(&st.k_combine, &[out.len()], 256)?;
