@@ -62,8 +62,28 @@ pub(crate) const PAL_SPLIT_HZ: (f64, f64) = (1.9e6, 2.4e6);
 /// the leakage across the crossover near -37 dB.
 pub(crate) const HI_TAPS: usize = 128;
 const HI_BETA: f64 = 8.0;
-/// Band used to estimate each input's noise floor (no signal there).
+/// Band used to estimate each input's noise floor (no signal there), kept
+/// below `NOISE_TOP` of the Nyquist frequency (the capture's anti-alias
+/// filter); where less than `NOISE_MIN_BW` of it remains (a capture at 30
+/// MHz), it reaches down to `NOISE_LOW_HZ`, where the RF has already fallen
+/// to the floor.
 const NOISE_BAND_HZ: (f64, f64) = (16.0e6, 19.5e6);
+const NOISE_TOP: f64 = 0.95;
+const NOISE_MIN_BW: f64 = 1.0e6;
+const NOISE_LOW_HZ: f64 = 13.5e6;
+
+/// The noise-floor band at a sample rate (see [`NOISE_BAND_HZ`]).
+fn noise_band(fs: f64) -> Result<(f64, f64)> {
+    let top = NOISE_TOP * fs / 2.0;
+    let (lo, hi) = (NOISE_BAND_HZ.0, NOISE_BAND_HZ.1.min(top));
+    if hi - lo >= NOISE_MIN_BW {
+        return Ok((lo, hi));
+    }
+    if top - NOISE_LOW_HZ < NOISE_MIN_BW / 4.0 {
+        bail!("input rate {fs} Hz too low: no noise-floor band left above the RF");
+    }
+    Ok((NOISE_LOW_HZ, top))
+}
 /// A paired line whose length differs from the primary's by more than this
 /// ratio is treated as a skip in that input (not covered).
 const MAX_LINE_RATIO_DEV: f64 = 0.02;
@@ -1162,7 +1182,7 @@ fn noise_floor(file: &RawFile, start: i64, fs: f64) -> Result<f64> {
     let fwd = FftPlanner::new().plan_fft_forward(NOISE_FFT);
     let mut x: Vec<Complex64> = raw.iter().map(|&v| Complex64::new(f64::from(v), 0.0)).collect();
     fwd.process(&mut x);
-    let (lo, hi) = NOISE_BAND_HZ;
+    let (lo, hi) = noise_band(fs)?;
     let (mut acc, mut n) = (0.0, 0usize);
     for (b, v) in x.iter().enumerate().take(NOISE_FFT / 2) {
         let f = b as f64 * fs / NOISE_FFT as f64;

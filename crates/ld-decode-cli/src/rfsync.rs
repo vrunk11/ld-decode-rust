@@ -4,7 +4,7 @@
 //! The carrier sits at its lowest frequency during a sync pulse (-40 IRE,
 //! ~7.6 MHz on NTSC, against ~8.1 MHz at blanking), so a coarse frequency
 //! estimate is enough to find every pulse: a short complex band-pass FIR
-//! evaluated only every `COARSE_STEP` samples (two neighbouring outputs give
+//! evaluated only every `COARSE_STEP` samples at 75 MHz (two neighbouring outputs give
 //! the phase step). Pulse lengths tell hsyncs from the equalizing and broad
 //! pulses of the vertical interval, and where that interval starts against
 //! the line grid gives the field parity.
@@ -99,12 +99,32 @@ impl System {
     }
 }
 
+/// The rate the sample counts below are given at; at another rate each
+/// scales to the same duration (`at_rate`), so pass 0 measures the same thing
+/// whatever the capture's rate.
+const REF_FS: f64 = 75.0e6;
 /// Coarse detector: taps and decimation (NTSC; PAL steps by three pilot
 /// periods).
-const COARSE_TAPS: usize = 48;
-const COARSE_STEP: usize = 32;
+const COARSE_TAPS: f64 = 48.0;
+const COARSE_STEP: f64 = 32.0;
 /// Fine stage taps.
-const FINE_TAPS: usize = 191;
+const FINE_TAPS: f64 = 191.0;
+/// Boxcar on the fine frequency for the edge and the levels (NTSC).
+const SMOOTH: f64 = 9.0;
+/// A line off the straight path of its measured neighbours by more than this
+/// is a damaged one.
+const MAX_LINE_DEV: f64 = 3.0;
+
+/// `n` samples at `REF_FS`, as samples at `fs` (exact at `REF_FS`).
+fn at_rate(n: f64, fs: f64) -> f64 {
+    n * fs / REF_FS
+}
+
+/// The same, as a count of at least 1; `odd` keeps a filter symmetric.
+fn count_at_rate(n: f64, fs: f64, odd: bool) -> usize {
+    let c = (at_rate(n, fs).round() as usize).max(1);
+    if odd && c % 2 == 0 { c + 1 } else { c }
+}
 /// Samples processed per step, and the context read on each side of them.
 const CHUNK: usize = 1 << 22;
 const MARGIN: usize = 1 << 17;
@@ -356,8 +376,8 @@ impl Tracker {
             })
             .collect();
         // A line off the straight path of its measured neighbours (the
-        // nearest on each side, across unmeasured lines) by more than 3
-        // samples is a damaged one (the time base moves far less than that
+        // nearest on each side, across unmeasured lines) by more than
+        // MAX_LINE_DEV samples is a damaged one (the time base moves far less than that
         // from one line to the next): interpolated instead. Of two adjacent
         // suspects, the worse goes.
         let neighbours = |i: usize| -> Option<(usize, usize)> {
@@ -373,10 +393,11 @@ impl Tracker {
                 _ => 0.0,
             }
         };
+        let max_dev = at_rate(MAX_LINE_DEV, self.fs);
         let bad: Vec<usize> = (0..pos.len())
             .filter(|&i| {
                 let d = dev(i);
-                d > 3.0 && neighbours(i).is_some_and(|(j, k)| dev(j) <= d && dev(k) <= d)
+                d > max_dev && neighbours(i).is_some_and(|(j, k)| dev(j) <= d && dev(k) <= d)
             })
             .collect();
         for i in bad {
@@ -498,11 +519,11 @@ fn refine(x: &[f32], s: f64, fir: &Fir, fs: f64, vbi: bool, sys: &System) -> Fin
     }
     let (c0, c1) = (c0 as usize, c1 as usize);
     let f = fir.freq(x, c0, c1, fs);
-    // Centred boxcar for the edge and the levels: 9 samples, or three pilot
+    // Centred boxcar for the edge and the levels: SMOOTH samples, or three pilot
     // periods on PAL (a whole number at 40 MHz, so it nulls the pilot; one
     // rounded period leaves a ripple that crosses the threshold at the start
     // of the sync tip). The edge, blurred symmetrically, keeps its 50% point.
-    let len = if sys.pal { (3.0 * fs / sys.lock_hz).round() as usize } else { 9 };
+    let len = if sys.pal { (3.0 * fs / sys.lock_hz).round() as usize } else { count_at_rate(SMOOTH, fs, false) };
     let sm: Vec<f32> = (0..f.len())
         .map(|i| {
             let (a, b) = (i.saturating_sub(len / 2), (i + len - len / 2).min(f.len()));
@@ -617,8 +638,8 @@ fn philips(sm: &[f32], c0: usize, edge: f64, porch: f32, fs: f64, hz_ire: f64) -
 
 /// Locate every line of `input` from its RF and feed the fields to `live`.
 pub fn locate(src: &StackInput, fs: f64, sys: &System, live: &Live, input: usize) -> Result<()> {
-    let coarse = Fir::new(COARSE_TAPS, sys.coarse_band, 6.0, fs);
-    let fine = Fir::new(FINE_TAPS, sys.fine_band, 7.0, fs);
+    let coarse = Fir::new(count_at_rate(COARSE_TAPS, fs, false), sys.coarse_band, 6.0, fs);
+    let fine = Fir::new(count_at_rate(FINE_TAPS, fs, true), sys.fine_band, 7.0, fs);
     let thr = ((sys.sync_hz + sys.blank_hz) / 2.0) as f32;
     let hlen = fs * sys.line_us / 1e6;
     // PAL: a step of three pilot periods, the phase steps summed at eight
@@ -627,7 +648,7 @@ pub fn locate(src: &StackInput, fs: f64, sys: &System, live: &Live, input: usize
         let step = (3.0 * fs / sys.lock_hz).round() as usize;
         (step, (0..8).map(|k| k * step / 8).collect())
     } else {
-        (COARSE_STEP, vec![0])
+        (count_at_rate(COARSE_STEP, fs, false), vec![0])
     };
     let reach = points.last().copied().unwrap_or(0);
     let len = src.len();

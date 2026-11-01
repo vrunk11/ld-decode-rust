@@ -617,7 +617,20 @@ fn read_tbc_source(
         .collect::<Result<Vec<_>>>()?;
     let stacked = inputs.iter().zip(&fmts).map(|(p, &f)| stack::StackInput::new(p, f)).collect::<Result<Vec<_>>>()?;
     let fs = inputfreq * 1e6;
-    // NTSC line: 286 lines per 4.5 MHz.
+    // Any sample rate works, but one for every input: the stack reads them
+    // all on one time base.
+    if inputs.len() > 1 {
+        for p in inputs {
+            if let Some(hz) = capture_rate_hz(p) {
+                if hz != fs {
+                    anyhow::bail!(
+                        "{p} was captured at {} MHz (its .yaml) but the stack decodes at {inputfreq} MHz; stacked captures must share one sample rate",
+                        hz / 1e6
+                    );
+                }
+            }
+        }
+    }
     // Line: NTSC 286 lines per 4.5 MHz, PAL 64 us.
     let linelen = if pal { fs * 64e-6 } else { fs * 286.0 / 4.5e6 };
     let live = stack::Live::new(inputs.to_vec(), stacked[0].len(), linelen);
@@ -637,6 +650,13 @@ fn read_tbc_source(
     }
     let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
     stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, rf_out)
+}
+
+/// The sample rate a Domesday Duplicator capture records in the `.yaml`
+/// beside it (`x.ddd.s16` -> `x.ddd.yaml`), if there is one.
+fn capture_rate_hz(path: &str) -> Option<f64> {
+    let text = std::fs::read_to_string(std::path::Path::new(path).with_extension("yaml")).ok()?;
+    text.lines().find_map(|l| l.trim().strip_prefix("\"sample_rate_hz\":")?.trim().parse().ok())
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF
