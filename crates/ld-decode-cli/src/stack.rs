@@ -784,6 +784,51 @@ impl Inner {
     }
 }
 
+/// `--rf-out`: the stream written as s16 beside the decode, each chunk at its
+/// place as the producer computes it (a seek leaves the skipped span zero).
+pub struct RfOut {
+    file: File,
+    /// s16 value = stream value * scale + shift, the inverse of how the
+    /// primary's format was widened (the decoder ignores the DC offset).
+    scale: f32,
+    shift: f32,
+}
+
+impl RfOut {
+    pub fn create(path: &str, primary: SampleFormat) -> Result<Self> {
+        let (scale, shift) = match primary {
+            SampleFormat::U16Le => (1.0, -32768.0),
+            SampleFormat::U8Le => (256.0, -32768.0),
+            _ => (1.0, 0.0),
+        };
+        let file = File::create(path).with_context(|| format!("creating {path}"))?;
+        tracing::info!("writing the RF the decoder reads to {path} (s16)");
+        Ok(Self { file, scale, shift })
+    }
+
+    fn write(&self, s0: u64, data: &[f32]) -> Result<()> {
+        let bytes: Vec<u8> = data
+            .iter()
+            .flat_map(|&v| ((v * self.scale + self.shift).round().clamp(-32768.0, 32767.0) as i16).to_le_bytes())
+            .collect();
+        let mut done = 0;
+        while done < bytes.len() {
+            done += write_at(&self.file, &bytes[done..], s0 * 2 + done as u64).context("writing --rf-out")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+}
+
+#[cfg(unix)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::write_at(file, buf, offset)
+}
+
 /// Virtual samples per read-ahead chunk.
 const CHUNK: usize = 1 << 21;
 /// Chunks computed ahead of the decoder's read position.
@@ -798,6 +843,7 @@ struct Engine {
     /// small tail pool (a quarter of the demod budget).
     pool: rayon::ThreadPool,
     gpu: Option<crate::opencl::StackGpu>,
+    rf_out: Option<RfOut>,
 }
 
 impl Engine {
@@ -913,6 +959,9 @@ impl Ahead {
         } else {
             engine.compute(s0, n, None)?
         };
+        if let Some(out) = &engine.rf_out {
+            out.write(s0, &data)?;
+        }
         let mut st = self.state.lock().unwrap();
         if let Some(l) = len {
             st.len = Some(l);
@@ -958,7 +1007,7 @@ pub struct VirtualSource {
 }
 
 impl VirtualSource {
-    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool) -> Result<Self> {
+    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, rf_out: Option<RfOut>) -> Result<Self> {
         // 1/sigma^2 from each input's noise floor, measured where pass 0
         // first located it (the stream starts before the rest is known).
         let mut weight = Vec::new();
@@ -979,7 +1028,7 @@ impl VirtualSource {
         ];
         let inner = Inner { inputs, live: Arc::clone(&live), weight, hi_lut, fir, exact };
         let gpu = if opencl { Some(crate::opencl::StackGpu::new(&inner)?) } else { None };
-        let engine = Engine { inner: Arc::new(inner), pool, gpu };
+        let engine = Engine { inner: Arc::new(inner), pool, gpu, rf_out };
         let ahead = Arc::new(Ahead { state: Mutex::new(AheadState::default()), cv: Condvar::new() });
         let producer = {
             let ahead = Arc::clone(&ahead);

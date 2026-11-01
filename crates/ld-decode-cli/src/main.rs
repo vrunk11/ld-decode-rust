@@ -54,6 +54,11 @@ struct Args {
     /// sources always use read.
     #[arg(long, value_enum)]
     tbc: Option<TbcMode>,
+    /// Also write the RF the decoder reads to this file (s16 at the input
+    /// rate): the stacked captures with `-i` repeated, the time-base
+    /// corrected capture with one. Needs `--tbc read` (the default with it).
+    #[arg(long, value_name = "FILE")]
+    rf_out: Option<String>,
     /// Where the FM demodulation and the read-time TBC / stack run: `cpu`
     /// (bit-exact to the reference), or `opencl` (a GPU through its driver's
     /// OpenCL runtime; see --gpu-precision).
@@ -234,8 +239,11 @@ fn main() -> Result<()> {
         (Some(TbcMode::Resample), n) if n > 1 => {
             anyhow::bail!("several inputs are stacked with read-time TBC; --tbc resample takes a single input")
         }
+        (Some(TbcMode::Resample), _) if args.rf_out.is_some() => {
+            anyhow::bail!("--rf-out writes the read-time corrected RF; it needs --tbc read")
+        }
         (Some(m), _) => m,
-        (None, 1) => TbcMode::Resample,
+        (None, 1) if args.rf_out.is_none() => TbcMode::Resample,
         (None, _) => TbcMode::Read,
     };
 
@@ -339,7 +347,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset)?),
+        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.rf_out.as_deref())?),
     };
     let mut reader = DecodeReader::new(source);
 
@@ -527,6 +535,7 @@ fn read_tbc_source(
     pal: bool,
     device: Device,
     preset: Preset,
+    rf_out: Option<&str>,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
         .iter()
@@ -552,7 +561,8 @@ fn read_tbc_source(
             live.finish(i, run.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))));
         })?;
     }
-    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow)
+    let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
+    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, rf_out)
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF
