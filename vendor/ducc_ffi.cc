@@ -128,6 +128,27 @@ void FN(rfft)(int n, const double *in, double *out) {
   catch (...) { duccq_fail("unknown", "rfft"); }
 }
 
+// Forward real FFT in SINGLE precision -> half spectrum (n/2+1 complex64).
+//
+// `scipy.fft.fft` keeps the precision of its input, so a float32 array comes
+// back complex64 -- and for a real input it takes the real-transform path
+// (`r2c` of the first half plus conjugate reflection), not a complex `c2c` of
+// the same values: measured on the decoder's own audio buffer, that
+// construction reproduces `scipy.fft.fft(float32)` 32768/32768 bins while
+// `c2c<float>` matches only 129. Reference use: core.py's
+// `runfilter_audio_phase2` takes `a2_in = a2_in_real` (float32) whenever the
+// field's stage-1 audio is at least `blocklen` long -- which is every PAL
+// field (34685 samples) and no NTSC one (~20850) -- so PAL's audio stage 2
+// runs its forward transform in single precision and NTSC's in double.
+void FN(rfft_f32)(int n, const float *in, float *out) {
+  try {
+    cfmav<float> rin(in, shape_t{(size_t)n});
+    vfmav<complex<float>> cout((complex<float>*)out, shape_t{(size_t)(n/2+1)});
+    r2c(rin, cout, 0, FORWARD, 1.0f, 1);
+  } catch (const std::exception &e) { duccq_fail(e.what(), "rfft_f32"); }
+  catch (...) { duccq_fail("unknown", "rfft_f32"); }
+}
+
 // Inverse real FFT: half spectrum (n/2+1 complex) in, n real out. fct=1/n.
 void FN(irfft)(int n, const double *in, double *out) {
   try {

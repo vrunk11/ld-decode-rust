@@ -59,14 +59,16 @@ struct Args {
     /// OpenCL runtime; see --gpu-precision).
     #[arg(long, value_enum, default_value = "cpu")]
     device: Device,
-    /// Speed/exactness preset of the stack (`--tbc read`). `slow`: nothing
-    /// traded for speed (stack FIRs and phase lock in double precision in one
-    /// fixed order, so the GPU gives the CPU's output). `fast`: stack FIRs in
-    /// single precision (measured without visible loss).
+    /// Speed/exactness preset. `slow`: nothing traded for speed (the GPU
+    /// demodulator runs the reference's FFT plan and `atan2`, the stack's FIRs
+    /// and phase lock run in double precision in one fixed order, so the GPU
+    /// gives the CPU's output). `fast`: the GPU demodulator takes a Stockham
+    /// FFT (not byte-identical) and the stack's FIRs run in single precision
+    /// (measured without visible loss).
     #[arg(long, value_enum, default_value = "slow")]
     preset: Preset,
-    /// Precision of the GPU demodulation (`--device opencl`); default double
-    /// (byte-identical to the CPU on a whole test capture, at no speed cost).
+    /// Precision of the GPU demodulation with `--preset fast`; default double.
+    /// `--preset slow` is always double.
     #[arg(long, value_enum)]
     gpu_precision: Option<GpuPrecision>,
     /// Input sample format; default: inferred from the file extension
@@ -98,8 +100,9 @@ struct Args {
     /// 0 IRE level instead of NTSC's 7.5 IRE setup.
     #[arg(long = "NTSCJ", short = 'j', visible_aliases = ["ntscj", "ntsc-j"])]
     ntscj: bool,
-    /// Source is PAL (not covered by the byte-parity target: follows the
-    /// newer ld-decode's PAL processing).
+    /// Source is PAL (625/25): pilot-based lineloc refinement, 312/313-line
+    /// fields, burst-phase field numbering and the PAL filter bank, byte-exact
+    /// against the Python reference.
     #[arg(long = "PAL", short = 'p', visible_aliases = ["pal"])]
     pal: bool,
     /// De-emphasis strength multiplier
@@ -406,7 +409,13 @@ fn main() -> Result<()> {
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
     if args.device == Device::Opencl {
-        match decoder.enable_gpu(args.gpu_precision != Some(GpuPrecision::Single)) {
+        // `slow` trades nothing: the reference's FFT plan and atan2 on the
+        // device, byte-identical to the CPU. `fast` takes the Stockham FFT.
+        let exact = args.preset == Preset::Slow;
+        if exact && args.gpu_precision == Some(GpuPrecision::Single) {
+            anyhow::bail!("--gpu-precision single needs --preset fast (--preset slow is always double)");
+        }
+        match decoder.enable_gpu(exact, args.gpu_precision != Some(GpuPrecision::Single)) {
             Ok(what) => tracing::info!("GPU demodulator: {what}"),
             Err(e) => anyhow::bail!("--device opencl: {e}"),
         }

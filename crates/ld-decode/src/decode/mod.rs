@@ -12,9 +12,14 @@
 
 mod audio;
 mod demodblock;
-// `--gpu`: the whole FM demodulator on an OpenCL device (`demod_gpu`). The
-// OpenCL runtime is loaded at run time, so the code is always compiled in.
+// `--gpu`: the whole FM demodulator on an OpenCL device (`demod_gpu`, the
+// reference's arithmetic via `ducc_gpu`/`ducc_plan`) or, with `--gpu-fast`, the
+// Stockham/`atan2` path that is quicker but rounds differently. The OpenCL
+// runtime is loaded at run time, so the code is always compiled in.
 mod demod_gpu;
+mod demod_gpu_exact;
+mod ducc_gpu;
+mod ducc_plan;
 #[cfg(test)]
 mod probe_test;
 mod dropouts;
@@ -527,7 +532,7 @@ struct DbgMeta {
 /// the whole demodulator on the device (`demod_gpu`). A device failure falls
 /// back to the CPU kernel.
 fn demod_batch(
-    gpu: Option<&Arc<demod_gpu::GpuDemod>>,
+    gpu: Option<&Arc<demod_gpu::Backend>>,
     blocks: &[(u64, &[f32])],
     mtf: f64,
     dspec: &DemodSpecRef,
@@ -559,6 +564,13 @@ pub struct Decoder {
     fieldinfo: Vec<FieldInfoEntry>,
     /// The last valid field, used as the previous field of the next decode.
     prevfield: Option<PrevField>,
+    /// `fieldstack[0]`: the last field that finished decoding (cleared by
+    /// nothing). The redo path of `readfield` passes this one as the previous
+    /// field, so an AGC/MTF rewind re-decodes against the last *committed*
+    /// field even when the fields in between were junk; `prevfield` cannot do
+    /// that job because an invalid field has to clear it (see its clearing
+    /// site). PAL's `determine_field_number` and `getLine0` both read it.
+    fieldstack_prev: Option<PrevField>,
     /// Line codes of the last decoded *first* field, for VBI frame decoding.
     firstfield_linecode: Option<Vec<Option<i64>>>,
     lastvalidfield: [Option<WriteableField>; 2],
@@ -618,9 +630,10 @@ pub struct Decoder {
     /// pool free for the tail's own data-parallel sections (the sinc gather),
     /// which otherwise lose half their threads to the side work.
     side_pool: Arc<rayon::ThreadPool>,
-    /// `--gpu`: the FM demodulator on an OpenCL device. `None` is the CPU
-    /// kernel (and the fallback if the device fails mid-decode).
-    gpu: Option<Arc<demod_gpu::GpuDemod>>,
+    /// `--gpu` (the reference's arithmetic) or `--gpu-fast` (Stockham): the FM
+    /// demodulator on an OpenCL device. `None` is the CPU kernel (and the
+    /// fallback if the device fails mid-decode).
+    gpu: Option<Arc<demod_gpu::Backend>>,
     /// Memo of `MTF ** mtf_level` per mtf value (keyed by f64 bits). mtf is a
     /// slowly-varying scalar — constant for thousands of fields in steady
     /// state — and the pow spectrum is a pure function of (mtf filter, mtf),
@@ -648,17 +661,33 @@ pub struct Decoder {
 
 
 impl Decoder {
-    /// Turn on the `--gpu` demodulator, in double (`f64`) or single precision.
+    /// Turn on the GPU demodulator: `--gpu` (`exact`, the reference's
+    /// arithmetic) or `--gpu-fast` (Stockham, in double or single precision).
     /// Opening the device is done eagerly so a host without OpenCL fails at
     /// start-up with a reason instead of decoding half a disc on one path and
     /// the rest on the other.
-    pub fn enable_gpu(&mut self, f64: bool) -> Result<String, String> {
+    pub fn enable_gpu(&mut self, exact: bool, f64: bool) -> Result<String, String> {
         let spec = &self.spec;
         let dspec = DemodSpecRef::with_plans(spec.freq, spec.freq_half, spec.freq_hz, spec.blocklen, &spec.filters, &self.levels);
-        let dev = demod_gpu::GpuDemod::new(&dspec, f64).map_err(|e| format!("{e:#}"))?;
+        let dev = if exact {
+            demod_gpu::Backend::Exact(
+                demod_gpu_exact::GpuDemodExact::new(&dspec).map_err(|e| format!("{e:#}"))?,
+            )
+        } else {
+            demod_gpu::Backend::Fast(
+                demod_gpu::GpuDemod::new(&dspec, f64).map_err(|e| format!("{e:#}"))?,
+            )
+        };
         let name = crate::opencl::Gpu::get().map(|g| g.name.clone()).unwrap_or_default();
         self.gpu = Some(Arc::new(dev));
-        Ok(format!("{name} ({} precision)", if f64 { "double" } else { "single" }))
+        Ok(if exact {
+            format!("{name} (reference arithmetic)")
+        } else {
+            format!(
+                "{name} ({} precision, Stockham FFT: not byte-exact)",
+                if f64 { "double" } else { "single" }
+            )
+        })
     }
 
     pub fn new(spec: Arc<DecoderSpec>, fdoffset: u64) -> Self {
@@ -699,6 +728,7 @@ impl Decoder {
             fields_written: 0,
             fieldinfo: Vec::new(),
             prevfield: None,
+            fieldstack_prev: None,
             firstfield_linecode: None,
             lastvalidfield: [None, None],
             last_written: None,
@@ -875,7 +905,7 @@ impl Decoder {
                 *self.mtf_hist.front().unwrap_or(&self.mtf_level)
             };
             let (start, prevfield) = if let Some(redo_loc) = redo {
-                (redo_loc, self.prevfield.clone())
+                (redo_loc, self.fieldstack_prev.clone())
             } else {
                 (self.fdoffset_abs(), self.prevfield.clone())
             };
@@ -1146,6 +1176,7 @@ impl Decoder {
             // and returns without running buildmetadata, so the next field
             // sees the post-getLine0 confidence (no syncconf min yet).
             self.prevfield = Some(field.to_prevfield());
+            self.fieldstack_prev = self.prevfield.clone();
             return Ok((self.fdoffset, output));
         }
 
@@ -1155,6 +1186,7 @@ impl Decoder {
         // reads sync_confidence AFTER compute_syncconf has min'd it with the
         // line-spacing score. Snapshot here, post-buildmetadata, to match.
         self.prevfield = Some(field.to_prevfield());
+        self.fieldstack_prev = self.prevfield.clone();
         t_meta += t_m0.elapsed().as_nanos() as u64;
         let idx = usize::from(field.is_first_field());
         let luma = picture.unwrap_or_else(|| LumaOutput::Encoded(Arc::new(Vec::new())));
@@ -1423,6 +1455,7 @@ impl Decoder {
             rfhpf: Vec::new(),
             audio: [Vec::new(), Vec::new()],
             audio_pend: None,
+            audio_f32: false,
             efm: Vec::new(),
             startloc: block_begin as u64,
         };
@@ -1772,6 +1805,7 @@ impl Decoder {
                 rfhpf: Vec::with_capacity(numblocks_read * per_block),
                 audio: [Vec::new(), Vec::new()],
                 audio_pend: None,
+                audio_f32: false,
                 efm: Vec::new(),
                 startloc: block_begin as u64,
             };
@@ -1934,7 +1968,7 @@ impl Decoder {
             let ph2_audio0 = raw.video.audio[0].clone();
             let ph2_audio1 = raw.video.audio[1].clone();
             let ph2_spec = Arc::clone(&self.spec);
-            let ph2_cell: Arc<std::sync::OnceLock<Result<[Vec<f64>; 2], ()>>> =
+            let ph2_cell: Arc<std::sync::OnceLock<Result<([Vec<f64>; 2], bool), ()>>> =
                 Arc::new(std::sync::OnceLock::new());
             let ph2_cell2 = Arc::clone(&ph2_cell);
             rayon::spawn(move || {
@@ -2584,11 +2618,43 @@ fn write_par_concat<T: Copy + Send + Sync>(dst: &mut Vec<T>, parts: &[&[T]]) {
         .for_each(|(d, p)| d.copy_from_slice(p));
 }
 
+/// Values whose f32 bit patterns differ, and the largest ULP distance between
+/// the two sequences (NaN payloads are not compared as numbers; the decoder's
+/// channels never carry one).
+fn ulp_span(a: &[f32], b: &[f32]) -> (usize, u32) {
+    fn ordered(bits: u32) -> i64 {
+        if bits >> 31 == 0 {
+            i64::from(bits)
+        } else {
+            -i64::from(bits & 0x7fff_ffff)
+        }
+    }
+    let mut n = 0usize;
+    let mut worst = 0u32;
+    for (x, y) in a.iter().zip(b) {
+        if x.to_bits() != y.to_bits() {
+            n += 1;
+            worst = worst.max((ordered(x.to_bits()) - ordered(y.to_bits())).unsigned_abs().min(u32::MAX as u64) as u32);
+        }
+    }
+    (n, worst)
+}
+
+/// `n/ulp` as the `LD_GPU_CHECK` line prints it.
+fn fmt_span((n, ulp): (usize, u32)) -> String {
+    if n == 0 {
+        "0".to_string()
+    } else {
+        format!("{n}/{ulp}ulp")
+    }
+}
+
 /// Demodulate `blocks` on the GPU. A GPU failure falls back to the CPU kernel
 /// (once reported); `LD_GPU_CHECK` also runs the CPU kernel and logs how far
-/// apart the two are.
+/// apart the two are -- per block, and only when they are not bit-identical
+/// (`n/ulp`: how many samples moved and by how many f32 units).
 fn gpu_demod_blocks(
-    gpu: &demod_gpu::GpuDemod,
+    gpu: &demod_gpu::Backend,
     blocks: &[(u64, &[f32])],
     mtf: f64,
     pow: Option<&[Complex64]>,
@@ -2598,8 +2664,7 @@ fn gpu_demod_blocks(
     let cpu = || -> Vec<BlockDecode> {
         blocks.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect()
     };
-    let data: Vec<&[f32]> = blocks.iter().map(|b| b.1).collect();
-    let out = match gpu.demod(&data, mtf, pow, rotdelay, dspec) {
+    let out = match gpu.demod(blocks, mtf, pow, rotdelay, dspec) {
         Ok(v) => v,
         Err(e) => {
             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2611,26 +2676,40 @@ fn gpu_demod_blocks(
     };
     if std::env::var_os("LD_GPU_CHECK").is_some() {
         let reference = cpu();
-        let worst = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let rms = |a: &[f32], b: &[f32]| {
-            (a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum::<f64>() / a.len().max(1) as f64).sqrt()
-        };
-        for (g, c) in out.iter().zip(&reference) {
-            let e = g.video.efm.iter().zip(&c.video.efm).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap_or(0);
-            crate::teeprintln!(
-                "GPUCHECK len {}/{} demod max {:.2} rms {:.3} Hz | 05 max {:.2} | burst max {:.2} | raw max {:.2} | rfhpf max {:.3} rms {:.4} | efm max {} | audio max {:.2}",
-                g.video.demod.len(),
-                c.video.demod.len(),
-                worst(&g.video.demod, &c.video.demod),
-                rms(&g.video.demod, &c.video.demod),
-                worst(&g.video.demod_05, &c.video.demod_05),
-                worst(&g.video.demod_burst, &c.video.demod_burst),
-                worst(&g.video.demod_raw, &c.video.demod_raw),
-                worst(&g.rfhpf, &c.rfhpf),
-                rms(&g.rfhpf, &c.rfhpf),
-                e,
-                worst(&g.video.audio[0], &c.video.audio[0]),
-            );
+        for (i, (g, c)) in out.iter().zip(&reference).enumerate() {
+            let d = ulp_span(&g.video.demod, &c.video.demod);
+            let d05 = ulp_span(&g.video.demod_05, &c.video.demod_05);
+            let dburst = ulp_span(&g.video.demod_burst, &c.video.demod_burst);
+            let draw = ulp_span(&g.video.demod_raw, &c.video.demod_raw);
+            let drf = ulp_span(&g.rfhpf, &c.rfhpf);
+            let efm = g
+                .video
+                .efm
+                .iter()
+                .zip(&c.video.efm)
+                .map(|(x, y)| (i32::from(*x) - i32::from(*y)).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            let aud = ulp_span(&g.video.audio[0], &c.video.audio[0]);
+            // Only the blocks that are not bit-identical are worth a line: a
+            // silent "0 everywhere" per block buries the one block that moved.
+            // Parenthesised on purpose: in Rust `|` binds tighter than `!=`
+            // (the opposite of C), so without them this would still be right --
+            // but it reads wrong.
+            if (d.0 | d05.0 | dburst.0 | draw.0 | drf.0 | efm as usize | aud.0) != 0 {
+                crate::teeprintln!(
+                    "GPUCHECK block {} len {}: demod {} | 05 {} | burst {} | raw {} | rfhpf {} | efm {} | audio {}",
+                    blocks.get(i).map(|b| b.0).unwrap_or(i as u64),
+                    g.video.demod.len(),
+                    fmt_span(d),
+                    fmt_span(d05),
+                    fmt_span(dburst),
+                    fmt_span(draw),
+                    fmt_span(drf),
+                    efm,
+                    fmt_span(aud),
+                );
+            }
         }
     }
     out

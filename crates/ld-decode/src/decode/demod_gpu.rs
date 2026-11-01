@@ -1,14 +1,35 @@
-//! OpenCL demodulator: [`demod_block_cpu`](super::demodblock::demod_block_cpu)
-//! for a whole batch of blocks at once, in single or double precision (the
-//! kernels are built with `REAL` = `float` or `double`).
+//! `--gpu-fast`: an OpenCL demodulator for a whole batch of blocks at once, in
+//! single or double precision (the kernels are built with `REAL` = `float` or
+//! `double`).
 //!
 //! Same signal path and the same filters as the CPU kernel (see the header of
-//! `demodblock.rs`); the FFTs are a radix-8 Stockham transform with twiddles
-//! tabulated in double precision. Its FFTs are not the reference's, so it is
-//! not bit-identical by construction; in double precision the differences
-//! stay far below the f32/16-bit roundings of the outputs (a whole test
-//! capture decoded byte-identical to the CPU). `LD_GPU_CHECK` compares the
-//! two kernels block by block.
+//! `demodblock.rs`), but **not** the reference's arithmetic: the FFTs are a
+//! radix-8 Stockham transform with twiddles tabulated in double precision, the
+//! discriminator calls the device's `atan2` (the CPU calls the UCRT port), and
+//! the `f - c` / `+ c*H(0)` shift below rounds differently from the reference's
+//! single transform. So it is not bit-identical by construction, and on a full
+//! disc it is not byte-identical either: 50 722 fields of `Pioneer_GGV1069` at
+//! double precision differ from the CPU -- and so from Python 7.4.0 -- in **1
+//! byte of the 24.3 GB `.tbc`** (1 LSB, one pixel at field 4326 y=103 x=254),
+//! with `.pcm`, `.efm`, `.tbc.json` and every table of the `.tbc.db`
+//! (field records, dropouts, VITS) identical; the 168 566-field sideA capture is
+//! 3 bytes of 80.7 GB at the same rate.
+//!
+//! The mechanism is rounding at the f32 cast, not a signal-path difference. In
+//! 13 000 fields the two kernels disagree on 20 `demod`, 31 `demod_raw`, 19
+//! `demod_05` and 680 `demod_burst` samples -- every one of them **1 ulp** of
+//! f32 (`LD_GPU_CHECK`, 2026-10-31) -- because the f64 values differ in their
+//! own last bits (FFT pass order, device `atan2`). The 16-tap sinc downscale
+//! then turns roughly 1 in 80 of those into a different u16, which is the 1
+//! pixel above. Do not "fix" this by widening anything:
+//! matching ducc's rounding decisions needs ducc's values, not more precision.
+//! Byte-exactness is what `--gpu` (the default; see `demod_gpu_exact`) buys, by
+//! running ducc's own plan (`ducc_plan`/`ducc_gpu`) and a port of the UCRT
+//! `atan2` on the device, at this path's speed rather than the CPU kernel's.
+//! Nothing here is shared with it beyond the signal path.
+//!
+//! `LD_GPU_CHECK` compares the two kernels block by block and prints only the
+//! blocks that are not bit-identical, as `n/ulp` per channel.
 //!
 //! Single precision: the FM discriminator's output is a frequency near 8 MHz that
 //! moves ~7 kHz per IRE. Carried as is in single precision, that constant
@@ -212,6 +233,33 @@ struct State {
     pow_level: Option<f64>,
 }
 
+/// Which GPU demodulator the CLI opened. Both compute the same signal path;
+/// they differ in arithmetic only, so this is a parity/speed choice, not a
+/// mode: [`Backend::Exact`] is `--gpu`, [`Backend::Fast`] is `--gpu-fast`.
+pub(crate) enum Backend {
+    /// The reference's rounding: ducc's plan, numpy's complex multiply, the
+    /// UCRT `atan2` (`demod_gpu_exact`).
+    Exact(super::demod_gpu_exact::GpuDemodExact),
+    /// Stockham FFT + the device's `atan2`: quicker, not byte-identical.
+    Fast(GpuDemod),
+}
+
+impl Backend {
+    pub(crate) fn demod(
+        &self,
+        blocks: &[(u64, &[f32])],
+        mtf_level: f64,
+        mtf_pow: Option<&[Complex64]>,
+        rotdelay: i64,
+        spec: &DemodSpecRef,
+    ) -> Result<Vec<BlockDecode>> {
+        match self {
+            Backend::Exact(d) => d.demod(blocks, mtf_level, mtf_pow, rotdelay, spec),
+            Backend::Fast(d) => d.demod(blocks, mtf_level, mtf_pow, rotdelay, spec),
+        }
+    }
+}
+
 pub(crate) struct GpuDemod {
     blocklen: usize,
     /// Double precision (`REAL` = `double`).
@@ -299,7 +347,7 @@ impl GpuDemod {
     /// does with `cut = true`.
     pub(crate) fn demod(
         &self,
-        blocks: &[&[f32]],
+        blocks: &[(u64, &[f32])],
         mtf_level: f64,
         mtf_pow: Option<&[Complex64]>,
         rotdelay: i64,
@@ -314,7 +362,7 @@ impl GpuDemod {
 
     fn batch(
         &self,
-        blocks: &[&[f32]],
+        blocks: &[(u64, &[f32])],
         mtf_level: f64,
         mtf_pow: Option<&[Complex64]>,
         rotdelay: i64,
@@ -337,13 +385,13 @@ impl GpuDemod {
         // samples spanning at most 65536 values (every 16-bit or 8-bit
         // capture) go up as 16-bit codes from their minimum: half the bytes,
         // the same values.
-        let (lo, hi) = blocks.iter().flat_map(|b| &b[..n]).fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &v| (l.min(v), h.max(v)));
-        let integral = hi - lo <= 65535.0 && blocks.iter().all(|b| b[..n].iter().all(|v| v.fract() == 0.0));
+        let (lo, hi) = blocks.iter().flat_map(|b| &b.1[..n]).fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &v| (l.min(v), h.max(v)));
+        let integral = hi - lo <= 65535.0 && blocks.iter().all(|b| b.1[..n].iter().all(|v| v.fract() == 0.0));
         if integral {
             st.up.ensure(nb * n * 2)?;
             let codes = st.up.slice_mut::<u16>(nb * n);
             for (dst, b) in codes.chunks_exact_mut(n).zip(blocks) {
-                for (d, &v) in dst.iter_mut().zip(&b[..n]) {
+                for (d, &v) in dst.iter_mut().zip(&b.1[..n]) {
                     *d = (v - lo) as u16;
                 }
             }
@@ -354,7 +402,7 @@ impl GpuDemod {
         } else {
             st.up.ensure(nb * n * 4)?;
             for (dst, b) in st.up.slice_mut::<f32>(nb * n).chunks_exact_mut(n).zip(blocks) {
-                dst.copy_from_slice(&b[..n]);
+                dst.copy_from_slice(&b.1[..n]);
             }
             q.upload(&st.raw, 0, &st.up, 0, nb * n * 4)?;
             st.k_load.args(&[Arg::Buf(&st.raw), Arg::Buf(&st.rows[0])])?;

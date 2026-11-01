@@ -121,7 +121,13 @@ pub(crate) struct FieldData {
     /// carries `Ok(audio2)` or `Err(())` on worker panic; `downscale` waits
     /// for it before the audio resample. `OnceLock` keeps `Field` `Sync` so
     /// the existing `rayon::join`/`par_iter` borrows stay legal.
-    pub audio_pend: Option<Arc<std::sync::OnceLock<Result<[Vec<f64>; 2], ()>>>>,
+    ///
+    /// The `bool` is "stage 2 stored through Python's f32 slow path": the audio
+    /// downscale's `nb_mean` must then accumulate in f32 (see
+    /// `audio::downscale_audio_to_output`).
+    pub audio_pend: Option<Arc<std::sync::OnceLock<Result<([Vec<f64>; 2], bool), ()>>>>,
+    /// Whether `audio` holds f32-quantised values (Python's slow path).
+    pub audio_f32: bool,
     /// EFM equalised signal (i16), for the .efm output.
     pub efm: Vec<i16>,
     pub startloc: u64,
@@ -1540,7 +1546,18 @@ impl Field {
         }
         self.is_first_field = is_first_field;
 
-        self.linecount = Some(self.spec.sys_field_lines[if is_first_field.unwrap_or(false) { 0 } else { 1 }]);
+        // `compute_linelocs` hard-codes the NTSC field heights here (263/262)
+        // even for PAL, and `FieldPAL.process` only overwrites them with
+        // 312/313 *after* `calc_burstmedian` has run. That matters: PAL's
+        // `get_burstlevel` -> `lineslice` -> `get_linelen` branches on
+        // `line >= linecount + lineoffset`, so during the burst median the
+        // reference uses the backwards difference for lines >= 262 rather
+        // than the neighbour midpoint. Using `sys_field_lines` (313) took the
+        // midpoint branch for every line and moved the slice bounds by one
+        // sample on the handful of lines whose slice start lands within ~1e-3
+        // of an integer, which flips those burst levels by ~1000 raw units
+        // and the field's median by 0.006 IRE.
+        self.linecount = Some(if is_first_field.unwrap_or(false) { 263 } else { 262 });
         let linecount = self.linecount.unwrap();
 
         // Number of lines to actually process; the entire following VSYNC is
@@ -2254,15 +2271,15 @@ impl Field {
                         std::thread::yield_now();
                     }
                 };
-                match res {
-                    Ok(audio2) => self.data.audio = audio2,
-                    Err(()) => {
-                        self.data.audio = crate::decode::audio::audio_phase2(
-                            &self.spec,
-                            &self.data.video.audio,
-                        );
-                    }
-                }
+                let (audio2, f32q) = match res {
+                    Ok(v) => v,
+                    Err(()) => crate::decode::audio::audio_phase2(
+                        &self.spec,
+                        &self.data.video.audio,
+                    ),
+                };
+                self.data.audio = audio2;
+                self.data.audio_f32 = f32q;
             }
             let linecount = self.linecount.unwrap_or(self.outlinecount);
             let (dsaudio, _next) = crate::decode::audio::downscale_audio(
@@ -2273,8 +2290,10 @@ impl Field {
                 audio_offset,
                 audio_freq,
                 self.data.startloc,
+                self.data.audio_f32,
             );
             self.dsaudio = dsaudio;
+
         }
         let t_aud = t3.elapsed().as_nanos() as u64;
 
@@ -2397,11 +2416,20 @@ impl Field {
         }
         let burstarea = &self.data.video.demod[start..end];
         if self.spec.sys.pal {
-            // `FieldPAL.get_burstlevel`: None (NaN here) above 30 IRE.
-            let m = mean_f32(burstarea);
-            if burstarea.iter().any(|&v| f64::from(v - m) > 30.0 * self.levels.hz_ire) {
+            // `FieldPAL.get_burstlevel` copies the slice, centres it in f32
+            // (`burstarea -= nb_mean(burstarea)`), bails out (None) above
+            // 30 IRE and then calls `rms`, which centres the already-centred
+            // data a *second* time inside
+            // `np.mean(np.square(arr - np.mean(arr)))`. Both centrings are
+            // load-bearing: centring only once (inside `rms`, as the port used
+            // to) shifts every line's level by up to ~2 ulp at 1e5, which
+            // moves the median by ~0.006 IRE on real PAL fields.
+            let mean = mean_f32(burstarea);
+            let centred: Vec<f32> = burstarea.iter().map(|&v| v - mean).collect();
+            if centred.iter().any(|&v| f64::from(v) > 30.0 * self.levels.hz_ire) {
                 return f64::NAN;
             }
+            return f64::from(rms(&centred)) * std::f64::consts::SQRT_2;
         }
         f64::from(rms(burstarea)) * std::f64::consts::SQRT_2
     }

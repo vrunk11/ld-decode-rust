@@ -502,6 +502,31 @@ impl Queue {
         )
     }
 
+    /// Enqueue `kernel` over **exactly** `global` work items (1 or 2 dimensions)
+    /// with no local work size: the driver chooses one and cannot round the
+    /// global size up, so a kernel may index the whole range without a bounds
+    /// guard. The transform-plan kernels this serves are pure permutations of a
+    /// fixed shape, and a rounded-up extra work item would read and write past
+    /// it.
+    pub fn launch_exact(&self, kernel: &Kernel, global: &[usize]) -> Result<()> {
+        check(
+            unsafe {
+                (self.gpu.api.enqueue_nd_range_kernel)(
+                    self.handle,
+                    kernel.handle,
+                    global.len() as u32,
+                    null(),
+                    global.as_ptr(),
+                    null(),
+                    0,
+                    null(),
+                    null_mut(),
+                )
+            },
+            "clEnqueueNDRangeKernel",
+        )
+    }
+
     /// Enqueue `kernel` over `global` work items (1 or 2 dimensions, the first
     /// rounded up to a multiple of `local`).
     pub fn launch(&self, kernel: &Kernel, global: &[usize], local: usize) -> Result<()> {

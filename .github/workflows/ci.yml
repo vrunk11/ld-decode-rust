@@ -66,8 +66,10 @@ jobs:
         with:
           # Pinned to the nightly this port is developed and verified with.
           # Several tests assert bit-level agreement with scipy 1.18.0
-          # references, and codegen drift between nightlies moves them.
-          toolchain: nightly-2026-08-29
+          # references, and codegen drift between nightlies moves them, so
+          # bump this deliberately and re-run the suite -- never float on
+          # `nightly`.
+          toolchain: nightly-2026-10-29
 
       - name: Install Python (for the scipy golden verification)
         # The pinned scipy 1.18.0 wheel needs CPython >= 3.12.
@@ -150,7 +152,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-08-29
+          toolchain: nightly-2026-10-29
 
       - name: Install C++ toolchain and FFmpeg
         # build.rs needs a C++17 compiler with the GNU dialect (clang++ is

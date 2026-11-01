@@ -3156,6 +3156,65 @@ mod tests {
         }
     }
 
+    /// Dump PAL's audio filter bank (the FIR, its stage-1 slice and the
+    /// stage-2 filter) so it can be compared bit-for-bit against scipy's
+    /// construction of the same arrays. PAL's `audio_filterorder` is 900 and
+    /// its carriers are 683.6/1066.4 kHz, so this exercises `firwin` and
+    /// `fft_determine_slices` at lengths and bin offsets no NTSC variant
+    /// reaches (`construction_is_platform_independent` is NTSC-only).
+    #[test]
+    #[ignore = "LD_PAL_DUMP=<dir> dumps PAL's constructed audio filters"]
+    fn pal_filter_dump_probe() {
+        let Some(dir) = std::env::var_os("LD_PAL_DUMP") else {
+            return;
+        };
+        let mut req = crate::request::DecodeRequest::default();
+        req.system = crate::request::ColorSystem::Pal;
+        let spec = DecoderSpec::new(&req).unwrap();
+        let d = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        let wc = |name: &str, v: &[Complex64]| {
+            let mut b = Vec::with_capacity(v.len() * 16);
+            for z in v {
+                b.extend_from_slice(&z.re.to_le_bytes());
+                b.extend_from_slice(&z.im.to_le_bytes());
+            }
+            std::fs::write(d.join(name), b).unwrap();
+        };
+        let wf = |name: &str, v: &[f64]| {
+            let mut b = Vec::with_capacity(v.len() * 8);
+            for x in v {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            std::fs::write(d.join(name), b).unwrap();
+        };
+        let sys = spec.sys;
+        for (i, c) in [spec.audio_lfreq, spec.audio_rfreq].into_iter().enumerate() {
+            let fir = firwin(
+                sys.audio_filterorder,
+                &[
+                    (c - sys.audio_filterwidth) / spec.freq_hz_half,
+                    (c + sys.audio_filterwidth) / spec.freq_hz_half,
+                ],
+                false,
+            );
+            wf(&format!("audio{i}_fir.bin"), &fir);
+            wc(&format!("audio{i}_filt1.bin"), &spec.filters.audio[i].filt1);
+            wc(&format!("audio{i}_stage2.bin"), &spec.filters.audio[i].audio2_filter);
+            println!(
+                "ch{i}: lowbin={} nbins={} a1_freq={:.17} low_freq={:.17}",
+                spec.filters.audio[i].lowbin,
+                spec.filters.audio[i].nbins,
+                spec.filters.audio[i].a1_freq,
+                spec.filters.audio[i].low_freq
+            );
+        }
+        println!(
+            "pal: blocklen={} freq_hz={:.1} audio_l={:.17} audio_r={:.17} fdiv={} linelen={}",
+            spec.blocklen, spec.freq_hz, spec.audio_lfreq, spec.audio_rfreq, spec.filters.audio_fdiv, spec.linelen
+        );
+    }
+
     /// `np_cmul3` must be bit-identical to the two-pass fill+assign pair it
     /// replaces (the demod video product): same lane ops, same rounding,
     /// every element.
