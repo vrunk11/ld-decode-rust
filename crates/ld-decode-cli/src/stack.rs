@@ -62,6 +62,27 @@ pub(crate) const PAL_SPLIT_HZ: (f64, f64) = (1.9e6, 2.4e6);
 /// the leakage across the crossover near -37 dB.
 pub(crate) const HI_TAPS: usize = 128;
 const HI_BETA: f64 = 8.0;
+/// Audio crosstalk cancellation: the analog audio carriers (Hz), NTSC and PAL.
+const AUDIO_CARRIERS_HZ: [f64; 2] = [2.301136e6, 2.8125e6];
+const PAL_AUDIO_CARRIERS_HZ: [f64; 2] = [0.68359375e6, 1.06640625e6];
+/// Length of each of the three cascaded boxcars that take a carrier out of
+/// the RF (seconds): ~150 kHz around it, wide enough for its deviation.
+const XTALK_BOX_S: f64 = 320.0 / 75.0e6;
+/// The correction fades in and out over this much at each chunk's edges
+/// (seconds), where the boxcars run out of signal: so it is continuous from
+/// one chunk to the next.
+const XTALK_TAPER_S: f64 = 1024.0 / 75.0e6;
+/// The correction is kept above this raised-cosine edge (Hz, NTSC; PAL: its
+/// video band split): the video is demodulated from above it, the audio
+/// carriers and the EFM sit below.
+const XTALK_KEEP_HZ: (f64, f64) = (3.0e6, 3.6e6);
+/// The carriers, once at 0 Hz, are kept every this many samples.
+const XTALK_DEC: usize = 16;
+/// FFT length of the correction's high-pass, and the context it takes on
+/// each side of each block (seconds).
+const XTALK_FFT_LEN: usize = 1 << 16;
+const XTALK_OV_S: f64 = 2048.0 / 75.0e6;
+
 /// Band used to estimate each input's noise floor (no signal there), kept
 /// below `NOISE_TOP` of the Nyquist frequency (the capture's anti-alias
 /// filter); where less than `NOISE_MIN_BW` of it remains (a capture at 30
@@ -789,6 +810,8 @@ pub(crate) struct Inner {
     /// (`fixed`): the fixed `1/sigma^2` weights and the plain phase lock
     /// (`combine_fixed`).
     pub(crate) carrier: bool,
+    /// Audio crosstalk cancellation: the sample rate and the audio carriers.
+    pub(crate) xtalk: Option<(f64, [f64; 2], (f64, f64))>,
 }
 
 /// `sum(h[i] * x[i])` over 8 single-precision lanes (as the OpenCL kernel,
@@ -992,6 +1015,8 @@ impl Engine {
     fn compute(&self, s0: u64, n: usize, plan: Option<Plan>) -> Result<Vec<f32>> {
         let mut out = vec![0f32; n];
         let inner = &self.inner;
+        // The combined video band, for the crosstalk cancellation.
+        let mut v = vec![Complex64::new(0.0, 0.0); if inner.xtalk.is_some() { n } else { 0 }];
         self.pool.install(|| match &self.gpu {
             Some(gpu) => {
                 let t0 = std::time::Instant::now();
@@ -1000,17 +1025,29 @@ impl Engine {
                     None => self.gpu_plan(s0, n)?,
                 };
                 let t1 = std::time::Instant::now();
-                gpu.run(&plan, LOCK_MARGIN, &mut out)?;
+                gpu.run(&plan, LOCK_MARGIN, &mut out, (!v.is_empty()).then_some(&mut v[..]))?;
                 if std::env::var_os("LD_TIMING").is_some() {
                     ld_decode::teeprintln!("STACKGPU plan_us={} gpu_us={}", (t1 - t0).as_micros(), t1.elapsed().as_micros());
                 }
                 Ok(())
             }
-            None => out
+            None if v.is_empty() => out
                 .par_chunks_mut(TASK)
                 .enumerate()
-                .try_for_each(|(c, chunk)| compute_task(inner, s0 + (c * TASK) as u64, chunk)),
+                .try_for_each(|(c, chunk)| compute_task(inner, s0 + (c * TASK) as u64, chunk, None)),
+            None => out
+                .par_chunks_mut(TASK)
+                .zip(v.par_chunks_mut(TASK))
+                .enumerate()
+                .try_for_each(|(c, (chunk, vc))| compute_task(inner, s0 + (c * TASK) as u64, chunk, Some(vc))),
         })?;
+        if let Some((fs, fa, keep)) = inner.xtalk {
+            let t0 = std::time::Instant::now();
+            self.pool.install(|| cancel_crosstalk(&mut out, &v, fs, fa, keep));
+            if std::env::var_os("LD_TIMING").is_some() {
+                ld_decode::teeprintln!("STACKXT us={}", t0.elapsed().as_micros());
+            }
+        }
         Ok(out)
     }
 }
@@ -1141,7 +1178,7 @@ pub struct VirtualSource {
 }
 
 impl VirtualSource {
-    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, carrier: bool, rf_out: Option<RfOut>) -> Result<Self> {
+    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, carrier: bool, xtalk: bool, rf_out: Option<RfOut>) -> Result<Self> {
         // 1/sigma^2 from each input's noise floor, measured where pass 0
         // first located it (the stream starts before the rest is known).
         let mut weight = Vec::new();
@@ -1164,7 +1201,12 @@ impl VirtualSource {
             hi_lut.iter().map(|c| c.re as f32).collect(),
             hi_lut.iter().map(|c| c.im as f32).collect(),
         ];
-        let inner = Inner { inputs, live: Arc::clone(&live), weight, afloor, lag: carrier_lag(fs), hi_lut, fir, exact, carrier };
+        let xtalk = xtalk.then_some(if pal {
+            (fs, PAL_AUDIO_CARRIERS_HZ, PAL_SPLIT_HZ)
+        } else {
+            (fs, AUDIO_CARRIERS_HZ, XTALK_KEEP_HZ)
+        });
+        let inner = Inner { inputs, live: Arc::clone(&live), weight, afloor, lag: carrier_lag(fs), hi_lut, fir, exact, carrier, xtalk };
         let gpu = if opencl { Some(crate::opencl::StackGpu::new(&inner)?) } else { None };
         let engine = Engine { inner: Arc::new(inner), pool, gpu, rf_out };
         let ahead = Arc::new(Ahead { state: Mutex::new(AheadState::default()), cv: Condvar::new() });
@@ -1197,7 +1239,202 @@ fn noise_floor(file: &RawFile, start: i64, fs: f64) -> Result<f64> {
     Ok((acc / n as f64 / NOISE_FFT as f64).max(1e-12))
 }
 
-fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
+/// Audio crosstalk cancellation: take out of the stream `out` the part of its
+/// demodulated video that follows the two analog audio carriers. On the disc
+/// they leak into the video carrier's phase; the leak is the same on every
+/// copy (one soundtrack), so no stacking removes it. Each carrier is taken out
+/// of the RF itself (mixed down, three boxcars, mixed back up: `r`), and the
+/// video band's instantaneous frequency (from `v`, the combined analytic video
+/// band) is fitted on both by least squares (the picture does not follow the
+/// carriers): one complex gain each. That frequency error is a phase error
+/// `theta = Re(C r / (j f))`, and the video band is turned back by it:
+/// `out + Re(v (exp(-j theta) - 1))`, kept above `keep` so the low band
+/// (audio, EFM) is left as it is. Only from this chunk's samples, so the same
+/// wherever it is computed.
+fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], keep: (f64, f64)) {
+    let n = out.len();
+    let taper = (XTALK_TAPER_S * fs).round() as usize;
+    let boxl = ((XTALK_BOX_S * fs).round() as usize).max(1);
+    if n < 4 * taper {
+        return;
+    }
+    let tau = 2.0 * std::f64::consts::PI;
+    let zero = Complex64::new(0.0, 0.0);
+    // Each carrier mixed down to 0 Hz and through a boxcar at the full rate,
+    // then, as it is now narrow, kept every XTALK_DEC samples through two
+    // more boxcars there, read back by linear interpolation.
+    let dec = XTALK_DEC;
+    let nd = n.div_ceil(dec);
+    let box_d = (boxl as f64 / dec as f64).round().max(1.0) as usize;
+    let boxcar = |z: &[Complex64], len: usize| -> Vec<Complex64> {
+        let m = z.len();
+        let mut c = Vec::with_capacity(m + 1);
+        let mut run = zero;
+        c.push(run);
+        for &x in z {
+            run += x;
+            c.push(run);
+        }
+        (0..m)
+            .map(|i| {
+                let lo = i.saturating_sub(len / 2);
+                (c[(lo + len).min(m)] - c[lo]) / len as f64
+            })
+            .collect()
+    };
+    // Per carrier: its phasor at every sample (to mix down, and back up), and
+    // its narrow band at 0 Hz.
+    let mixed: Vec<(Vec<Complex64>, Vec<Complex64>)> = fa
+        .par_iter()
+        .map(|&f| {
+            let w = -tau * f / fs;
+            let e: Vec<Complex64> = (0..n).into_par_iter().map(|t| Complex64::from_polar(1.0, w * t as f64)).collect();
+            let mut c = Vec::with_capacity(n + 1);
+            let mut run = zero;
+            c.push(run);
+            for (&x, &p) in out.iter().zip(&e) {
+                run += p * f64::from(x);
+                c.push(run);
+            }
+            let first: Vec<Complex64> = (0..nd)
+                .map(|k| {
+                    let lo = (k * dec).saturating_sub(boxl / 2);
+                    (c[(lo + boxl).min(n)] - c[lo]) / boxl as f64
+                })
+                .collect();
+            (e, boxcar(&boxcar(&first, box_d), box_d))
+        })
+        .collect();
+    // The carrier at `t` (analytic, at its frequency again).
+    let carrier_at = |c: usize, t: usize| -> Complex64 {
+        let k = t / dec;
+        let a = (t % dec) as f64 / dec as f64;
+        let (e, l) = &mixed[c];
+        let b = if k + 1 < nd { l[k] * (1.0 - a) + l[k + 1] * a } else { l[k] };
+        b * e[t].conj() * 2.0
+    };
+    let cols = |t: usize| {
+        let (r0, r1) = (carrier_at(0, t), carrier_at(1, t));
+        [r0.re, r0.im, r1.re, r1.im]
+    };
+    // Least squares on every 5th sample away from the edges, means removed.
+    let idx: Vec<usize> = (taper..n - taper).step_by(5).collect();
+    let cnt = idx.len() as f64;
+    let rows: Vec<([f64; 4], f64)> = idx.par_iter().map(|&t| (cols(t), (v[t] * v[t - 1].conj()).arg() * fs / tau)).collect();
+    let (mut mx, mut my) = ([0.0f64; 4], 0.0f64);
+    for (c, y) in &rows {
+        for k in 0..4 {
+            mx[k] += c[k];
+        }
+        my += y;
+    }
+    for m in &mut mx {
+        *m /= cnt;
+    }
+    my /= cnt;
+    let (mut ata, mut aty) = ([[0.0f64; 4]; 4], [0.0f64; 4]);
+    for (c, y) in &rows {
+        let y = y - my;
+        for a in 0..4 {
+            let ca = c[a] - mx[a];
+            aty[a] += ca * y;
+            for b in 0..4 {
+                ata[a][b] += ca * (c[b] - mx[b]);
+            }
+        }
+    }
+    let Some(k) = solve4(ata, aty) else { return };
+    let gain = [Complex64::new(k[0], -k[1]), Complex64::new(k[2], -k[3])];
+    let corr: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|t| {
+            let mut th = 0.0;
+            for c in 0..2 {
+                th += (gain[c] * carrier_at(c, t) / Complex64::new(0.0, fa[c])).re;
+            }
+            let e = t.min(n - 1 - t);
+            if e < taper {
+                th *= 0.5 - 0.5 * (std::f64::consts::PI * e as f64 / taper as f64).cos();
+            }
+            let (sn, cs) = th.sin_cos();
+            v[t].re * (cs - 1.0) + v[t].im * sn
+        })
+        .collect();
+    // Only its part in the video band (`keep`, a raised-cosine edge): below,
+    // turning the video band also moves what lands on the audio carriers and
+    // the EFM, which the video never reads. Overlap-save, blocks in parallel.
+    let size = XTALK_FFT_LEN;
+    let ov = ((XTALK_OV_S * fs).round() as usize).clamp(1, size / 4);
+    let step = size - 2 * ov;
+    let (fwd, inv) = {
+        let mut planner = XTALK_FFT.get_or_init(|| Mutex::new(FftPlanner::new())).lock().unwrap();
+        (planner.plan_fft_forward(size), planner.plan_fft_inverse(size))
+    };
+    let gain_at: Vec<f64> = (0..size)
+        .map(|b| {
+            let f = b.min(size - b) as f64 * fs / size as f64;
+            let g = if f <= keep.0 {
+                0.0
+            } else if f >= keep.1 {
+                1.0
+            } else {
+                0.5 - 0.5 * (std::f64::consts::PI * (f - keep.0) / (keep.1 - keep.0)).cos()
+            };
+            g / size as f64
+        })
+        .collect();
+    out.par_chunks_mut(step).enumerate().for_each(|(blk, o)| {
+        let s0 = blk * step;
+        let mut buf: Vec<Complex64> = (0..size)
+            .map(|i| {
+                let t = (s0 + i) as isize - ov as isize;
+                if t >= 0 && (t as usize) < n { Complex64::new(corr[t as usize], 0.0) } else { zero }
+            })
+            .collect();
+        fwd.process(&mut buf);
+        for (x, g) in buf.iter_mut().zip(&gain_at) {
+            *x *= *g;
+        }
+        inv.process(&mut buf);
+        for (i, y) in o.iter_mut().enumerate() {
+            *y = (f64::from(*y) + buf[ov + i].re) as f32;
+        }
+    });
+}
+
+/// FFT plans of `cancel_crosstalk`.
+static XTALK_FFT: OnceLock<Mutex<FftPlanner<f64>>> = OnceLock::new();
+
+/// Solve the 4x4 system `a x = b` (Gaussian elimination, partial pivoting);
+/// `None` when it is singular.
+fn solve4(mut a: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
+    for c in 0..4 {
+        let p = (c..4).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs()))?;
+        if a[p][c].abs() < 1e-300 || !a[p][c].is_finite() {
+            return None;
+        }
+        a.swap(c, p);
+        b.swap(c, p);
+        for r in c + 1..4 {
+            let f = a[r][c] / a[c][c];
+            for k in c..4 {
+                a[r][k] -= f * a[c][k];
+            }
+            b[r] -= f * b[c];
+        }
+    }
+    let mut x = [0.0f64; 4];
+    for c in (0..4).rev() {
+        let mut s = b[c];
+        for k in c + 1..4 {
+            s -= a[c][k] * x[k];
+        }
+        x[c] = s / a[c][c];
+    }
+    Some(x)
+}
+
+fn compute_task(inner: &Inner, s0: u64, out: &mut [f32], v: Option<&mut [Complex64]>) -> Result<()> {
     let n = out.len();
     let m = LOCK_MARGIN;
     let len = n + 2 * m;
@@ -1249,7 +1486,7 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
         })
         .collect();
     if !inner.carrier {
-        combine_fixed(inner, &reads, m, out);
+        combine_fixed(inner, &reads, m, out, v);
         return Ok(());
     }
 
@@ -1289,6 +1526,7 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
     let (full0, hi0, cov0) = &reads[0];
     let mut acc = vec![0.0f64; n];
     let mut wsum = vec![0.0f64; n];
+    let mut vacc = vec![Complex64::new(0.0, 0.0); if v.is_some() { n } else { 0 }];
     // The primary's carrier fraction over the lock window at each sample, for
     // the others' locks.
     let mut q0 = vec![0.0f64; n];
@@ -1353,6 +1591,9 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
             let w = amp_weight(s, afl[0], wt[0]);
             acc[j - m] += full0[j] * w;
             wsum[j - m] += w;
+            if !vacc.is_empty() {
+                vacc[j - m] += hi0[j] * w;
+            }
         }
     }
     for (i, (full, hi, cov)) in reads.iter().enumerate().skip(1) {
@@ -1402,10 +1643,16 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
             let d = Complex64::new(rot.re - 1.0, rot.im);
             acc[j - m] += (full[j] + (hi[j].re * d.re - hi[j].im * d.im)) * w;
             wsum[j - m] += w;
+            if !vacc.is_empty() {
+                vacc[j - m] += rotated(hi[j], rot) * w;
+            }
         }
     }
     for (o, (a, w)) in out.iter_mut().zip(acc.iter().zip(&wsum)) {
         *o = if *w > 0.0 { (a / w) as f32 } else { 0.0 };
+    }
+    if let Some(v) = v {
+        combined_band(v, &vacc, &wsum);
     }
     Ok(())
 }
@@ -1414,17 +1661,21 @@ fn compute_task(inner: &Inner, s0: u64, out: &mut [f32]) -> Result<()> {
 /// over a LOCK_WIN window (running sums, normalized) and every input summed
 /// with its fixed `1/sigma^2` weight. The rest of each input (full minus
 /// video band) is summed as read.
-fn combine_fixed(inner: &Inner, reads: &[(Vec<f64>, Vec<Complex64>, Vec<bool>)], m: usize, out: &mut [f32]) {
+fn combine_fixed(inner: &Inner, reads: &[(Vec<f64>, Vec<Complex64>, Vec<bool>)], m: usize, out: &mut [f32], v: Option<&mut [Complex64]>) {
     let n = out.len();
     let len = n + 2 * m;
     let half = LOCK_WIN / 2;
     let (full0, hi0, cov0) = &reads[0];
     let mut acc = vec![0.0f64; n];
     let mut wsum = vec![0.0f64; n];
+    let mut vacc = vec![Complex64::new(0.0, 0.0); if v.is_some() { n } else { 0 }];
     for j in m..m + n {
         if cov0[j] {
             acc[j - m] += full0[j] * inner.weight[0];
             wsum[j - m] += inner.weight[0];
+            if !vacc.is_empty() {
+                vacc[j - m] += Complex64::new(hi0[j].re * inner.weight[0], hi0[j].im * inner.weight[0]);
+            }
         }
     }
     for (i, (full, hi, cov)) in reads.iter().enumerate().skip(1) {
@@ -1449,6 +1700,9 @@ fn combine_fixed(inner: &Inner, reads: &[(Vec<f64>, Vec<Complex64>, Vec<bool>)],
                 let d = Complex64::new(rot.re - 1.0, rot.im);
                 acc[j - m] += (full[j] + (hi[j].re * d.re - hi[j].im * d.im)) * inner.weight[i];
                 wsum[j - m] += inner.weight[i];
+                if !vacc.is_empty() {
+                    vacc[j - m] += rotated(hi[j], rot) * inner.weight[i];
+                }
             }
             continue;
         }
@@ -1470,10 +1724,29 @@ fn combine_fixed(inner: &Inner, reads: &[(Vec<f64>, Vec<Complex64>, Vec<bool>)],
             let rot = if a > 0.0 { r / a } else { Complex64::new(1.0, 0.0) };
             acc[j - m] += (full[j] + (hi[j] * (rot - 1.0)).re) * inner.weight[i];
             wsum[j - m] += inner.weight[i];
+            if !vacc.is_empty() {
+                vacc[j - m] += rotated(hi[j], rot) * inner.weight[i];
+            }
         }
     }
     for (o, (a, w)) in out.iter_mut().zip(acc.iter().zip(&wsum)) {
         *o = if *w > 0.0 { (a / w) as f32 } else { 0.0 };
+    }
+    if let Some(v) = v {
+        combined_band(v, &vacc, &wsum);
+    }
+}
+
+/// `z` turned by `rot`, as the OpenCL kernels compute it.
+#[inline]
+fn rotated(z: Complex64, rot: Complex64) -> Complex64 {
+    Complex64::new(z.re * rot.re - z.im * rot.im, z.re * rot.im + z.im * rot.re)
+}
+
+/// The combined video band from its weighted sums (audio crosstalk cancellation).
+fn combined_band(v: &mut [Complex64], vacc: &[Complex64], wsum: &[f64]) {
+    for (o, (a, &w)) in v.iter_mut().zip(vacc.iter().zip(wsum)) {
+        *o = if w > 0.0 { Complex64::new(a.re / w, a.im / w) } else { Complex64::new(0.0, 0.0) };
     }
 }
 

@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use ld_decode::opencl::{Arg, Buffer, Gpu, Kernel, Pinned, Queue};
+use rustfft::num_complex::Complex64;
 
 use crate::stack::{
     sinc_lut, Inner, Plan, CARRIER_WIN, HI_TAPS, H_LO, H_SPAN, KAPPA_LO, KAPPA_SPAN, LOCK_PRIOR, LOCK_WIN, QN_CARRIER, QN_LOCK, Q_LO, Q_ROT,
@@ -126,6 +127,17 @@ void lagged(__global const REAL2* hi, __global const uchar* cov, int t, int len,
 }
 
 #define TILE 256
+// XTALK: the combined video band as well (stack.rs combined_band), each
+// input's turned by its lock rotation.
+#ifdef XTALK
+#define VACC(z, w) vacc += (z) * (w)
+#define ROT(z, r) ((REAL2)((z).x * (r).x - (z).y * (r).y, (z).x * (r).y + (z).y * (r).x))
+#define VOUT() vout[jo] = wsum > (REAL)0 ? vacc / wsum : (REAL2)((REAL)0, (REAL)0)
+#else
+#define VACC(z, w)
+#define ROT(z, r) (z)
+#define VOUT()
+#endif
 #ifdef CARRIER_COMBINE
 // Weight every input by its carrier amplitude over LOCK_WIN samples,
 // phase-lock its video band onto the primary's over the same window (the
@@ -142,7 +154,11 @@ __kernel void combine(
     __global const uchar* cov,
     __global const REAL* weight,
     __global const REAL* afloor,
-    __global float* out)
+    __global float* out
+#ifdef XTALK
+    , __global REAL2* vout
+#endif
+    )
 {
     // Correlation, both energies and the count over the samples the input
     // shares with the primary; its own carrier terms.
@@ -155,6 +171,7 @@ __kernel void combine(
     int t0 = (int)get_group_id(0) * TILE + m - LOCK_WIN / 2;
     bool active = jo < n;
     REAL acc = (REAL)0, wsum = (REAL)0, q0 = (REAL)0, h0 = (REAL)0;
+    REAL2 vacc = (REAL2)((REAL)0, (REAL)0);
     for (int u = lid; u < TILE + LOCK_WIN; u += TILE) {
         REAL2 v;
         REAL p, k;
@@ -180,6 +197,7 @@ __kernel void combine(
             REAL w = amp_weight(s, afloor[0], weight[0]);
             acc += full[j] * w;
             wsum += w;
+            VACC(hi[j], w);
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -234,10 +252,14 @@ __kernel void combine(
             REAL2 z = hi[b + j];
             acc += (full[b + j] + (z.x * d.x - z.y * d.y)) * w;
             wsum += w;
+            VACC(ROT(z, rot), w);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (active) out[jo] = wsum > (REAL)0 ? (float)(acc / wsum) : 0.0f;
+    if (active) {
+        out[jo] = wsum > (REAL)0 ? (float)(acc / wsum) : 0.0f;
+        VOUT();
+    }
 }
 #else
 // --stack-weight fixed: phase-lock every input's video band onto the
@@ -253,7 +275,11 @@ __kernel void combine(
     __global const uchar* cov,
     __global const REAL* weight,
     __global const REAL* afloor,
-    __global float* out)
+    __global float* out
+#ifdef XTALK
+    , __global REAL2* vout
+#endif
+    )
 {
     __local REAL2 prod[TILE + LOCK_WIN];
     int lid = get_local_id(0);
@@ -262,7 +288,8 @@ __kernel void combine(
     int t0 = (int)get_group_id(0) * TILE + m - LOCK_WIN / 2;
     bool active = jo < n;
     REAL acc = (REAL)0, wsum = (REAL)0;
-    if (active && cov[j]) { acc += full[j] * weight[0]; wsum += weight[0]; }
+    REAL2 vacc = (REAL2)((REAL)0, (REAL)0);
+    if (active && cov[j]) { acc += full[j] * weight[0]; wsum += weight[0]; VACC(hi[j], weight[0]); }
     for (int i = 1; i < ni; i++) {
         int b = i * len;
         for (int u = lid; u < TILE + LOCK_WIN; u += TILE) {
@@ -284,10 +311,14 @@ __kernel void combine(
             REAL2 z = hi[b + j];
             acc += (full[b + j] + (z.x * d.x - z.y * d.y)) * weight[i];
             wsum += weight[i];
+            VACC(ROT(z, rot), weight[i]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (active) out[jo] = wsum > (REAL)0 ? (float)(acc / wsum) : 0.0f;
+    if (active) {
+        out[jo] = wsum > (REAL)0 ? (float)(acc / wsum) : 0.0f;
+        VOUT();
+    }
 }
 #endif
 "#;
@@ -296,6 +327,8 @@ struct State {
     q: Queue,
     k_read: Kernel,
     k_combine: Kernel,
+    /// Audio crosstalk cancellation: the combined video band read back.
+    vout: Buffer,
     sinc: Buffer,
     hil: Buffer,
     weight: Buffer,
@@ -332,9 +365,10 @@ impl StackGpu {
                     "-DPHASES={SINC_PHASES} -DSINC_TAPS={SINC_TAPS} -DHI_TAPS={HI_TAPS} -DLOCK_WIN={LOCK_WIN} \
                      -DCARRIER_WIN={CARRIER_WIN} -DQN_LOCK={QN_LOCK:?} -DQN_CARRIER={QN_CARRIER:?} \
                      -DLOCK_PRIOR={LOCK_PRIOR:?} -DKAPPA_LO={KAPPA_LO:?} -DKAPPA_SPAN={KAPPA_SPAN:?} \
-                     -DQ_LO={Q_LO:?} -DQ_SPAN={Q_SPAN:?} -DQ_MAX={Q_MAX:?} -DQ_ROT={Q_ROT:?} -DH_LO={H_LO:?} -DH_SPAN={H_SPAN:?} -DLAG={} {} {}",
+                     -DQ_LO={Q_LO:?} -DQ_SPAN={Q_SPAN:?} -DQ_MAX={Q_MAX:?} -DQ_ROT={Q_ROT:?} -DH_LO={H_LO:?} -DH_SPAN={H_SPAN:?} -DLAG={} {} {} {}",
                     inner.lag,
                     if inner.carrier { "-DCARRIER_COMBINE" } else { "" },
+                    if inner.xtalk.is_some() { "-DXTALK" } else { "" },
                     if inner.exact { "-DREAL=double -DREAL2=double2" } else { "-DREAL=float -DREAL2=float2" }
                 ),
                 &["read_input", "combine"],
@@ -360,6 +394,7 @@ impl StackGpu {
         let wmax = if f64 { 1.0 } else { inner.weight.iter().copied().fold(0.0, f64::max) };
         let weight: Vec<f64> = inner.weight.iter().map(|&w| w / wmax).collect();
         let state = State {
+            vout: gpu.buffer(8)?,
             sinc: constant(&sinc)?,
             hil: constant(&hil)?,
             weight: constant(&weight)?,
@@ -382,8 +417,9 @@ impl StackGpu {
         Ok(Self { ni: inner.weight.len(), f64, state: Mutex::new(state) })
     }
 
-    /// Fill `out` with plan samples `m..m + out.len()`.
-    pub(crate) fn run(&self, plan: &Plan, m: usize, out: &mut [f32]) -> Result<()> {
+    /// Fill `out` with plan samples `m..m + out.len()`, and `v` with the
+    /// combined video band there (audio crosstalk cancellation).
+    pub(crate) fn run(&self, plan: &Plan, m: usize, out: &mut [f32], v: Option<&mut [Complex64]>) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
         let (len, ni) = (plan.len, self.ni);
@@ -460,7 +496,10 @@ impl StackGpu {
             st.q.finish()?;
         }
         let t2 = std::time::Instant::now();
-        st.k_combine.args(&[
+        if v.is_some() {
+            st.vout.ensure(out.len() * 2 * rsz)?;
+        }
+        let mut args = vec![
             Arg::I32(ni as i32),
             Arg::I32(len as i32),
             Arg::I32(m as i32),
@@ -471,9 +510,28 @@ impl StackGpu {
             Arg::Buf(&st.weight),
             Arg::Buf(&st.afloor),
             Arg::Buf(&st.out),
-        ])?;
+        ];
+        if v.is_some() {
+            args.push(Arg::Buf(&st.vout));
+        }
+        st.k_combine.args(&args)?;
         st.q.launch(&st.k_combine, &[out.len()], 256)?;
         st.q.read(&st.out, 0, out)?;
+        if let Some(v) = v {
+            if self.f64 {
+                let mut b = vec![0.0f64; 2 * out.len()];
+                st.q.read(&st.vout, 0, &mut b)?;
+                for (o, c) in v.iter_mut().zip(b.chunks_exact(2)) {
+                    *o = Complex64::new(c[0], c[1]);
+                }
+            } else {
+                let mut b = vec![0.0f32; 2 * out.len()];
+                st.q.read(&st.vout, 0, &mut b)?;
+                for (o, c) in v.iter_mut().zip(b.chunks_exact(2)) {
+                    *o = Complex64::new(f64::from(c[0]), f64::from(c[1]));
+                }
+            }
+        }
         if timing {
             ld_decode::teeprintln!(
                 "STACKCL upload_us={} read_us={} combine_us={}",
