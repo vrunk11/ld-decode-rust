@@ -14,7 +14,7 @@
 //! (values: `sse2` default | `avx2fma` | `avx2`), gated on CPU features, with
 //! the active engine logged once at startup. The default path is untouched.
 
-use rustfft::num_complex::Complex64;
+use rustfft::num_complex::{Complex32, Complex64};
 use std::os::raw::c_int;
 use std::sync::OnceLock;
 
@@ -22,14 +22,17 @@ unsafe extern "C" {
     fn duccq_sse2_fft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_sse2_ifft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_sse2_rfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_sse2_rfft_f32(n: c_int, inp: *const f32, out: *mut f32);
     fn duccq_sse2_irfft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2fma_fft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2fma_ifft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2fma_rfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2fma_rfft_f32(n: c_int, inp: *const f32, out: *mut f32);
     fn duccq_avx2fma_irfft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2_fft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2_ifft(n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2_rfft(n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_avx2_rfft_f32(n: c_int, inp: *const f32, out: *mut f32);
     fn duccq_avx2_irfft(n: c_int, inp: *const f64, out: *mut f64);
     #[cfg(test)]
     fn duccq_sse2_simdlen() -> c_int;
@@ -46,6 +49,27 @@ unsafe extern "C" {
     fn duccq_sse2_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2fma_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
     fn duccq_avx2_ifft_batch_rows(k: c_int, n: c_int, inp: *const f64, out: *mut f64);
+    fn duccq_sse2_c2r_batch_rows(
+        k: c_int,
+        n: c_int,
+        inp: *const f64,
+        in_row_stride: isize,
+        out: *mut f64,
+    );
+    fn duccq_avx2fma_c2r_batch_rows(
+        k: c_int,
+        n: c_int,
+        inp: *const f64,
+        in_row_stride: isize,
+        out: *mut f64,
+    );
+    fn duccq_avx2_c2r_batch_rows(
+        k: c_int,
+        n: c_int,
+        inp: *const f64,
+        in_row_stride: isize,
+        out: *mut f64,
+    );
     fn duccq_sse2_ifft_batch_rows_ip(k: c_int, n: c_int, buf: *mut f64);
     fn duccq_avx2fma_ifft_batch_rows_ip(k: c_int, n: c_int, buf: *mut f64);
     fn duccq_avx2_ifft_batch_rows_ip(k: c_int, n: c_int, buf: *mut f64);
@@ -357,6 +381,49 @@ pub fn ifft_batch_rows_inplace(k: usize, n: usize, buf: &mut [Complex64]) {
     }
 }
 
+/// Single-precision forward real FFT -> half spectrum of `n/2+1` complex64,
+/// unnormalized.
+///
+/// This exists because `scipy.fft.fft` keeps the precision of its input: given
+/// a `float32` array it returns `complex64`, computed with a single-precision
+/// real transform. `core.py`'s `runfilter_audio_phase2` hands it a `float32`
+/// buffer whenever the field's stage-1 audio is at least `blocklen` long, so
+/// PAL's audio stage 2 transforms in single precision (NTSC's fields are
+/// shorter and take the complex128 zero-padded branch instead).
+///
+/// Replacing it with an f64 transform and rounding is not equivalent: the
+/// single-precision forward transform changes ~3% of the f32-quantised
+/// stage-2 samples by one f32 ulp, which is what makes `.pcm` differ.
+pub fn rfft_f32(x: &[f32]) -> Vec<Complex32> {
+    let n = x.len() as c_int;
+    let mut out = Vec::with_capacity(x.len() / 2 + 1);
+    // ducc writes every element of the half spectrum before returning.
+    unsafe { out.set_len(x.len() / 2 + 1) };
+    let f = rfft_f32_fn();
+    unsafe {
+        f(n, x.as_ptr(), out.as_mut_ptr() as *mut f32);
+    }
+    out
+}
+
+fn rfft_f32_fn() -> unsafe extern "C" fn(c_int, *const f32, *mut f32) {
+    #[cfg(test)]
+    {
+        if let Some(e) = TEST_OVERRIDE.with(|c| c.get()) {
+            return match e {
+                FftEngine::Sse2 => duccq_sse2_rfft_f32,
+                FftEngine::Avx2Fma => duccq_avx2fma_rfft_f32,
+                FftEngine::Avx2 => duccq_avx2_rfft_f32,
+            };
+        }
+    }
+    match active_engine() {
+        FftEngine::Sse2 => duccq_sse2_rfft_f32,
+        FftEngine::Avx2Fma => duccq_avx2fma_rfft_f32,
+        FftEngine::Avx2 => duccq_avx2_rfft_f32,
+    }
+}
+
 /// Forward real FFT -> half spectrum (len `n/2+1` complex), unnormalized.
 pub fn rfft(x: &[f64]) -> Vec<Complex64> {
     let n = x.len() as c_int;
@@ -411,6 +478,65 @@ pub fn irfft(spectrum: &[Complex64], n: usize) -> Vec<f64> {
         f_irfft(n as c_int, spectrum.as_ptr() as *const f64, out.as_mut_ptr());
     }
     out
+}
+
+/// The batch real-inverse entry point of the active engine.
+fn c2r_batch_fn() -> unsafe extern "C" fn(c_int, c_int, *const f64, isize, *mut f64) {
+    #[cfg(test)]
+    {
+        if let Some(e) = TEST_OVERRIDE.with(|c| c.get()) {
+            return match e {
+                FftEngine::Sse2 => duccq_sse2_c2r_batch_rows,
+                FftEngine::Avx2Fma => duccq_avx2fma_c2r_batch_rows,
+                FftEngine::Avx2 => duccq_avx2_c2r_batch_rows,
+            };
+        }
+    }
+    match active_engine() {
+        FftEngine::Sse2 => duccq_sse2_c2r_batch_rows,
+        FftEngine::Avx2Fma => duccq_avx2fma_c2r_batch_rows,
+        FftEngine::Avx2 => duccq_avx2_c2r_batch_rows,
+    }
+}
+
+/// Batched inverse real FFT: `k` independent half spectra held as `k`
+/// contiguous rows of `n/2+1` complex, inverted into `k` contiguous rows of `n`
+/// reals, normalized by 1/n.
+///
+/// Results are bit-identical to `k` separate [`irfft`] calls (gated by
+/// `irfft_batch_matches_scalar_transforms`) — the same pass structure and the
+/// same per-element rounding, just several transforms in flight, which is what
+/// ducc's FFT kernels vectorize across. The real inverse is only expressible
+/// out of place (see the note in `vendor/ducc_ffi.cc`), hence the separate
+/// destination buffer.
+pub fn irfft_batch_rows(k: usize, n: usize, spectra: &[Complex64], out: &mut [f64]) {
+    irfft_batch_rows_strided(k, n, spectra, n / 2 + 1, out);
+}
+
+/// [`irfft_batch_rows`] with a caller-chosen row pitch: `spectra` holds `k`
+/// rows of `n/2+1` complex at `row_stride` complex elements apart, so a kernel
+/// that keeps each half spectrum in its own full-length row can hand a strided
+/// view over instead of gathering into a contiguous buffer first.
+pub fn irfft_batch_rows_strided(
+    k: usize,
+    n: usize,
+    spectra: &[Complex64],
+    row_stride: usize,
+    out: &mut [f64],
+) {
+    debug_assert!(row_stride >= n / 2 + 1);
+    debug_assert!((k - 1) * row_stride + n / 2 + 1 <= spectra.len());
+    debug_assert_eq!(out.len(), k * n);
+    let f_batch = c2r_batch_fn();
+    unsafe {
+        f_batch(
+            k as c_int,
+            n as c_int,
+            spectra.as_ptr() as *const f64,
+            row_stride as isize,
+            out.as_mut_ptr(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +714,13 @@ mod tests {
             .collect()
     }
 
+    fn read_f32s(name: &str) -> Vec<f32> {
+        let raw = std::fs::read(data_path(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
     fn assert_same_bits(got: &[Complex64], want: &[Complex64], what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length");
         for i in 0..want.len() {
@@ -619,6 +752,45 @@ mod tests {
     /// `scipy.fft.fft` of a *real* array — what the kernel's `indata_fft` and
     /// `demod_fft` are: pocketfft computes the r2c half and reflects it, so this
     /// pins the r2c result *and* the reflection in one comparison.
+    #[test]
+    /// `scipy.fft.fft` of a **float32** array, which `runfilter_audio_phase2`
+    /// passes it on every PAL field (its stage-1 audio is longer than
+    /// `blocklen`, so `a2_in = a2_in_real` and the transform is complex64). The
+    /// golden is the full 32768-bin spectrum that scipy returns; `rfft_f32` is
+    /// the r2c half, and `audio::runfilter_audio_phase2` adds the conjugate
+    /// reflection that completes it. Bit-compared: rounding an f64 transform
+    /// to f32 is **not** the same answer (that is what made PAL's `.pcm` differ
+    /// by 1 LSB on ~0.5% of samples), so this has to pin single precision.
+    #[test]
+    fn rfft_f32_matches_scipy_32768() {
+        let x = read_f32s("rfft32768_f32_in.bin");
+        assert_eq!(x.len(), 32768);
+        let got = rfft_f32(&x);
+        let want = read_f32s("rfft32768_f32_out.bin");
+        assert_eq!(want.len(), 2 * 32768);
+        assert_eq!(got.len(), 32768 / 2 + 1);
+        for i in 0..got.len() {
+            let (want_re, want_im) = (want[2 * i], want[2 * i + 1]);
+            assert_eq!(got[i].re.to_bits(), want_re.to_bits(), "idx {i} re");
+            // Bins 0 and n/2 are mathematically real; scipy's c2c composition
+            // leaves a signed zero in the imaginary part there.
+            if i == 0 || i == 32768 / 2 {
+                assert_eq!(got[i].im, 0.0, "idx {i}: trivial bin im must be zero");
+                assert_eq!(want_im, 0.0, "idx {i}: golden trivial bin im");
+            } else {
+                assert_eq!(got[i].im.to_bits(), want_im.to_bits(), "idx {i} im");
+            }
+        }
+        // The reflection production applies must rebuild scipy's upper half
+        // exactly, in f32, before anything widens to f64.
+        for k in 1..got.len() - 1 {
+            let h = got[k];
+            let refl = (got.len() - 1) * 2 - k;
+            assert_eq!(want[2 * refl].to_bits(), h.re.to_bits(), "reflected idx {refl} re");
+            assert_eq!(want[2 * refl + 1].to_bits(), (-h.im).to_bits(), "reflected idx {refl} im");
+        }
+    }
+
     #[test]
     fn fft_real_full_matches_scipy_32768() {
         let real = read_f64s("rfft32768_in.f64");
@@ -770,6 +942,90 @@ mod tests {
     /// what remains asserted for them is that the batch is well-formed (right
     /// length, all values finite), which is all "the batching is harmless" can
     /// mean for an engine that does not reproduce the reference rounding.
+    /// The batched real inverse against the scalar `irfft` it replaces: same
+    /// order statistic of rounding, i.e. bit-identical rows.
+    #[test]
+    fn irfft_batch_matches_scalar_transforms() {
+        let n = 32768usize;
+        let half = n / 2 + 1;
+        let have_avx2 = cpu_has_avx2() && cpu_has_fma();
+        let engines: &[FftEngine] = if have_avx2 {
+            &[FftEngine::Sse2, FftEngine::Avx2, FftEngine::Avx2Fma]
+        } else {
+            &[FftEngine::Sse2]
+        };
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            ((st >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        for engine in engines {
+            TEST_OVERRIDE.with(|c| c.set(Some(*engine)));
+            let parity = engine.is_parity_reference();
+            for k in [1usize, 2, 3, 4, 6, 8] {
+                let mut x = vec![Complex64::new(0.0, 0.0); k * half];
+                for t in 0..k {
+                    for i in 0..half {
+                        let scale = 2f64.powi(((t + i % 5) as i32 % 30) - 15);
+                        x[t * half + i] = Complex64::new(next() * scale, next() * scale);
+                    }
+                }
+                let mut want = vec![0.0f64; k * n];
+                for t in 0..k {
+                    let row: Vec<Complex64> = x[t * half..(t + 1) * half].to_vec();
+                    want[t * n..(t + 1) * n].copy_from_slice(&irfft(&row, n));
+                }
+                let mut got = vec![0.0f64; k * n];
+                irfft_batch_rows(k, n, &x, &mut got);
+                let mut diff = 0usize;
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(g.is_finite(), "non-finite output");
+                    if g.to_bits() != w.to_bits() {
+                        diff += 1;
+                        if parity {
+                            assert_eq!(
+                                g.to_bits(),
+                                w.to_bits(),
+                                "batched irfft ({}) k={k} diverged at index {i}: {g:e} vs {w:e}",
+                                engine.name()
+                            );
+                        }
+                    }
+                }
+                if !parity {
+                    println!(
+                        "census: batched irfft ({}) k={k}: {diff}/{} values differ from the \
+                         scalar per-row path (expected for a 4-lane engine)",
+                        engine.name(),
+                        got.len()
+                    );
+                }
+                // The strided view the demod kernel actually uses: each half
+                // spectrum at the front of its own `blocklen`-pitch row.
+                let mut pitched = vec![Complex64::new(0.0, 0.0); k * n];
+                for t in 0..k {
+                    pitched[t * n..t * n + half].copy_from_slice(&x[t * half..(t + 1) * half]);
+                }
+                let mut got_strided = vec![0.0f64; k * n];
+                irfft_batch_rows_strided(k, n, &pitched, n, &mut got_strided);
+                for (i, (g, w)) in got_strided.iter().zip(want.iter()).enumerate() {
+                    assert!(g.is_finite(), "non-finite output");
+                    if parity {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "strided batched irfft ({}) k={k} diverged at index {i}",
+                            engine.name()
+                        );
+                    }
+                }
+            }
+        }
+        TEST_OVERRIDE.with(|c| c.set(None));
+    }
+
     #[test]
     fn ifft_batch_matches_scalar_transforms() {
         let n = 32768usize;

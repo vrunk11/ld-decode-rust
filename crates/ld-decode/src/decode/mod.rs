@@ -12,6 +12,14 @@
 
 mod audio;
 mod demodblock;
+// `--gpu`: the whole FM demodulator on an OpenCL device (`demod_gpu`, the
+// reference's arithmetic via `ducc_gpu`/`ducc_plan`) or, with `--gpu-fast`, the
+// Stockham/`atan2` path that is quicker but rounds differently. The OpenCL
+// runtime is loaded at run time, so the code is always compiled in.
+mod demod_gpu;
+mod demod_gpu_exact;
+mod ducc_gpu;
+mod ducc_plan;
 #[cfg(test)]
 mod probe_test;
 mod dropouts;
@@ -385,6 +393,43 @@ struct AssembledField {
 
 
 
+/// Non-temporal copy for the per-field assembly stage (default; `LD_ASM_ST=1`
+/// is the ordinary-store control).
+///
+/// Pure data movement: the bytes written are identical to
+/// `copy_nonoverlapping`, only the store path differs — the destination is
+/// aligned for the 32-byte streaming stores, the unaligned head/tail go through
+/// the ordinary copy, and `_mm_sfence` makes the stores visible to the tail
+/// that reads them after the parallel join.
+#[cfg(target_feature = "avx2")]
+unsafe fn stream_copy(src: *const u8, dst: *mut u8, n: usize) {
+    use std::arch::x86_64::*;
+    let misalign = (dst as usize) & 31;
+    let head = if misalign == 0 { 0 } else { 32 - misalign }.min(n);
+    if head > 0 {
+        std::ptr::copy_nonoverlapping(src, dst, head);
+    }
+    let body = (n - head) & !31;
+    let mut i = 0usize;
+    while i < body {
+        let v = _mm256_loadu_si256(src.add(head + i) as *const __m256i);
+        _mm256_stream_si256(dst.add(head + i) as *mut __m256i, v);
+        i += 32;
+    }
+    std::ptr::copy_nonoverlapping(
+        src.add(head + body),
+        dst.add(head + body),
+        n - head - body,
+    );
+    _mm_sfence();
+}
+
+/// Scalar-target fallback: always the ordinary copy.
+#[cfg(not(target_feature = "avx2"))]
+unsafe fn stream_copy(src: *const u8, dst: *mut u8, n: usize) {
+    std::ptr::copy_nonoverlapping(src, dst, n);
+}
+
 /// Per-field wall-clock accumulation for the LD_TIMING breakdown (temporary
 /// instrumentation; nanos per phase, set by decode_field/decode).
 #[derive(Clone, Copy)]
@@ -483,6 +528,32 @@ struct DbgMeta {
     vits: u64,
 }
 
+/// Demodulate a batch of blocks: the CPU pool normally, or -- with `--gpu` --
+/// the whole demodulator on the device (`demod_gpu`). A device failure falls
+/// back to the CPU kernel.
+fn demod_batch(
+    gpu: Option<&Arc<demod_gpu::Backend>>,
+    blocks: &[(u64, &[f32])],
+    mtf: f64,
+    dspec: &DemodSpecRef,
+    mtf_pow: Option<&[Complex64]>,
+    rotdelay: i64,
+) -> Vec<(u64, BlockDecode)> {
+    let Some(dev) = gpu else {
+        return blocks
+            .par_iter()
+            .map(|&(bnum, data)| {
+                (
+                    bnum,
+                    demod_block_cpu(data, mtf, dspec, true, mtf_pow, rotdelay, bnum),
+                )
+            })
+            .collect();
+    };
+    let out = gpu_demod_blocks(dev, blocks, mtf, mtf_pow, dspec, rotdelay);
+    blocks.iter().map(|b| b.0).zip(out).collect()
+}
+
 pub struct Decoder {
     spec: Arc<DecoderSpec>,
     dbg: DbgTiming,
@@ -493,6 +564,13 @@ pub struct Decoder {
     fieldinfo: Vec<FieldInfoEntry>,
     /// The last valid field, used as the previous field of the next decode.
     prevfield: Option<PrevField>,
+    /// `fieldstack[0]`: the last field that finished decoding (cleared by
+    /// nothing). The redo path of `readfield` passes this one as the previous
+    /// field, so an AGC/MTF rewind re-decodes against the last *committed*
+    /// field even when the fields in between were junk; `prevfield` cannot do
+    /// that job because an invalid field has to clear it (see its clearing
+    /// site). PAL's `determine_field_number` and `getLine0` both read it.
+    fieldstack_prev: Option<PrevField>,
     /// Line codes of the last decoded *first* field, for VBI frame decoding.
     firstfield_linecode: Option<Vec<Option<i64>>>,
     lastvalidfield: [Option<WriteableField>; 2],
@@ -552,6 +630,10 @@ pub struct Decoder {
     /// pool free for the tail's own data-parallel sections (the sinc gather),
     /// which otherwise lose half their threads to the side work.
     side_pool: Arc<rayon::ThreadPool>,
+    /// `--gpu` (the reference's arithmetic) or `--gpu-fast` (Stockham): the FM
+    /// demodulator on an OpenCL device. `None` is the CPU kernel (and the
+    /// fallback if the device fails mid-decode).
+    gpu: Option<Arc<demod_gpu::Backend>>,
     /// Memo of `MTF ** mtf_level` per mtf value (keyed by f64 bits). mtf is a
     /// slowly-varying scalar — constant for thousands of fields in steady
     /// state — and the pow spectrum is a pure function of (mtf filter, mtf),
@@ -579,14 +661,44 @@ pub struct Decoder {
 
 
 impl Decoder {
+    /// Turn on the GPU demodulator: `--gpu` (`exact`, the reference's
+    /// arithmetic) or `--gpu-fast` (Stockham, in double or single precision).
+    /// Opening the device is done eagerly so a host without OpenCL fails at
+    /// start-up with a reason instead of decoding half a disc on one path and
+    /// the rest on the other.
+    pub fn enable_gpu(&mut self, exact: bool, f64: bool) -> Result<String, String> {
+        let spec = &self.spec;
+        let dspec = DemodSpecRef::with_plans(spec.freq, spec.freq_half, spec.freq_hz, spec.blocklen, &spec.filters, &self.levels);
+        let dev = if exact {
+            demod_gpu::Backend::Exact(
+                demod_gpu_exact::GpuDemodExact::new(&dspec).map_err(|e| format!("{e:#}"))?,
+            )
+        } else {
+            demod_gpu::Backend::Fast(
+                demod_gpu::GpuDemod::new(&dspec, f64).map_err(|e| format!("{e:#}"))?,
+            )
+        };
+        let name = crate::opencl::Gpu::get().map(|g| g.name.clone()).unwrap_or_default();
+        self.gpu = Some(Arc::new(dev));
+        Ok(if exact {
+            format!("{name} (reference arithmetic)")
+        } else {
+            format!(
+                "{name} ({} precision, Stockham FFT: not byte-exact)",
+                if f64 { "double" } else { "single" }
+            )
+        })
+    }
+
     pub fn new(spec: Arc<DecoderSpec>, fdoffset: u64) -> Self {
         let output_lines = spec.output_lines();
         let bytes_per_field = spec.bytes_per_field() as f64;
         let linelen = spec.linelen;
-        let readlen = ((linelen * 350) / 16384) * 16384;
+        let readlen = if spec.sys.pal { linelen * 400 } else { ((linelen * 350) / 16384) * 16384 };
         // Read before `spec` moves into the struct: the EFM PLL clocks at the
         // input rate.
         let sample_rate_hz = spec.freq_hz;
+        let levels = CalibLevels::defaults(spec.sys);
         Self {
             spec,
             dbg: DbgTiming {
@@ -610,12 +722,13 @@ impl Decoder {
                 df_plan: 0,
                 df_new: 0,
             },
-            levels: CalibLevels::defaults(),
+            levels,
             fdoffset,
             fdoffset_frac: 0.0,
             fields_written: 0,
             fieldinfo: Vec::new(),
             prevfield: None,
+            fieldstack_prev: None,
             firstfield_linecode: None,
             lastvalidfield: [None, None],
             last_written: None,
@@ -686,6 +799,7 @@ impl Decoder {
             ),
             mtf_hist: VecDeque::from([1.0, 1.0]),
             mtf_pow_memo: Arc::new(Mutex::new(HashMap::new())),
+            gpu: None,
             pending_prefetch: None,
             metadata: None,
             output_lines,
@@ -791,7 +905,7 @@ impl Decoder {
                 *self.mtf_hist.front().unwrap_or(&self.mtf_level)
             };
             let (start, prevfield) = if let Some(redo_loc) = redo {
-                (redo_loc, self.prevfield.clone())
+                (redo_loc, self.fieldstack_prev.clone())
             } else {
                 (self.fdoffset_abs(), self.prevfield.clone())
             };
@@ -1062,6 +1176,7 @@ impl Decoder {
             // and returns without running buildmetadata, so the next field
             // sees the post-getLine0 confidence (no syncconf min yet).
             self.prevfield = Some(field.to_prevfield());
+            self.fieldstack_prev = self.prevfield.clone();
             return Ok((self.fdoffset, output));
         }
 
@@ -1071,6 +1186,7 @@ impl Decoder {
         // reads sync_confidence AFTER compute_syncconf has min'd it with the
         // line-spacing score. Snapshot here, post-buildmetadata, to match.
         self.prevfield = Some(field.to_prevfield());
+        self.fieldstack_prev = self.prevfield.clone();
         t_meta += t_m0.elapsed().as_nanos() as u64;
         let idx = usize::from(field.is_first_field());
         let luma = picture.unwrap_or_else(|| LumaOutput::Encoded(Arc::new(Vec::new())));
@@ -1339,6 +1455,7 @@ impl Decoder {
             rfhpf: Vec::new(),
             audio: [Vec::new(), Vec::new()],
             audio_pend: None,
+            audio_f32: false,
             efm: Vec::new(),
             startloc: block_begin as u64,
         };
@@ -1443,19 +1560,34 @@ impl Decoder {
             let mtf_pow: OnceLock<Option<Vec<Complex64>>> = OnceLock::new();
             let t_demod0 = std::time::Instant::now();
             self.dbg.missing_blocks = missing.len() as u64;
-            let computed: Vec<BlockDecode> = missing
-                .par_iter()
-                .map(|&(bnum, off)| {
-                    let pow = mtf_pow.get_or_init(|| {
+            let pow_ref: Option<&[Complex64]> = if missing.is_empty() {
+                None
+            } else {
+                mtf_pow
+                    .get_or_init(|| {
                         if mtf != 0.0 {
                             Some(compute_mtf_pow(&spec.filters.mtf, mtf))
                         } else {
                             None
                         }
-                    });
-                    demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pow.as_deref(), spec.delays.video_rot, bnum)
-                })
+                    })
+                    .as_deref()
+            };
+            let batch: Vec<(u64, &[f32])> = missing
+                .iter()
+                .map(|&(bnum, off)| (bnum, &data[off..off + spec.blocklen]))
                 .collect();
+            let computed: Vec<BlockDecode> = demod_batch(
+                self.gpu.as_ref(),
+                &batch,
+                mtf,
+                &dspec,
+                pow_ref,
+                spec.delays.video_rot,
+            )
+            .into_iter()
+            .map(|(_, bd)| bd)
+            .collect();
             self.dbg.demod = t_demod0.elapsed().as_nanos() as u64;
             let t_asm0 = std::time::Instant::now();
             for (&(bnum, _), bd) in missing.iter().zip(computed) {
@@ -1513,6 +1645,7 @@ impl Decoder {
                     self.dbg.df_plan = t_pf0.elapsed().as_nanos() as u64;
                     let f_mtf = mtf;
                     let memo = Arc::clone(&self.mtf_pow_memo);
+                    let gpu_arc = self.gpu.clone();
                     let (tx, rx) = std::sync::mpsc::channel();
                     // `install` (not just `spawn`) sets the thread-local pool
                     // so the inner par_iter dispatches onto the dedicated
@@ -1575,30 +1708,26 @@ impl Decoder {
                                 pf_tl_push(7, us, us, 0);
                             }
                         }
-                        let results: Vec<(u64, BlockDecode)> = inputs
-                            .into_par_iter()
-                            .enumerate()
-                            .map(|(i, (bnum, buf))| {
-                                let t_u = work_ns.as_ref().map(|_| std::time::Instant::now());
-                                let tl_a = tl_on.then(|| t_span.unwrap().elapsed().as_nanos() as u32 / 1000);
-                                let r = (bnum, demod_block_cpu(&buf, f_mtf, &dspec, true, mtf_pow.as_deref().map(|v| v.as_slice()), spec_arc.delays.video_rot, bnum));
-                                if let (Some(w), Some(t)) = (&work_ns, t_u) {
-                                    w.fetch_add(
-                                        t.elapsed().as_nanos() as u64,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                }
-                                if let Some(ta) = tl_a {
-                                    pf_tl_push(
-                                        0,
-                                        ta,
-                                        t_span.unwrap().elapsed().as_nanos() as u32 / 1000,
-                                        i,
-                                    );
-                                }
-                                r
-                            })
-                            .collect();
+                        let t_u = work_ns.as_ref().map(|_| std::time::Instant::now());
+                        let batch: Vec<(u64, &[f32])> =
+                            inputs.iter().map(|(b, v)| (*b, v.as_slice())).collect();
+                        let results: Vec<(u64, BlockDecode)> = demod_batch(
+                            gpu_arc.as_ref(),
+                            &batch,
+                            f_mtf,
+                            &dspec,
+                            mtf_pow.as_deref().map(|v| v.as_slice()),
+                            spec_arc.delays.video_rot,
+                        );
+                        if let (Some(w), Some(t)) = (&work_ns, t_u) {
+                            w.fetch_add(
+                                t.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        if let Some(ta) = tl_on.then(|| t_span.unwrap().elapsed().as_nanos() as u32 / 1000) {
+                            pf_tl_push(0, ta, t_span.unwrap().elapsed().as_nanos() as u32 / 1000, 0);
+                        }
                         if tl_on {
                             let mut rows = PF_TIMELINE.lock().unwrap().take().unwrap_or_default();
                             rows.sort_by_key(|r| r.2);
@@ -1633,12 +1762,21 @@ impl Decoder {
                     self.pending_prefetch = Some(PendingPrefetch { mtf, recv: rx });
                 } else {
                     let pf_pow = mtf_pow_memo_get(&self.mtf_pow_memo, &spec.filters.mtf, mtf);
-                    let computed: Vec<BlockDecode> = prefetch
-                        .par_iter()
-                        .map(|&(bnum, off)| {
-                            demod_block_cpu(&data[off..off + spec.blocklen], mtf, &dspec, true, pf_pow.as_deref().map(|v| v.as_slice()), spec.delays.video_rot, bnum)
-                        })
+                    let batch: Vec<(u64, &[f32])> = prefetch
+                        .iter()
+                        .map(|&(bnum, off)| (bnum, &data[off..off + spec.blocklen]))
                         .collect();
+                    let computed: Vec<BlockDecode> = demod_batch(
+                        self.gpu.as_ref(),
+                        &batch,
+                        mtf,
+                        &dspec,
+                        pf_pow.as_deref().map(|v| v.as_slice()),
+                        spec.delays.video_rot,
+                    )
+                    .into_iter()
+                    .map(|(_, bd)| bd)
+                    .collect();
                     for ((bnum, _), bd) in prefetch.into_iter().zip(computed) {
                         self.cache_insert(bnum, mtf, bd);
                     }
@@ -1667,6 +1805,7 @@ impl Decoder {
                 rfhpf: Vec::with_capacity(numblocks_read * per_block),
                 audio: [Vec::new(), Vec::new()],
                 audio_pend: None,
+                audio_f32: false,
                 efm: Vec::new(),
                 startloc: block_begin as u64,
             };
@@ -1798,8 +1937,22 @@ impl Decoder {
             // traffic slows the concurrent prefetch demod enough that the
             // exposed wait grows 1.21 -> 3.51 ms. Net loss, so it stays on the
             // global pool.
+            //
+            // Non-temporal stores (the default; `LD_ASM_ST=1` is the control):
+            // the assembly is 18 MB/field of write-once data whose readers are
+            // the serial tail a few ms later, so the RFO traffic the ordinary
+            // store path generates (a third of the traffic) buys L3 residency
+            // the working set cannot keep anyway. Measured on `.ddd.flac`
+            // `-s 300 -l 5000 -t 9`, two interleaved pairs: 46.80/47.01 ->
+            // 48.03/47.66 FPS (+2.0%), byte-identical output; s16 `-l 2000`
+            // 50.91 -> 51.48 (+1.0%).
+            let nt = std::env::var_os("LD_ASM_ST").is_none();
             all_jobs.into_par_iter().for_each(|job| unsafe {
-                std::ptr::copy_nonoverlapping(job.src, job.dst, job.nbytes);
+                if nt && job.nbytes >= 4096 {
+                    stream_copy(job.src, job.dst, job.nbytes);
+                } else {
+                    std::ptr::copy_nonoverlapping(job.src, job.dst, job.nbytes);
+                }
             });
             self.dbg.asm_extend = t_ext0.elapsed().as_nanos() as u64;
             // `df_rest` subtracts the assembly stages, so the aggregate must
@@ -1815,7 +1968,7 @@ impl Decoder {
             let ph2_audio0 = raw.video.audio[0].clone();
             let ph2_audio1 = raw.video.audio[1].clone();
             let ph2_spec = Arc::clone(&self.spec);
-            let ph2_cell: Arc<std::sync::OnceLock<Result<[Vec<f64>; 2], ()>>> =
+            let ph2_cell: Arc<std::sync::OnceLock<Result<([Vec<f64>; 2], bool), ()>>> =
                 Arc::new(std::sync::OnceLock::new());
             let ph2_cell2 = Arc::clone(&ph2_cell);
             rayon::spawn(move || {
@@ -2367,7 +2520,8 @@ impl Decoder {
                 let minute_seconds = clv_minutes * 60;
                 if let Some(clv_seconds) = self.clv_seconds {
                     // newer CLV
-                    return Some((minute_seconds + clv_seconds) * 30 + self.clv_frame_num.unwrap_or(0));
+                    let clvfps = if self.spec.sys.pal { 25 } else { 30 };
+                    return Some((minute_seconds + clv_seconds) * clvfps + self.clv_frame_num.unwrap_or(0));
                 } else {
                     self.early_clv = true;
                     return Some(minute_seconds);
@@ -2399,7 +2553,7 @@ impl Decoder {
         let blanking = ire_to_output(0.0);
         let white = ire_to_output(100.0);
         Some(DecoderMetadata {
-            system: ColorSystem::Ntsc.as_str(),
+            system: if self.spec.sys.pal { ColorSystem::Pal.as_str() } else { ColorSystem::Ntsc.as_str() },
             number_of_sequential_fields: self.fieldinfo.len(),
             field_width: self.spec.sys_outlinelen,
             sample_rate: self.spec.sys_outfreq * 1e6,
@@ -2462,4 +2616,101 @@ fn write_par_concat<T: Copy + Send + Sync>(dst: &mut Vec<T>, parts: &[&[T]]) {
         .into_par_iter()
         .zip(parts.par_iter())
         .for_each(|(d, p)| d.copy_from_slice(p));
+}
+
+/// Values whose f32 bit patterns differ, and the largest ULP distance between
+/// the two sequences (NaN payloads are not compared as numbers; the decoder's
+/// channels never carry one).
+fn ulp_span(a: &[f32], b: &[f32]) -> (usize, u32) {
+    fn ordered(bits: u32) -> i64 {
+        if bits >> 31 == 0 {
+            i64::from(bits)
+        } else {
+            -i64::from(bits & 0x7fff_ffff)
+        }
+    }
+    let mut n = 0usize;
+    let mut worst = 0u32;
+    for (x, y) in a.iter().zip(b) {
+        if x.to_bits() != y.to_bits() {
+            n += 1;
+            worst = worst.max((ordered(x.to_bits()) - ordered(y.to_bits())).unsigned_abs().min(u32::MAX as u64) as u32);
+        }
+    }
+    (n, worst)
+}
+
+/// `n/ulp` as the `LD_GPU_CHECK` line prints it.
+fn fmt_span((n, ulp): (usize, u32)) -> String {
+    if n == 0 {
+        "0".to_string()
+    } else {
+        format!("{n}/{ulp}ulp")
+    }
+}
+
+/// Demodulate `blocks` on the GPU. A GPU failure falls back to the CPU kernel
+/// (once reported); `LD_GPU_CHECK` also runs the CPU kernel and logs how far
+/// apart the two are -- per block, and only when they are not bit-identical
+/// (`n/ulp`: how many samples moved and by how many f32 units).
+fn gpu_demod_blocks(
+    gpu: &demod_gpu::Backend,
+    blocks: &[(u64, &[f32])],
+    mtf: f64,
+    pow: Option<&[Complex64]>,
+    dspec: &DemodSpecRef,
+    rotdelay: i64,
+) -> Vec<BlockDecode> {
+    let cpu = || -> Vec<BlockDecode> {
+        blocks.par_iter().map(|&(bnum, d)| demod_block_cpu(d, mtf, dspec, true, pow, rotdelay, bnum)).collect()
+    };
+    let out = match gpu.demod(blocks, mtf, pow, rotdelay, dspec) {
+        Ok(v) => v,
+        Err(e) => {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("GPU demod failed, using the CPU: {e:#}");
+            }
+            return cpu();
+        }
+    };
+    if std::env::var_os("LD_GPU_CHECK").is_some() {
+        let reference = cpu();
+        for (i, (g, c)) in out.iter().zip(&reference).enumerate() {
+            let d = ulp_span(&g.video.demod, &c.video.demod);
+            let d05 = ulp_span(&g.video.demod_05, &c.video.demod_05);
+            let dburst = ulp_span(&g.video.demod_burst, &c.video.demod_burst);
+            let draw = ulp_span(&g.video.demod_raw, &c.video.demod_raw);
+            let drf = ulp_span(&g.rfhpf, &c.rfhpf);
+            let efm = g
+                .video
+                .efm
+                .iter()
+                .zip(&c.video.efm)
+                .map(|(x, y)| (i32::from(*x) - i32::from(*y)).unsigned_abs())
+                .max()
+                .unwrap_or(0);
+            let aud = ulp_span(&g.video.audio[0], &c.video.audio[0]);
+            // Only the blocks that are not bit-identical are worth a line: a
+            // silent "0 everywhere" per block buries the one block that moved.
+            // Parenthesised on purpose: in Rust `|` binds tighter than `!=`
+            // (the opposite of C), so without them this would still be right --
+            // but it reads wrong.
+            if (d.0 | d05.0 | dburst.0 | draw.0 | drf.0 | efm as usize | aud.0) != 0 {
+                crate::teeprintln!(
+                    "GPUCHECK block {} len {}: demod {} | 05 {} | burst {} | raw {} | rfhpf {} | efm {} | audio {}",
+                    blocks.get(i).map(|b| b.0).unwrap_or(i as u64),
+                    g.video.demod.len(),
+                    fmt_span(d),
+                    fmt_span(d05),
+                    fmt_span(dburst),
+                    fmt_span(draw),
+                    fmt_span(drf),
+                    efm,
+                    fmt_span(aud),
+                );
+            }
+        }
+    }
+    out
 }

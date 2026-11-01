@@ -128,6 +128,27 @@ void FN(rfft)(int n, const double *in, double *out) {
   catch (...) { duccq_fail("unknown", "rfft"); }
 }
 
+// Forward real FFT in SINGLE precision -> half spectrum (n/2+1 complex64).
+//
+// `scipy.fft.fft` keeps the precision of its input, so a float32 array comes
+// back complex64 -- and for a real input it takes the real-transform path
+// (`r2c` of the first half plus conjugate reflection), not a complex `c2c` of
+// the same values: measured on the decoder's own audio buffer, that
+// construction reproduces `scipy.fft.fft(float32)` 32768/32768 bins while
+// `c2c<float>` matches only 129. Reference use: core.py's
+// `runfilter_audio_phase2` takes `a2_in = a2_in_real` (float32) whenever the
+// field's stage-1 audio is at least `blocklen` long -- which is every PAL
+// field (34685 samples) and no NTSC one (~20850) -- so PAL's audio stage 2
+// runs its forward transform in single precision and NTSC's in double.
+void FN(rfft_f32)(int n, const float *in, float *out) {
+  try {
+    cfmav<float> rin(in, shape_t{(size_t)n});
+    vfmav<complex<float>> cout((complex<float>*)out, shape_t{(size_t)(n/2+1)});
+    r2c(rin, cout, 0, FORWARD, 1.0f, 1);
+  } catch (const std::exception &e) { duccq_fail(e.what(), "rfft_f32"); }
+  catch (...) { duccq_fail("unknown", "rfft_f32"); }
+}
+
 // Inverse real FFT: half spectrum (n/2+1 complex) in, n real out. fct=1/n.
 void FN(irfft)(int n, const double *in, double *out) {
   try {
@@ -202,30 +223,46 @@ void FN(ifft_batch_rows_ip)(int k, int n, double *buf) {
   }
 }
 
-// NOTE (7.4.0 port): there is deliberately no batched *real* inverse entry
-// here, although the 7.4.0 demod kernel inverts three half spectra per block
-// (the dropout-detection RF highpass and the two delayed video channels) and
-// batching is what makes the complex path 1.83x faster per transform. (EFM is
-// *not* one of them: 7.4.0 left it on the full complex `ifft` with a full-length
-// `Fefm`, so it stays in the batched complex group.)
+// Batched inverse real FFT: `k` independent half spectra (each `n/2+1`
+// complex, contiguous rows) inverted together into `k` contiguous rows of `n`
+// reals, normalized by 1/n.
 //
-// ducc's in-place `c2r` cannot express the layout it would need. Its
-// `sanity_check_cr` requires, on every non-transform axis,
-// `ar.stride == 2*ac.stride` (counted in each view's own element size), and on
-// the transform axis a stride of 1 for *both* views. For `k` rows of `n/2+1`
-// complex in and `n` real out that is unsatisfiable: a contiguous real row
-// (stride 1) is `n` doubles from the next row, so the complex rows would need a
-// stride of `n/2`, overlapping each row's last element with the next row's
-// first. Measured: the closest expressible layout prints "stride on
-// halfcomplex axis must be 1" and then silently computes garbage (a DC-only
-// spectrum inverts to 1.0 instead of 1/n).
+// This is the real-transform counterpart of `ifft_batch_rows`, and it is only
+// expressible *out of place*: ducc's `sanity_check_cr` requires
+// `ar.stride == 2*ac.stride` on every non-transform axis when the two views
+// alias, which `k` rows of `n/2+1` complex -> `k` rows of `n` real cannot
+// satisfy in one buffer (the real row is `n` doubles from the next, so the
+// complex rows would need a stride of `n/2`; the closest expressible aliased
+// layout prints "stride on halfcomplex axis must be 1" and then silently
+// computes garbage). A separate output buffer lifts that check entirely.
 //
-// The out-of-place `c2r` has no such constraint, so a batch entry is possible
-// by giving it a separate output buffer -- `ifft_batch_rows` is exactly that
-// shape for the complex case. That is a real, worth-measuring follow-up, but it
-// was not taken here: the Rust kernel calls the scalar `irfft` once per
-// half-spectrum row, which is bit-identical to the reference's own call by
-// construction.
+// Same `force_simul_batch` opt-in as the complex batch: without it the
+// multi-transform machinery sets `n_simul = 1` for long transforms and the
+// call costs what a scalar `irfft` costs.
+// `in_row_stride` is the caller's row pitch in complex elements (it may exceed
+// `n/2+1`: the Rust kernel keeps each spectrum in a `blocklen`-pitch row, and a
+// strided view reads it without a gather). The output rows are contiguous.
+void FN(c2r_batch_rows)(int k, int n, const double *in, ptrdiff_t in_row_stride, double *out) {
+  try {
+    duccq_engine_probe("c2r_batch_rows");
+    force_simul_batch() = true;
+    shape_t shp{ (size_t)k, (size_t)(n/2+1) };
+    stride_t strd{ in_row_stride, 1 };
+    cfmav<complex<double>> cin((complex<double>*)in, shp, strd);
+    shape_t shpo{ (size_t)k, (size_t)n };
+    stride_t strdo{ (ptrdiff_t)n, 1 };
+    vfmav<double> cout(out, shpo, strdo);
+    c2r(cin, cout, shape_t{1}, BACKWARD, 1.0/double(n), 1);
+    force_simul_batch() = false;
+  } catch (const std::exception &e) {
+    force_simul_batch() = false;
+    duccq_fail(e.what(), "c2r_batch_rows");
+  }
+  catch (...) {
+    force_simul_batch() = false;
+    duccq_fail("unknown", "c2r_batch_rows");
+  }
+}
 
 } // extern "C"
 

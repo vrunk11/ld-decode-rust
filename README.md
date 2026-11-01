@@ -1,32 +1,42 @@
 # ld-decode-rust
 
 A from-scratch Rust port of the NTSC LaserDisc RF decoder from
-[ld-decode](https://github.com/happycube/ld-decode) 7.4.0, byte-identical on
-`.tbc`/`.pcm`/`.efm`.
+[ld-decode](https://github.com/happycube/ld-decode) 7.4.0, byte-identical to the
+Python original on `.tbc`, `.pcm` and `.efm`.
 
-The goal is not "a decoder that produces similar pictures". The goal is a
-decoder that produces **byte-identical output files** to the Python original:
-same `.tbc` luma, same `.pcm` audio, same `.efm` digital-audio bits, same
-`.tbc.json` metadata. Any change is measured against that bar, and a change that
-moves a single byte is a bug, not a rounding detail. Speed is the reason the port
-exists; parity is the constraint it is built under.
+The goal is not "a decoder that produces similar pictures" but one that produces
+**byte-identical output files**: the same `.tbc` luma, the same `.pcm` audio, the
+same `.efm` digital-audio bits, the same `.tbc.json` metadata. Every change is
+measured against that bar, and a change that moves a single byte is a bug, not a
+rounding detail. Speed is the reason the port exists; parity is the constraint it
+is built under.
 
 ## What it does today
 
-- **NTSC only.** PAL is deliberately not ported: it needs pilot-based lineloc
-  refinement, a different V4300D notch and different field constants, and none
-  of it has been verified. The code assumes NTSC.
-- **Byte-parity verified end-to-end** on five full-disc paths:
-  - `s16` capture (168,800 fields) — 4/4 outputs identical,
-  - `.ddd.flac` from frame 300 (168,566 fields) — 4/4 outputs identical,
-  - Pioneer GGV1069 `.ldf` (50,722 fields) — 4/4 outputs identical to the
-    Python **7.4.0** release,
-  - Diamond Time CLV `.ldf` (71,710 fields) — 4/4 outputs identical,
-  - GGV1016 CAV `.ldf` (108,576 fields) — 4/4 outputs identical, JSON included.
-- **Roughly 9–20x faster than the Python reference.** About 46 FPS for raw
-  `s16` (`-t 8`) and ~45 FPS for `.ldf` (`-t 10`/`11`) on a Ryzen 7 5800X3D
-  (10,000-field window), against ~2–5 FPS for Python 3.12 + numpy + scipy on the
-  same box; the full GGV1069 `.ldf` takes 575 s (44.1 FPS). FPS is only
+- **NTSC and PAL are both byte-parity targets.** PAL (`--PAL`/`-p`) is ld-decode
+  7.4's `FieldPAL`: pilot-based lineloc refinement, 312/313-line fields,
+  burst-phase field numbering, PAL dropout thresholds, the PAL filter bank and
+  audio carriers, and PAL VITS metrics. Its full-disc byte parity is part of the
+  verified list below; the one PAL option not ported is
+  `--V4300D_notch_filter`.
+- **Byte-parity verified end-to-end** on six full-disc paths:
+  - `s16` capture (168,800 fields) — 4/4 outputs identical.
+  - `.ddd.flac` from frame 300 (168,566 fields) — 4/4 outputs identical.
+  - Pioneer GGV1069 `.ldf` (50,722 fields) — 4/4 outputs identical.
+  - Diamond Time CLV `.ldf` (71,710 fields) — 4/4 outputs identical.
+  - GGV1016 CAV `.ldf` (108,576 fields) — 4/4 outputs identical.
+  - GGV1011 CAV **PAL** side 1 `.ldf` (48,260 fields) — 4/4 outputs identical,
+    `.tbc.db` content-identical in every table.
+- **Roughly 9–20x faster than the Python reference.** About 46 FPS for raw `s16`
+  (`-t 8`) and ~45 FPS for `.ldf` (`-t 10`/`11`) on a Ryzen 7 5800X3D over a
+  10,000-field window, against ~2–5 FPS for Python 3.12 + numpy + scipy on the
+  same box. The full GGV1069 `.ldf` takes 575 s (44.1 FPS). **PAL is a little
+  slower:** the full GGV1011 PAL side 1 takes 753 s (32.0 FPS at the default
+  thread count), because a PAL field carries ~20% more pixels and its
+  pilot-based lineloc refinement and burst-phase field numbering add transforms
+  per field. With `--gpu` the whole demodulator runs on an OpenCL device
+  instead: ~62 FPS on a 400-frame window that does 46 on the CPU, and ~48 FPS
+  single-threaded against 10 — see [GPU speeds](#gpu-speeds). FPS is only
   meaningful with the machine otherwise idle and the output disk not full.
 - Produces `.tbc`, `.tbc.json`, `.pcm`, `.efm` and `.tbc.db`, plus a `.log` that
   mirrors the console output.
@@ -39,7 +49,8 @@ runtime dependency is `ffmpeg` for the FLAC-family inputs.
 
 Prerequisites:
 
-- Rust **nightly** (`rustup toolchain install nightly-2026-08-29`).
+- Rust **nightly** (`rustup toolchain install nightly-2026-10-29`, the
+  toolchain CI and the release artifacts are built with).
 - A C++17 compiler for the vendored ducc0 FFT (`build.rs`):
   - **Windows**: the MSVC toolchain plus LLVM's `clang-cl` on `PATH`.
   - **Linux**: `clang++` (preferred) or `g++`, and the C++ standard library
@@ -98,12 +109,60 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--no-dod` | off | Disable dropout detection. |
 | `--ntsc-color-notch` | off | Notch filter on the decoded video, reduces colour wobble. |
 | `--lowband` | off | Lower-bandwidth (lowband) decode settings. |
+| `--gpu` | off | Run the whole FM demodulator on an OpenCL device, bit-identical to the CPU kernel. See [GPU demodulation](#gpu-demodulation). |
+| `--gpu-fast` | off | The quicker, differently-rounded GPU demodulator; not bit-exact. See below. |
+| `--gpu-precision <p>` | `double` | `single` runs the `--gpu-fast` demodulator in f32: faster on consumer cards with little f64 throughput, further from the reference. `--gpu` is always double. |
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
 
 Short flags are the reference's exactly: `-t` is threads and `-j` is NTSC-J
 (`-j` was `--threads` in this port before 2026-10-17, so older command lines
 need `-t`).
+
+### GPU demodulation
+
+`--gpu` runs the whole FM demodulator on an OpenCL device (the driver's OpenCL
+runtime, loaded at start-up; nothing to install or link), with the reference's
+arithmetic: every transform runs ducc's own 1-D plan (`decode/ducc_plan.rs`,
+encoded as OpenCL), and the discriminator runs a device port of the UCRT `atan2`.
+The output is therefore byte-identical to the CPU kernel and to Python 7.4.0 —
+verified on the full 168,566-field sideA disc, all three bit-compared outputs. A
+block whose `atan2` operand falls outside the port's covered class is recomputed
+by the CPU kernel, so a declined operand cannot change a byte.
+`LD_GPU_CHECK=1` runs the CPU kernel alongside and logs only the blocks that are
+not bit-identical, as `n/ulp` per channel. A device failure falls back to the CPU
+for that batch.
+
+`--gpu-fast` is the quicker, differently-rounded path: a radix-8 Stockham FFT
+instead of ducc's pass tree, and the device's `atan2` instead of the UCRT port,
+so the f64 values differ in their last bits. On a 50,722-field NTSC disc
+(24.3 GB `.tbc`) that comes to **1 byte** — one pixel, 1 LSB, at field 4326 —
+with `.pcm`, `.efm`, `.tbc.json` and every `.tbc.db` table identical. The two
+kernels disagree on ~1 sample per 10⁸–10⁹ by exactly 1 ulp of f32 (20 `demod`,
+31 `demod_raw`, 19 `demod_05`, 680 `demod_burst` in 13,000 fields), and the
+16-tap downscale absorbs all but ~1 in 80 of those.
+
+### GPU speeds
+
+Measured on a Ryzen 7 5800X3D with an AMD Radeon RX 9070 XT, 400-frame
+NTSC `.ldf` window (`-s 1000 -l 400`, 800 fields), two interleaved runs each:
+
+| mode | FPS | against CPU |
+| --- | --- | --- |
+| CPU, default threads (10 demod) | 46.2 | — |
+| `--gpu` (bit-exact) | 61.7 | +33% |
+| `--gpu-fast` | 63.4 | +37% |
+| CPU, `-t 1` | 10.1 | — |
+| `--gpu -t 1` | 48.0 | +4.8x |
+
+The full 168,566-field sideA `.ddd.flac` disc reads the same way: 1,816 s on the
+CPU (46.4 FPS), 1,390 s with `--gpu` (60.6) and 1,320 s with `--gpu-fast`
+(63.9). The gain grows as the CPU is thread-starved, because the whole
+demodulator leaves the pool — a single-threaded decode is nearly five times
+quicker on the device, and `--gpu -t 1` still beats a ten-thread CPU run.
+`--gpu-fast` is only ~3–5% above the bit-exact mode. Both GPU modes need an
+OpenCL device with `fp64`; `--gpu-precision single` applies to `--gpu-fast`
+only and helps consumer cards with little f64 throughput.
 
 ## Input formats
 
@@ -161,7 +220,7 @@ is in its reference configuration.
 | --- | --- |
 | `LD_FFT_ENGINE=sse2\|avx2fma\|avx2` | Pick one of the three ducc0 builds linked into the binary. **`sse2` is the default and the only parity-safe choice**: the AVX2 engines evaluate a different, differently-rounded sequence and are not bit-exact, so they are for experiments only. The engine in use is logged at startup. |
 | `LD_NO_FFMPEG=1` | Decode `.flac` and Ogg `.ldf` with claxon instead of `ffmpeg`. Bit-identical but slower (the demod pool starves on claxon's throughput), so `ffmpeg` stays the default. |
-| `LD_PF_POOL=n`, `LD_SIDE_POOL=n` | Override the demod/side worker pool split. Both optima are measured and closed. |
+| `LD_PF_POOL=n`, `LD_SIDE_POOL=n`, `LD_TAIL_THREADS=n` | Override the three pool sizes: prefetch demod, side work (dropout/audio), and the global pool that runs the serial tail. All three optima are measured and closed — `LD_TAIL_THREADS` exists as the instrument for re-sweeping the split (e.g. after a change like `--gpu` that moves work off the pool), not as a tuning knob: the tail floors at ~7.7 ms with 8 threads while the default 2 already yields the best FPS. |
 | `LD_START_SAMPLE=n` | Start at an absolute sample instead of a frame. |
 | `LD_NO_ASYNC_PREFETCH=1`, `LD_NO_DOD_PRE=1` | Disable the async demod prefetch and the dropout pre-pass. |
 | `LD_PLLSPEC=1` | Print the EFM-PLL speculation commit/fallback counters. |
@@ -187,7 +246,7 @@ the sinc LUT, the batched inverse FFT against the scalar form it replaced, and
 the EFM PLL against the reference's own T-value stream. The goldens are **one
 committed set for both platforms** (the Windows scipy values are the target), so
 the suite needs no Python and runs unchanged on Windows and Linux. Expect
-**56 passed, 3 ignored, 0 failures**:
+**64 passed, 6 ignored, 0 failures**:
 
 - `pll_matches_stock_field_stream` replays the reference PLL's input from a
   committed synthetic fixture (`tests/data/pll_seg*`, generated by

@@ -17,7 +17,7 @@ use crate::optimized::{
     sinc_lut,
     SincScaleParams,
 };
-use crate::spec::{CalibLevels, DecoderSpec, SYS_HZ_IRE, SYS_IRE0};
+use crate::spec::{CalibLevels, DecoderSpec};
 
 // Vblank state machine states (matching the Python HSYNC..EQPL2 order).
 pub(crate) const STATE_HSYNC: u8 = 0;
@@ -58,6 +58,8 @@ pub(crate) struct PrevField {
     pub outlinecount: usize,
     pub phase_adjust_median: f64,
     pub field_phase_id: i64,
+    /// PAL: the burst phase adjustments of lines 7, 11, 15, 19.
+    pub pal_phase_adjust: [f64; 4],
     /// TBC picture of the previous field (for 3D comb metrics).
     pub dspicture: Arc<Vec<u16>>,
     pub out_scale: f64,
@@ -119,7 +121,13 @@ pub(crate) struct FieldData {
     /// carries `Ok(audio2)` or `Err(())` on worker panic; `downscale` waits
     /// for it before the audio resample. `OnceLock` keeps `Field` `Sync` so
     /// the existing `rayon::join`/`par_iter` borrows stay legal.
-    pub audio_pend: Option<Arc<std::sync::OnceLock<Result<[Vec<f64>; 2], ()>>>>,
+    ///
+    /// The `bool` is "stage 2 stored through Python's f32 slow path": the audio
+    /// downscale's `nb_mean` must then accumulate in f32 (see
+    /// `audio::downscale_audio_to_output`).
+    pub audio_pend: Option<Arc<std::sync::OnceLock<Result<([Vec<f64>; 2], bool), ()>>>>,
+    /// Whether `audio` holds f32-quantised values (Python's slow path).
+    pub audio_f32: bool,
     /// EFM equalised signal (i16), for the .efm output.
     pub efm: Vec<i16>,
     pub startloc: u64,
@@ -160,6 +168,9 @@ pub(crate) struct Field {
     pub is_first_field: Option<bool>,
     pub needrerun: bool,
     pub skipdetected: bool,
+    /// PAL: the burst phase adjustments of lines 7, 11, 15, 19 (seeds the
+    /// next field's).
+    pub pal_phase_adjust: [f64; 4],
     pub phase_adjust_median: f64,
     pub field_phase_id: i64,
     pub burstmedian: f64,
@@ -351,9 +362,45 @@ pub(crate) fn calczc(
     }
 }
 
+/// The f32 threshold equivalent to the f64 predicate `f64::from(x) > high`.
+///
+/// The scan in [`findpulses`] compares every sample against `high` as f64,
+/// which costs a widen per sample. Because f32 -> f64 is exact and strictly
+/// order-preserving, `f64::from(x) > high` is *exactly* `x > t` when `t` is the
+/// **largest** f32 with `f64::from(t) <= high`: any `x > t` is at least the next
+/// f32 above `t`, which by construction exceeds `high`; and any `x <= t` cannot
+/// exceed it. NaN is neither `> t` nor `<= t`, matching the f64 comparison's
+/// unordered result, which is what leaves the pulse state unchanged on NaN.
+///
+/// So hoisting the comparison into f32 changes no decision, only its width.
+fn f32_threshold(high: f64) -> f32 {
+    debug_assert!(!high.is_nan(), "pulse threshold must not be NaN");
+    let t = high as f32;
+    if t.is_nan() || f64::from(t) <= high {
+        return t;
+    }
+    // One f32 step toward -inf: `bits - 1` for positive values, `bits + 1` for
+    // negative ones (the sign bit puts the magnitude order backwards).
+    let bits = t.to_bits();
+    let down = if t > 0.0 {
+        bits - 1
+    } else if t < 0.0 {
+        bits + 1
+    } else {
+        // `t` is a zero: `f64::from(t) > high` means `high < 0`, and the next
+        // value below either zero is the negative subnormal closest to it.
+        0x8000_0001
+    };
+    f32::from_bits(down)
+}
+
 /// Port of `findpulses_numba_raw` + `findpulses`: locate pulses by looking at
 /// areas of `sync_ref` below `high`.
-pub(crate) fn findpulses(sync_ref: &[f32], high: f64) -> Vec<Pulse> {
+///
+/// The run boundaries are the only thing the state machine reacts to, so this is
+/// the scalar form of that machine — kept as the reference the vector path is
+/// differentially tested against, and used verbatim on targets without AVX2.
+pub(crate) fn findpulses_scalar(sync_ref: &[f32], high: f64) -> Vec<Pulse> {
     let mut in_pulse = sync_ref.first().map_or(false, |&v| f64::from(v) <= high);
     let mut starts = Vec::new();
     let mut lengths = Vec::new();
@@ -383,6 +430,96 @@ pub(crate) fn findpulses(sync_ref: &[f32], high: f64) -> Vec<Pulse> {
         .zip(lengths)
         .map(|(start, len)| Pulse { start, len })
         .collect()
+}
+
+/// [`findpulses_scalar`], with the sample scan done 16 at a time.
+///
+/// `compute_linelocs` runs this over the whole field's `demod_05` (~665k
+/// samples) on the *serial* tail, where it was **1.24 ms/field** — the largest
+/// single serial item left now that the demod pool runs ahead of the tail
+/// (`pffold` 0.63 ms). The state machine only changes state on a threshold
+/// crossing, so each 16-sample chunk becomes two bitmasks and the transitions
+/// are read out of them with `trailing_zeros`; the pulse bookkeeping is then
+/// identical arithmetic on identical indices, and the tail (< 16 samples) runs
+/// the scalar loop. See [`f32_threshold`] for why the compare may be f32.
+pub(crate) fn findpulses(sync_ref: &[f32], high: f64) -> Vec<Pulse> {
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        findpulses_scalar(sync_ref, high)
+    }
+    #[cfg(target_feature = "avx2")]
+    {
+        use core::arch::x86_64::*;
+        let n = sync_ref.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let t = f32_threshold(high);
+        let mut starts: Vec<f64> = Vec::new();
+        let mut lengths: Vec<f64> = Vec::new();
+        let mut cur_start = 0usize;
+        let mut in_pulse = sync_ref[0] <= t;
+        let mut pos = 0usize;
+        unsafe {
+            let tv = _mm256_set1_ps(t);
+            while pos + 16 <= n {
+                let p = sync_ref.as_ptr().add(pos);
+                let a = _mm256_loadu_ps(p);
+                let b = _mm256_loadu_ps(p.add(8));
+                // Bit k set = sample pos+k is above `t` (resp. at/below it).
+                // NaN sets neither bit, exactly like the f64 predicates.
+                let mut g = (_mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GT_OQ>(a, tv)) as u32)
+                    | ((_mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GT_OQ>(b, tv)) as u32) << 8);
+                let mut l = (_mm256_movemask_ps(_mm256_cmp_ps::<_CMP_LE_OQ>(a, tv)) as u32)
+                    | ((_mm256_movemask_ps(_mm256_cmp_ps::<_CMP_LE_OQ>(b, tv)) as u32) << 8);
+                loop {
+                    // Only one kind of event can matter in the current state,
+                    // so an empty mask for that kind ends the chunk.
+                    let mask = if in_pulse { g } else { l };
+                    if mask == 0 {
+                        break;
+                    }
+                    let k = mask.trailing_zeros();
+                    if in_pulse {
+                        let length = pos + k as usize - cur_start;
+                        if length <= 5000 && cur_start != 0 {
+                            starts.push(cur_start as f64);
+                            lengths.push(length as f64);
+                        }
+                        in_pulse = false;
+                    } else {
+                        cur_start = pos + k as usize;
+                        in_pulse = true;
+                    }
+                    // k <= 15, so the shift is in range.
+                    let keep = u32::MAX << (k + 1);
+                    g &= keep;
+                    l &= keep;
+                }
+                pos += 16;
+            }
+        }
+        for (off, &value) in sync_ref[pos..].iter().enumerate() {
+            if in_pulse {
+                if value > t {
+                    let length = pos + off - cur_start;
+                    if length <= 5000 && cur_start != 0 {
+                        starts.push(cur_start as f64);
+                        lengths.push(length as f64);
+                    }
+                    in_pulse = false;
+                }
+            } else if value <= t {
+                cur_start = pos + off;
+                in_pulse = true;
+            }
+        }
+        starts
+            .into_iter()
+            .zip(lengths)
+            .map(|(start, len)| Pulse { start, len })
+            .collect()
+    }
 }
 
 fn median_f32(values: &mut [f32]) -> f32 {
@@ -483,6 +620,7 @@ impl Field {
             needrerun: false,
             skipdetected: false,
             phase_adjust_median: 0.0,
+            pal_phase_adjust: [0.0; 4],
             field_phase_id: 1,
             burstmedian: 0.0,
             linecode: vec![None; 3],
@@ -498,8 +636,10 @@ impl Field {
     }
 
     fn update_out_scale(&mut self) {
-        // NTSC: (0xC800 - 0x0400) / (100 - vsync_ire)
-        self.out_scale = (51200.0 - 1024.0) / (100.0 - self.levels.vsync_ire);
+        // (output_white - output_black) / (100 - vsync_ire); the codes are
+        // NTSC 0xC800 / 0x0400, PAL 0xD300 / 0x0100.
+        let (white, black) = if self.spec.sys.pal { (54016.0, 256.0) } else { (51200.0, 1024.0) };
+        self.out_scale = (white - black) / (100.0 - self.levels.vsync_ire);
     }
 
     pub fn is_first_field(&self) -> bool {
@@ -521,6 +661,7 @@ impl Field {
             outlinecount: self.outlinecount,
             phase_adjust_median: self.phase_adjust_median,
             field_phase_id: self.field_phase_id,
+            pal_phase_adjust: self.pal_phase_adjust,
             dspicture: Arc::new(std::mem::take(&mut self.dspicture)),
             out_scale: self.out_scale,
         }
@@ -1053,9 +1194,12 @@ impl Field {
 
     #[allow(dead_code)]
     fn get_vblank_length(&self, is_first_field: bool) -> f64 {
-        let _ = is_first_field;
-        // NTSC
-        self.spec.sys_num_pulses as f64 * 3.0 * 0.5 + 1.0
+        let core = self.spec.sys_num_pulses as f64 * 3.0 * 0.5;
+        if self.spec.sys.pal {
+            core + 0.5 + if is_first_field { 0.0 } else { 1.0 }
+        } else {
+            core + 1.0
+        }
     }
 
     /// Port of `processVBlank`.
@@ -1153,12 +1297,22 @@ impl Field {
             let gap1 = validpulses[firstblank].start - validpulses[firstblank - 1].start;
             let gap2 = validpulses[lastblank + 1].start - validpulses[lastblank].start;
 
-            // NTSC only.
-            if inrange(
-                (gap2 + gap1).abs(),
-                self.inlinelen as f64 * 1.4,
-                self.inlinelen as f64 * 1.6,
-            ) {
+            if self.spec.sys.pal && inrange((gap2 - gap1).abs(), 0.0, self.spec.freq) {
+                let isfirstfield = inrange(gap1 / self.inlinelen as f64, 0.45, 0.55);
+                return (
+                    Some(validpulses[firstblank - 1].start),
+                    Some(isfirstfield),
+                    Some(firstblank),
+                    50,
+                );
+            }
+            if !self.spec.sys.pal
+                && inrange(
+                    (gap2 + gap1).abs(),
+                    self.inlinelen as f64 * 1.4,
+                    self.inlinelen as f64 * 1.6,
+                )
+            {
                 let isfirstfield = inrange(gap1 / self.inlinelen as f64, 0.95, 1.05);
                 return (
                     Some(validpulses[firstblank - 1].start),
@@ -1392,12 +1546,23 @@ impl Field {
         }
         self.is_first_field = is_first_field;
 
+        // `compute_linelocs` hard-codes the NTSC field heights here (263/262)
+        // even for PAL, and `FieldPAL.process` only overwrites them with
+        // 312/313 *after* `calc_burstmedian` has run. That matters: PAL's
+        // `get_burstlevel` -> `lineslice` -> `get_linelen` branches on
+        // `line >= linecount + lineoffset`, so during the burst median the
+        // reference uses the backwards difference for lines >= 262 rather
+        // than the neighbour midpoint. Using `sys_field_lines` (313) took the
+        // midpoint branch for every line and moved the slice bounds by one
+        // sample on the handful of lines whose slice start lands within ~1e-3
+        // of an integer, which flips those burst levels by ~1000 raw units
+        // and the field's median by 0.006 IRE.
         self.linecount = Some(if is_first_field.unwrap_or(false) { 263 } else { 262 });
         let linecount = self.linecount.unwrap();
 
         // Number of lines to actually process; the entire following VSYNC is
         // processed.
-        let proclines = self.outlinecount + self.lineoffset + 10;
+        let proclines = self.outlinecount + self.lineoffset + 10 + if self.spec.sys.pal { 3 } else { 0 };
 
         // lastlineloc comes from the next vblank (may be None).
         let lastlineloc = self.vblank_next;
@@ -1611,7 +1776,7 @@ impl Field {
             .into_par_iter()
             .map(|i| {
                 // skip VSYNC lines (they handle pulses differently)
-                if inrange(i as f64, 3.0, 6.0) {
+                if inrange(i as f64, 3.0, 6.0) || (self.spec.sys.pal && inrange(i as f64, 1.0, 2.0)) {
                     return (true, None, usize::MAX, None, None, None);
                 }
 
@@ -1810,7 +1975,7 @@ impl Field {
                 nextgood += 1;
             }
 
-            let firstcheck = 1; // NTSC
+            let firstcheck = if self.spec.sys.pal { 0 } else { 1 };
             if prevgood >= firstcheck && nextgood < linelocs.len() + self.lineoffset {
                 let gap = (linelocs[nextgood] - linelocs[prevgood as usize])
                     / (nextgood - prevgood as usize) as f64;
@@ -2106,15 +2271,15 @@ impl Field {
                         std::thread::yield_now();
                     }
                 };
-                match res {
-                    Ok(audio2) => self.data.audio = audio2,
-                    Err(()) => {
-                        self.data.audio = crate::decode::audio::audio_phase2(
-                            &self.spec,
-                            &self.data.video.audio,
-                        );
-                    }
-                }
+                let (audio2, f32q) = match res {
+                    Ok(v) => v,
+                    Err(()) => crate::decode::audio::audio_phase2(
+                        &self.spec,
+                        &self.data.video.audio,
+                    ),
+                };
+                self.data.audio = audio2;
+                self.data.audio_f32 = f32q;
             }
             let linecount = self.linecount.unwrap_or(self.outlinecount);
             let (dsaudio, _next) = crate::decode::audio::downscale_audio(
@@ -2125,8 +2290,10 @@ impl Field {
                 audio_offset,
                 audio_freq,
                 self.data.startloc,
+                self.data.audio_f32,
             );
             self.dsaudio = dsaudio;
+
         }
         let t_aud = t3.elapsed().as_nanos() as u64;
 
@@ -2245,9 +2412,25 @@ impl Field {
     pub fn get_burstlevel(&self, l: usize, linelocs: Option<&[f64]>) -> f64 {
         let (start, end) = self.lineslice(l, Some(5.5), Some(2.4), linelocs, 0.0);
         if start >= end || end > self.data.video.demod.len() {
-            return 0.0;
+            return if self.spec.sys.pal { f64::NAN } else { 0.0 };
         }
         let burstarea = &self.data.video.demod[start..end];
+        if self.spec.sys.pal {
+            // `FieldPAL.get_burstlevel` copies the slice, centres it in f32
+            // (`burstarea -= nb_mean(burstarea)`), bails out (None) above
+            // 30 IRE and then calls `rms`, which centres the already-centred
+            // data a *second* time inside
+            // `np.mean(np.square(arr - np.mean(arr)))`. Both centrings are
+            // load-bearing: centring only once (inside `rms`, as the port used
+            // to) shifts every line's level by up to ~2 ulp at 1e5, which
+            // moves the median by ~0.006 IRE on real PAL fields.
+            let mean = mean_f32(burstarea);
+            let centred: Vec<f32> = burstarea.iter().map(|&v| v - mean).collect();
+            if centred.iter().any(|&v| f64::from(v) > 30.0 * self.levels.hz_ire) {
+                return f64::NAN;
+            }
+            return f64::from(rms(&centred)) * std::f64::consts::SQRT_2;
+        }
         f64::from(rms(burstarea)) * std::f64::consts::SQRT_2
     }
 
@@ -2255,9 +2438,11 @@ impl Field {
         // Each line's burst level is an independent pure gather+RMS, so the
         // 253 slice computations run in parallel; the median below sorts the
         // same 253 values either way, keeping the result bit-identical.
-        let burstlevel: Vec<f64> = (11..264)
+        let lines = if self.spec.sys.pal { 11..313 } else { 11..264 };
+        let burstlevel: Vec<f64> = lines
             .into_par_iter()
             .map(|l| self.get_burstlevel(l, None))
+            .filter(|v| !v.is_nan())
             .collect();
         let median = if burstlevel.is_empty() {
             0.0
@@ -2664,6 +2849,10 @@ impl Field {
         for i in 1..end {
             rv.push(i);
         }
+        if self.spec.sys.pal {
+            let start2 = if self.is_first_field() { 311 } else { 310 };
+            rv.extend(start2..318);
+        }
         rv
     }
 
@@ -2671,6 +2860,169 @@ impl Field {
     #[allow(dead_code)]
     pub fn vsync_area_lines(&self) -> usize {
         (self.get_vblank_length(self.is_first_field()) + 0.6) as usize
+    }
+
+    /// `FieldPAL.process`: the lines are locked onto the 3.75 MHz pilot (two
+    /// passes, the second fine-tunes the adjusted line frequency), then the
+    /// output lines start at line 2 or 3 of the field.
+    fn process_pal(&mut self, spec: &DecoderSpec) {
+        self.update_out_scale();
+        let linelocs2 = self.linelocs2.clone();
+        let linelocs3 = self.refine_linelocs_pilot(&linelocs2);
+        let linelocs3a = self.refine_linelocs_pilot(&linelocs3);
+        self.linelocs = self.fix_badlines(spec, &linelocs3a, None);
+        self.burstmedian = self.calc_burstmedian(spec);
+        let first = self.is_first_field();
+        self.linecount = Some(if first { 312 } else { 313 });
+        self.lineoffset = if first { 2 } else { 3 };
+        self.linecode = [16, 17, 18]
+            .iter()
+            .map(|&l| self.decodephillipscode(spec, l + self.lineoffset))
+            .collect();
+        self.field_phase_id = self.determine_field_number();
+    }
+
+    /// `get_following_field_number`: the previous field's phase + 1 (8 -> 1).
+    fn following_field_number(&self) -> i64 {
+        match &self.prevfield {
+            Some(p) => p.field_phase_id % 8 + 1,
+            None => 1,
+        }
+    }
+
+    /// `FieldPAL.determine_field_number`: the 4-field sequence from the
+    /// parity and the burst on line 6 (present on fields 2 and 3), then fields
+    /// 5-8 told from 1-4 by the burst phase on lines 7, 11, 15, 19.
+    fn determine_field_number(&mut self) -> i64 {
+        let bl6 = self.get_burstlevel(6, None);
+        if bl6.is_nan() {
+            return self.following_field_number();
+        }
+        let bl6 = bl6 / self.levels.hz_ire;
+        let hasburst = if inrange(bl6, self.burstmedian * 0.8, self.burstmedian * 1.2) {
+            true
+        } else if bl6 < self.burstmedian * 0.2 {
+            false
+        } else {
+            return self.following_field_number();
+        };
+        let m4 = match (self.is_first_field(), hasburst) {
+            (true, false) => 1,
+            (false, true) => 2,
+            (true, true) => 3,
+            (false, false) => 4,
+        };
+
+        // The burst channel for those lines (the third channel holds the
+        // pilot on PAL); `compute_line_bursts` reads it as `demod_burst`.
+        let lines = [7usize, 11, 15, 19];
+        let burst = self.pal_burst_signal(&lines);
+        let saved = std::mem::replace(&mut self.data.video.demod_burst, burst);
+        let prev: [f64; 4] = self.prevfield.as_ref().map_or([0.0; 4], |p| p.pal_phase_adjust);
+        let linelocs = self.linelocs.clone();
+        let (mut rcount, mut count) = (0, 0);
+        for (k, &line) in lines.iter().enumerate() {
+            let (rising, adj) = self.compute_line_bursts(&linelocs, line, prev[k]);
+            self.pal_phase_adjust[k] = adj;
+            if let Some(r) = rising {
+                rcount += usize::from(r);
+                count += 1;
+            }
+        }
+        self.data.video.demod_burst = saved;
+
+        if count == 0 || rcount * 2 == count {
+            return self.following_field_number();
+        }
+        let mut is_firstfour = rcount * 2 > count;
+        if m4 == 2 {
+            is_firstfour = !is_firstfour;
+        }
+        m4 + if is_firstfour { 0 } else { 4 }
+    }
+
+    /// 7.4's burst channel (`FVideoBurst` on the clamped raw demod) around
+    /// the given lines, one demod block per line; zero elsewhere.
+    fn pal_burst_signal(&self, lines: &[usize]) -> Vec<f32> {
+        let raw = &self.data.video.demod_raw;
+        let mut out = vec![0.0f32; raw.len()];
+        let Some(filt) = self.spec.filters.pal_burst_rfft.as_ref() else { return out };
+        let n = self.spec.blocklen;
+        if raw.len() < n {
+            return out;
+        }
+        let hi = self.spec.freq_hz * 0.75;
+        for &l in lines {
+            let Some(&loc) = self.linelocs.get(l + self.lineoffset) else { continue };
+            let s = loc.max(0.0) as usize;
+            let a = s.saturating_sub(n / 2).min(raw.len() - n);
+            let block: Vec<f64> = raw[a..a + n].iter().map(|&v| f64::from(v).clamp(1_500_000.0, hi)).collect();
+            let prod: Vec<rustfft::num_complex::Complex64> = crate::ffi_ducc::rfft(&block).iter().zip(filt).map(|(&x, &h)| x * h).collect();
+            let real = crate::ffi_ducc::irfft(&prod, n);
+            let e = (s + 2 * self.inlinelen).min(a + n);
+            for i in s..e {
+                out[i] = real[i - a] as f32;
+            }
+        }
+        out
+    }
+
+    /// `FieldPAL.refine_linelocs_pilot` (`refine_pilot_zcs`): each line is
+    /// moved onto the mean phase of the pilot's zero crossings, measured in
+    /// half pilot periods at the line's own frequency.
+    fn refine_linelocs_pilot(&self, linelocs: &[f64]) -> Vec<f64> {
+        let mut out = linelocs.to_vec();
+        let n = 323.min(linelocs.len());
+        let pilot = &self.data.video.demod_burst;
+        let freq = self.spec.freq;
+        let linelen = self.inlinelen as f64;
+        let mut zcs = vec![0.0f64; n];
+        let mut plen = vec![0.0f64; n];
+        let mut prev = 0.0;
+        for l in 0..n {
+            let mut adjfreq = freq;
+            if l > 1 {
+                adjfreq /= (linelocs[l] - linelocs[l - 1]) / linelen;
+            }
+            let pl = (adjfreq / self.spec.sys.pilot_mhz) / 2.0;
+            plen[l] = pl;
+            let (start, stop) = self.lineslice(l, Some(0.0), Some(6.0), Some(linelocs), 0.0);
+            let stop = stop.min(pilot.len());
+            let zc = if start < stop {
+                let pilots = &pilot[start..stop];
+                let peakloc = pilots
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, -1.0f32), |m, (i, &v)| if v.abs() > m.1 { (i, v.abs()) } else { m })
+                    .0;
+                calczc_do(pilots, peakloc, 0.0, 0, 10).map(|z| (z - (linelocs[l] - start as f64)) / pl)
+            } else {
+                None
+            };
+            zcs[l] = zc.unwrap_or(prev);
+            prev = zcs[l];
+        }
+        // Circular mean of the fractional phases (`angular_mean_helper`).
+        let (mut c, mut sn) = (0.0f64, 0.0f64);
+        for &z in &zcs {
+            let x = z - z.trunc();
+            c += (2.0 * std::f64::consts::PI * x).cos();
+            sn += (2.0 * std::f64::consts::PI * x).sin();
+        }
+        let mut am = sn.atan2(c) / (2.0 * std::f64::consts::PI);
+        if am < 0.0 {
+            am += 1.0;
+        }
+        for l in 0..n {
+            let mut d = (zcs[l] - zcs[l].floor()) - am;
+            if d < -0.5 {
+                d += 1.0;
+            } else if d > 0.5 {
+                d -= 1.0;
+            }
+            out[l] += d * plen[l];
+        }
+        out
     }
 
     /// Port of `Field.process` + the NTSC additions from `FieldNTSC.process`.
@@ -2716,6 +3068,10 @@ impl Field {
         self.linebad = self.compute_deriv_error(&self.linelocs2, &self.linebad);
         self.linelocs = self.linelocs2.clone();
         self.valid = true;
+        if spec.sys.pal {
+            self.process_pal(&spec);
+            return Ok(());
+        }
 
         // ---- NTSC-specific process ----
         self.update_out_scale();
@@ -2937,7 +3293,7 @@ pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
             sorted[lo]
         };
         // NOTE: the Python computes IRE against the *spec* levels (spec=True).
-        let freq_ire = (f64::from(freq) - SYS_IRE0 as f64) / SYS_HZ_IRE as f64;
+        let freq_ire = (f64::from(freq) - spec.sys.ire0) / spec.sys.hz_ire;
 
         if inrange(freq_ire, 95.0, 110.0) {
             ire100_hzs.push(freq);
@@ -3022,7 +3378,142 @@ pub(crate) fn detect_levels(field: &Field) -> (f64, f64, f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::burst_window;
+    use super::{burst_window, findpulses, findpulses_scalar, f32_threshold};
+
+    /// `(start, len)` pairs as bits, so a mismatch prints the first index that
+    /// differs instead of a wall of floats.
+    fn triples(v: &[super::Pulse]) -> Vec<(u64, u64)> {
+        v.iter().map(|p| (p.start.to_bits(), p.len.to_bits())).collect()
+    }
+
+    /// The vector scan must reproduce the scalar state machine exactly — same
+    /// pulses, same order, same f64 values — including the cases the state
+    /// machine is fussy about: a run starting at index 0 (dropped by
+    /// `cur_start != 0`), a trailing run that never closes (dropped), runs over
+    /// the 5000-sample `max_synclen` filter, NaN/±inf samples (neither above
+    /// nor below, so they leave the state alone), and lengths that straddle the
+    /// 16-sample chunk boundary.
+    #[test]
+    fn findpulses_vector_scan_matches_the_scalar_machine() {
+        let mut seed = 0x5EED_1234_ABCD_0001u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Thresholds: exactly representable, between two f32s (the
+        // `f32_threshold` next-down branch), negative, zero, and extreme.
+        let thresholds = [
+            1000.0f64,
+            1000.000_000_1,
+            -1000.0,
+            -1000.000_000_1,
+            0.0,
+            -0.0,
+            1.0e-40,
+            -1.0e-40,
+            f32::MAX as f64,
+            (f32::MAX as f64) * 2.0,
+            f64::from(f32::MIN), // -inf as f32
+        ];
+        for &high in &thresholds {
+            for len in 0..40usize {
+                for _ in 0..8 {
+                    let data: Vec<f32> = (0..len)
+                        .map(|i| match (rand() % 16, i % 7) {
+                            (0, _) => f32::NAN,
+                            (1, _) => f32::INFINITY,
+                            (2, _) => f32::NEG_INFINITY,
+                            // Exactly on the threshold half the time.
+                            (3, _) => high as f32,
+                            (4, _) => -high as f32,
+                            _ => {
+                                let base = high as f32;
+                                let step = ((rand() >> 40) % 5) as f32 - 2.0;
+                                base + step
+                            }
+                        })
+                        .collect();
+                    assert_eq!(
+                        triples(&findpulses(&data, high)),
+                        triples(&findpulses_scalar(&data, high)),
+                        "high={high:?} len={len} data={data:?}"
+                    );
+                }
+            }
+        }
+
+        // Decoder-shaped: mostly above threshold with sync-length runs below,
+        // plus a >5000-sample no-signal run and a run at index 0.
+        let mut data = vec![1000.0f32; 20_000];
+        for k in 0..5 {
+            let start = 200 + k * 3000;
+            for s in data.iter_mut().skip(start).take(160) {
+                *s = -500.0;
+            }
+        }
+        for s in data.iter_mut().take(40) {
+            *s = -500.0;
+        }
+        for s in data.iter_mut().skip(9_000).take(7_000) {
+            *s = -500.0;
+        }
+        assert_eq!(triples(&findpulses(&data, 0.0)), triples(&findpulses_scalar(&data, 0.0)));
+        // Vetted count, so the differential test cannot pass with both paths
+        // wrong: the runs at 200/3200/6200 are kept, the one at index 0 is
+        // dropped (`cur_start != 0`), and the 7000-sample no-signal run swallows
+        // the 9200 and 12200 pulses and is itself over `max_synclen`.
+        assert_eq!(findpulses(&data, 0.0).len(), 3);
+    }
+
+    /// The f32 threshold must decide every sample exactly like the f64 compare
+    /// it replaces, on both sides of the boundary.
+    #[test]
+    fn f32_threshold_matches_the_f64_comparison() {
+        let mut seed = 0xFEED_FACE_0000_0003u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let highs = [
+            1.0e6f64,
+            1.0e6 + 1.0e-4,
+            6_500_000.0,
+            -1.0e6,
+            -1.0e6 - 1.0e-4,
+            0.0,
+            -0.0,
+            1.0e-45,
+            f32::MAX as f64,
+        ];
+        for &high in &highs {
+            let t = f32_threshold(high);
+            let near = high as f32;
+            let mut probes: Vec<f32> = vec![near, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+            for b in [near.to_bits().wrapping_sub(2), near.to_bits().wrapping_sub(1), near.to_bits(), near.to_bits() + 1, near.to_bits() + 2] {
+                probes.push(f32::from_bits(b));
+            }
+            for _ in 0..200 {
+                let base = high * (0.5 + (rand() % 1000) as f64 / 1000.0);
+                probes.push(base as f32);
+            }
+            for &x in &probes {
+                assert_eq!(
+                    f64::from(x) > high,
+                    x > t,
+                    "above: high={high:?} x={x:?} t={t:?}"
+                );
+                assert_eq!(
+                    f64::from(x) <= high,
+                    x <= t,
+                    "below: high={high:?} x={x:?} t={t:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn normal_window_is_a_half_open_slice() {
