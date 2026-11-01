@@ -85,6 +85,18 @@ const XTALK_FIT_STRIDE: usize = 20;
 const XTALK_FFT_LEN: usize = 1 << 16;
 const XTALK_OV_S: f64 = 2048.0 / 75.0e6;
 
+/// Chroma leak cancellation (NTSC): the band the leak is fitted in (rising
+/// and falling raised-cosine edges, Hz: the chroma, 3.58 MHz +- 0.6), the
+/// lags of its fit (`LEAK_TAPS` lags `LEAK_STEP` samples apart, centred),
+/// and the fit's sample stride.
+const LEAK_BAND_HZ: ((f64, f64), (f64, f64)) = ((2.9e6, 3.1e6), (4.1e6, 4.3e6));
+const LEAK_TAPS: usize = 13;
+const LEAK_STEP: usize = 2;
+const LEAK_FIT_STRIDE: usize = 7;
+/// A chunk is corrected only where the leak explains at least this share of
+/// the RF's chroma band (a disc or a stretch with no leak is left untouched).
+const LEAK_MIN_SHARE: f64 = 0.05;
+
 /// A player's EFM decoder crystal (384 x 44.1 kHz) and the divisor its lines
 /// in the RF are multiples of (its 192nd, 88.2 kHz).
 const EFM_XTAL_HZ: f64 = 16.9344e6;
@@ -844,6 +856,16 @@ pub(crate) struct Inner {
     pub(crate) carrier: bool,
     /// Audio crosstalk cancellation: the sample rate and the audio carriers.
     pub(crate) xtalk: Option<(f64, [f64; 2], (f64, f64))>,
+    /// Chroma leak cancellation: the sample rate and the band.
+    leak: Option<(f64, ((f64, f64), (f64, f64)))>,
+}
+
+impl Inner {
+    /// Whether the combine also returns the combined video band (the audio
+    /// crosstalk and chroma leak cancellations need it).
+    pub(crate) fn wants_band(&self) -> bool {
+        self.xtalk.is_some() || self.leak.is_some()
+    }
 }
 
 /// `sum(h[i] * x[i])` over 8 single-precision lanes (as the OpenCL kernel,
@@ -1052,7 +1074,7 @@ impl Engine {
         let mut out = vec![0f32; n];
         let inner = &self.inner;
         // The combined video band, for the crosstalk cancellation.
-        let mut v = vec![Complex64::new(0.0, 0.0); if inner.xtalk.is_some() { n } else { 0 }];
+        let mut v = vec![Complex64::new(0.0, 0.0); if inner.wants_band() { n } else { 0 }];
         self.pool.install(|| match &self.gpu {
             Some(gpu) => {
                 let t0 = std::time::Instant::now();
@@ -1082,6 +1104,13 @@ impl Engine {
             self.pool.install(|| cancel_crosstalk(&mut out, &v, fs, fa, keep));
             if std::env::var_os("LD_TIMING").is_some() {
                 ld_decode::teeprintln!("STACKXT us={}", t0.elapsed().as_micros());
+            }
+        }
+        if let Some((fs, band)) = inner.leak {
+            let t0 = std::time::Instant::now();
+            self.pool.install(|| cancel_chroma_leak(&mut out, &v, fs, band));
+            if std::env::var_os("LD_TIMING").is_some() {
+                ld_decode::teeprintln!("STACKLEAK us={}", t0.elapsed().as_micros());
             }
         }
         Ok(out)
@@ -1214,7 +1243,7 @@ pub struct VirtualSource {
 }
 
 impl VirtualSource {
-    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, carrier: bool, xtalk: bool, xtal: bool, rf_out: Option<RfOut>) -> Result<Self> {
+    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, carrier: bool, xtalk: bool, xtal: bool, leak: bool, rf_out: Option<RfOut>) -> Result<Self> {
         // 1/sigma^2 from each input's noise floor, measured where pass 0
         // first located it (the stream starts before the rest is known).
         let mut weight = Vec::new();
@@ -1244,12 +1273,14 @@ impl VirtualSource {
             hi_lut.iter().map(|c| c.re as f32).collect(),
             hi_lut.iter().map(|c| c.im as f32).collect(),
         ];
+        // NTSC only: measured there; PAL's subcarrier sits elsewhere.
+        let leak = (leak && !pal).then_some((fs, LEAK_BAND_HZ));
         let xtalk = xtalk.then_some(if pal {
             (fs, PAL_AUDIO_CARRIERS_HZ, PAL_SPLIT_HZ)
         } else {
             (fs, AUDIO_CARRIERS_HZ, XTALK_KEEP_HZ)
         });
-        let inner = Inner { inputs, live: Arc::clone(&live), weight, afloor, lag: carrier_lag(fs), hi_lut, fir, exact, carrier, xtalk };
+        let inner = Inner { inputs, live: Arc::clone(&live), weight, afloor, lag: carrier_lag(fs), hi_lut, fir, exact, carrier, xtalk, leak };
         let gpu = if opencl { Some(crate::opencl::StackGpu::new(&inner)?) } else { None };
         let engine = Engine { inner: Arc::new(inner), pool, gpu, rf_out };
         let ahead = Arc::new(Ahead { state: Mutex::new(AheadState::default()), cv: Condvar::new() });
@@ -1628,6 +1659,148 @@ impl CrystalLines {
         }
         Ok(())
     }
+}
+
+/// `x` through a band of raised-cosine edges `rise` and `fall` (Hz), by
+/// overlap-save FFT blocks in parallel (zero outside `x`).
+fn band_filter(x: &[f64], fs: f64, rise: (f64, f64), fall: (f64, f64)) -> Vec<f64> {
+    let n = x.len();
+    let size = XTALK_FFT_LEN;
+    let ov = ((XTALK_OV_S * fs).round() as usize).clamp(1, size / 4);
+    let step = size - 2 * ov;
+    let (fwd, inv) = {
+        let mut planner = XTALK_FFT.get_or_init(|| Mutex::new(FftPlanner::new())).lock().unwrap();
+        (planner.plan_fft_forward(size), planner.plan_fft_inverse(size))
+    };
+    let rc = |f: f64, (a, b): (f64, f64)| {
+        if f <= a {
+            0.0
+        } else if f >= b {
+            1.0
+        } else {
+            0.5 - 0.5 * (std::f64::consts::PI * (f - a) / (b - a)).cos()
+        }
+    };
+    let gain: Vec<f64> = (0..size)
+        .map(|b| {
+            let f = b.min(size - b) as f64 * fs / size as f64;
+            rc(f, rise) * (1.0 - rc(f, fall)) / size as f64
+        })
+        .collect();
+    let mut out = vec![0.0f64; n];
+    out.par_chunks_mut(step).enumerate().for_each(|(blk, o)| {
+        let s0 = blk * step;
+        let mut buf: Vec<Complex64> = (0..size)
+            .map(|i| {
+                let t = (s0 + i) as isize - ov as isize;
+                Complex64::new(if t >= 0 && (t as usize) < n { x[t as usize] } else { 0.0 }, 0.0)
+            })
+            .collect();
+        fwd.process(&mut buf);
+        for (v, g) in buf.iter_mut().zip(&gain) {
+            *v *= *g;
+        }
+        inv.process(&mut buf);
+        for (i, y) in o.iter_mut().enumerate() {
+            *y = buf[ov + i].re;
+        }
+    });
+    out
+}
+
+/// Solve the n x n system `a x = b` (Gaussian elimination, partial
+/// pivoting); `None` when it is singular.
+fn solve_n(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    for c in 0..n {
+        let p = (c..n).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs()))?;
+        if a[p][c].abs() < 1e-300 || !a[p][c].is_finite() {
+            return None;
+        }
+        a.swap(c, p);
+        b.swap(c, p);
+        for r in c + 1..n {
+            let f = a[r][c] / a[c][c];
+            for k in c..n {
+                a[r][k] -= f * a[c][k];
+            }
+            b[r] -= f * b[c];
+        }
+    }
+    let mut x = vec![0.0f64; n];
+    for c in (0..n).rev() {
+        let mut s = b[c];
+        for k in c + 1..n {
+            s -= a[c][k] * x[k];
+        }
+        x[c] = s / a[c][c];
+    }
+    Some(x)
+}
+
+/// Chroma leak cancellation: take out of the stream `out` the composite
+/// chroma that leaks into the RF baseband around the colour subcarrier. It
+/// beats with the video carrier (carrier minus 3.58 MHz) and makes the fine
+/// wavering vertical stripes of saturated areas, the NTSC "colour wobble".
+/// The chroma is the demodulated video band `v`'s instantaneous frequency
+/// through `band`; the RF's same band is fitted on it, shifted by
+/// `LEAK_TAPS` lags `LEAK_STEP` apart (least squares, every
+/// `LEAK_FIT_STRIDE`-th sample: the picture's own RF there does not follow
+/// it), and the fit subtracted, fading in and out at the chunk's edges. Only
+/// from this chunk's samples, so the same wherever it is computed.
+fn cancel_chroma_leak(out: &mut [f32], v: &[Complex64], fs: f64, band: ((f64, f64), (f64, f64))) {
+    let n = out.len();
+    let taper = (XTALK_TAPER_S * fs).round() as usize;
+    let half = LEAK_TAPS / 2 * LEAK_STEP;
+    if n < 4 * taper + 2 * half {
+        return;
+    }
+    let tau = 2.0 * std::f64::consts::PI;
+    let f: Vec<f64> = (0..n).into_par_iter().map(|t| if t == 0 { 0.0 } else { (v[t] * v[t - 1].conj()).arg() * fs / tau }).collect();
+    let c = band_filter(&f, fs, band.0, band.1);
+    let x: Vec<f64> = out.iter().map(|&s| f64::from(s)).collect();
+    let r = band_filter(&x, fs, band.0, band.1);
+    let lags: Vec<isize> = (0..LEAK_TAPS).map(|k| (k * LEAK_STEP) as isize - half as isize).collect();
+    let col = |t: usize, k: usize| c[(t as isize + lags[k]) as usize];
+    let m = lags.len();
+    let (mut ata, mut aty, mut yy) = (vec![vec![0.0f64; m]; m], vec![0.0f64; m], 0.0f64);
+    for t in (taper + half..n - taper - half).step_by(LEAK_FIT_STRIDE) {
+        yy += r[t] * r[t];
+        for a in 0..m {
+            let ca = col(t, a);
+            aty[a] += ca * r[t];
+            for b in a..m {
+                ata[a][b] += ca * col(t, b);
+            }
+        }
+    }
+    for a in 0..m {
+        for b in 0..a {
+            ata[a][b] = ata[b][a];
+        }
+    }
+    let Some(h) = solve_n(ata, aty.clone()) else { return };
+    // Share of the RF's chroma band the leak explains: below LEAK_MIN_SHARE
+    // there is no leak to speak of, and the chunk is left as it is.
+    let share = h.iter().zip(&aty).map(|(a, b)| a * b).sum::<f64>() / yy.max(1e-300);
+    tracing::debug!("stack: chroma leak share {share:.4}");
+    if !(share >= LEAK_MIN_SHARE) {
+        return;
+    }
+    out.par_iter_mut().enumerate().for_each(|(t, o)| {
+        if t < half || t + half >= n {
+            return;
+        }
+        let mut leak = 0.0;
+        for (k, hk) in h.iter().enumerate() {
+            leak += hk * col(t, k);
+        }
+        let e = t.min(n - 1 - t);
+        if e < taper {
+            leak *= 0.5 - 0.5 * (std::f64::consts::PI * e as f64 / taper as f64).cos();
+        }
+        *o = (f64::from(*o) - leak) as f32;
+    });
 }
 
 /// Solve the 4x4 system `a x = b` (Gaussian elimination, partial pivoting);

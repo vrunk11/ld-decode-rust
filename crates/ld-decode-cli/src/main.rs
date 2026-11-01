@@ -84,6 +84,13 @@ struct Args {
     /// and subtracts its lines (multiples of 88.2 kHz) from the stream.
     #[arg(long)]
     keep_crystal_lines: bool,
+    /// Leave the chroma that leaks into the RF (NTSC). By default `--tbc
+    /// read` takes it out: the composite chroma leaks into the RF baseband
+    /// around 3.58 MHz and beats with the video carrier into fine wavering
+    /// stripes in saturated areas ("colour wobble"); it is fitted on the
+    /// decoded chroma on every chunk and subtracted before demodulation.
+    #[arg(long)]
+    keep_chroma_leak: bool,
     /// Where the FM demodulation and the read-time TBC / stack run: `cpu`
     /// (bit-exact to the reference), or `opencl` (a GPU through its driver's
     /// OpenCL runtime; see --gpu-precision).
@@ -402,7 +409,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, args.rf_out.as_deref()) {
+        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak, args.rf_out.as_deref()) {
             Ok(v) => Box::new(v),
             // Read was the default, not asked for: a source it cannot read
             // (stdin, a compressed format) or finds no lines in still
@@ -635,6 +642,7 @@ fn read_tbc_source(
     stack_weight: StackWeight,
     xtalk: bool,
     xtal: bool,
+    leak: bool,
     rf_out: Option<&str>,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
@@ -675,7 +683,7 @@ fn read_tbc_source(
         })?;
     }
     let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
-    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, xtal, rf_out)
+    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, xtal, leak, rf_out)
 }
 
 /// The sample rate a Domesday Duplicator capture records in the `.yaml`

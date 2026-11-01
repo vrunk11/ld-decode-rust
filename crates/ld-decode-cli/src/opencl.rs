@@ -368,7 +368,7 @@ impl StackGpu {
                      -DQ_LO={Q_LO:?} -DQ_SPAN={Q_SPAN:?} -DQ_MAX={Q_MAX:?} -DQ_ROT={Q_ROT:?} -DH_LO={H_LO:?} -DH_SPAN={H_SPAN:?} -DLAG={} {} {} {}",
                     inner.lag,
                     if inner.carrier { "-DCARRIER_COMBINE" } else { "" },
-                    if inner.xtalk.is_some() { "-DXTALK" } else { "" },
+                    if inner.wants_band() { "-DXTALK" } else { "" },
                     if inner.exact { "-DREAL=double -DREAL2=double2" } else { "-DREAL=float -DREAL2=float2" }
                 ),
                 &["read_input", "combine"],
