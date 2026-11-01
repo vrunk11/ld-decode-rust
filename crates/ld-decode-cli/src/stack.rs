@@ -582,6 +582,9 @@ fn code_s8(b: &[u8], out: &mut [u16]) {
 
 impl RawFile {
     fn open(path: &str, format: SampleFormat) -> Result<Self> {
+        if path == "-" {
+            bail!("--tbc read reads its input at random positions, which stdin cannot do");
+        }
         let Some((bytes, widen)) = crate::reader::raw_layout(format) else {
             bail!("--tbc read needs a fixed-width raw input (s16, r16, r8, s8, rf); {path} is {format:?}");
         };

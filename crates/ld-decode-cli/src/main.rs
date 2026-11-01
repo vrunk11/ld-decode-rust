@@ -52,8 +52,10 @@ struct Args {
     output: Option<String>,
     /// Time-base correction: `read` reads the RF at the corrected positions
     /// before demodulation (and takes the audio crosstalk out), `resample`
-    /// resamples the demodulated video (the reference decoder's way).
-    /// Default: resample for one source; several sources always use read.
+    /// resamples the demodulated video (the reference decoder's way, its
+    /// bytes). Default: read (measured +0.5 to +0.8 dB on one capture); where
+    /// it cannot run on one source (stdin, a compressed format, no lines
+    /// found), resample. Several sources always use read.
     #[arg(long, value_enum)]
     tbc: Option<TbcMode>,
     /// Also write the RF the decoder reads to this file (s16 at the input
@@ -277,7 +279,6 @@ fn main() -> Result<()> {
             anyhow::bail!("--rf-out writes the read-time corrected RF; it needs --tbc read")
         }
         (Some(m), _) => m,
-        (None, 1) if args.rf_out.is_none() => TbcMode::Resample,
         (None, _) => TbcMode::Read,
     };
 
@@ -396,7 +397,17 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => Box::new(read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, args.rf_out.as_deref())?),
+        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, args.rf_out.as_deref()) {
+            Ok(v) => Box::new(v),
+            // Read was the default, not asked for: a source it cannot read
+            // (stdin, a compressed format) or finds no lines in still
+            // decodes, the reference's way.
+            Err(e) if args.tbc.is_none() && inputs.len() == 1 => {
+                tracing::warn!("--tbc read: {e:#}; decoding with --tbc resample");
+                input.source
+            }
+            Err(e) => return Err(e),
+        },
     };
     let mut reader = DecodeReader::new(source);
 
