@@ -4,6 +4,8 @@ Ce document résume la session de conception et de spike pour la reprendre aille
 
 Branche : `ccr-74cb4fe9-ehem1s` (rien n'est fusionné dans `main`). **Aucun code Rust du décodeur n'a été modifié.** Tout ce qui existe est de la documentation et un prototype Python dans `scripts/stacking_spike/`.
 
+> **Mise à jour 2026-11-01.** Le stack est maintenant dans le décodeur Rust (branche `feat/multi-source-stacking`) : voir la [section 9](#9-état-dans-le-décodeur-2026-11-01). Les sections 1 à 8 décrivent la phase de conception et de spike.
+
 ## 1. Objectif
 
 Aujourd'hui on démodule chaque capture RF d'un même LaserDisc en `.tbc`, puis on empile les `.tbc`. Ça marche mais ce n'est pas optimal : dropouts, erreurs de sync et bruit sont déjà figés, et l'information de fiabilité du RF est perdue. Empiler le RF directement est trop lourd et exige un alignement de phase de porteuse irréaliste. Objectif : **une démodulation qui bénéficie de toutes les sources**, avec N sources quelconques.
@@ -241,3 +243,20 @@ Chaque exécution prend quelques minutes (2 M d'échantillons). Le décodeur Rus
 - `scripts/stacking_spike/sweep.py` : balayage synthétique avec erreur d'alignement injectée.
 - `scripts/stacking_spike/real_spike.py` : même test sur un vrai fichier s16.
 - Les scripts des sections 4 bis et 4 ter (`bcommon.py`, `bbtest.py`, `tbcdemod.py` et les bancs d'essai, dont `guide_align.py` et `guide_chroma.py` pour l'architecture guide / sortie, `tfmask.py` pour le masque temps-fréquence, `subband.py`, `subband2.py` et `hybrid.py` pour les poids par sous-bande) ne sont pas versionnés : ils sont restés dans le dossier temporaire de la session. Ils supposent les captures de `D:\RF_CAPTURE\stack` et un environnement conda avec `numpy` et `numba`.
+
+## 9. État dans le décodeur (2026-11-01)
+
+Branche `feat/multi-source-stacking`. Ce qui est implémenté, avec les mesures (NTSC 75 MHz, 60 images, wSNR / bPSNR des VITS du décodeur, sauf mention) :
+
+- **`--tbc read` par défaut**, pour une source comme pour un stack. Pass 0 localise les lignes directement dans le RF, en parallèle du décodage ; le RF est lu aux positions corrigées avant démodulation. Repli automatique sur `--tbc resample` (avec un avertissement) quand `read` ne peut pas tourner sur une source unique : stdin, `.flac`/`.ldf`, aucune ligne trouvée.
+- **Contrôle de parité : le lancer avec `--tbc resample`.** Le défaut `read` (et la correction de diaphonie qu'il porte) ne donne plus les octets du décodeur de référence ; `resample` les donne toujours. `main` n'est pas concerné.
+- **Correction de la diaphonie audio**, active par défaut avec `read` (`--keep-audio-crosstalk` la coupe). Un gain complexe par porteuse audio (2,30 / 2,81 MHz), ajusté par bloc sur la fréquence instantanée de la bande vidéo combinée, retiré par une rotation de phase de la bande vidéo du RF, gardé au-dessus de 3,0–3,6 MHz (EFM identique). Gains : une capture +0,48 à +0,83 / +0,51 à +0,68 dB ; 3 exemplaires +0,76 / +0,77 ; 3 passages d'un exemplaire +0,91 / +0,72. Le gain complexe simple bat le FIR à 11 coefficients du prototype. En PAL (`ld-1100`, 40 MHz) : neutre (±0,03 dB).
+- **Combinaison `--stack-weight adaptive`** (défaut) : poids par échantillon selon l'amplitude de la porteuse, rotation filtrée par la confiance, garde-fou d'alignement conditionné à la santé de la référence. `fixed` garde l'ancien poids fixe par entrée.
+- **Pass 0 robuste aux dropouts** : structure des champs (263/262 lignes en NTSC, 312/313 en PAL) prédite et imposée une fois verrouillée (détections à ±3 lignes recalées, intervalles manqués comblés, faux intervalles écartés) ; la grille de lignes ne se réinitialise plus sur les fausses impulsions d'un dropout ; codes de trame réparés (mots constants remis, code réduit aux mots constants retiré). Sur dropouts simulés : référence abîmée rms 1274 → 49, secondaire abîmée 358 → 60, 0 champ perdu au lieu de 3. Sur une vraie capture PAL : 3 champs fusionnés et 3 longueurs anormales corrigés.
+- **Tous les taux d'entrée**, un seul par stack (les constantes de pass 0 suivent le taux ; un `.yaml` Domesday Duplicator d'un autre taux est refusé). Vérifié à 30, 40 et 75 MHz.
+- **`--rf-out`** écrit le RF que lit le décodeur (stacké ou recalé).
+- **GPU** : `--device opencl --preset slow` donne les octets du CPU, stack et correction compris.
+
+Essayé et écarté (chiffres dans la mémoire du projet) : poids par sous-bande RF au bruit de puissance (−0,17 dB : il mesure de l'amplitude, que la FM ignore) ; poids au bruit de phase (−0,08 à 0 dB) ; compensation de l'amplitude (±0,02 dB) ; correction AM→PM par capture (0 dB sur le stack : les corrections propres à chaque capture s'annulent dans la moyenne).
+
+Ce qui reste : vitesse de la correction de diaphonie (~40 ms par bloc de 28 ms de signal, à chevaucher avec le calcul GPU du bloc suivant) ; confirmation sur de vrais dropouts ; mesure du gain PAL sur d'autres disques.
