@@ -136,6 +136,8 @@ const PAL_LINE_EXCLUDE_HZ: [(f64, f64); 4] = [(0.48e6, 0.88e6), (0.86e6, 1.27e6)
 const XTAL_BLOCK: usize = 1 << 16;
 const XTAL_SUPER: usize = 1 << 22;
 const XTAL_CACHE: usize = 16;
+/// Samples between the exact seeds of a line's phasor in `clean`.
+const XTAL_SEED: usize = 1024;
 
 /// Band used to estimate each input's noise floor (no signal there), kept
 /// below `NOISE_TOP` of the Nyquist frequency (the capture's anti-alias
@@ -1086,6 +1088,14 @@ impl Engine {
     /// Samples `[s0, s0 + n)` of the stream; `plan` is the GPU plan for
     /// exactly that span when it was prepared ahead.
     fn compute(&self, s0: u64, n: usize, plan: Option<Plan>) -> Result<Vec<f32>> {
+        let (mut out, v) = self.combine(s0, n, plan)?;
+        self.cancel(&mut out, &v);
+        Ok(out)
+    }
+
+    /// The combined stream over `[s0, s0 + n)` before the cancellations, and
+    /// its combined video band when they need it.
+    fn combine(&self, s0: u64, n: usize, plan: Option<Plan>) -> Result<(Vec<f32>, Vec<Complex64>)> {
         let mut out = vec![0f32; n];
         let inner = &self.inner;
         // The combined video band, for the crosstalk cancellation.
@@ -1114,21 +1124,27 @@ impl Engine {
                 .enumerate()
                 .try_for_each(|(c, (chunk, vc))| compute_task(inner, s0 + (c * TASK) as u64, chunk, Some(vc))),
         })?;
+        Ok((out, v))
+    }
+
+    /// The audio crosstalk and chroma leak cancellations, on `out` and its
+    /// combined video band `v`.
+    fn cancel(&self, out: &mut [f32], v: &[Complex64]) {
+        let inner = &self.inner;
         if let Some((fs, fa, keep)) = inner.xtalk {
             let t0 = std::time::Instant::now();
-            self.pool.install(|| cancel_crosstalk(&mut out, &v, fs, fa, keep));
+            self.pool.install(|| cancel_crosstalk(out, v, fs, fa, keep));
             if std::env::var_os("LD_TIMING").is_some() {
                 ld_decode::teeprintln!("STACKXT us={}", t0.elapsed().as_micros());
             }
         }
         if let Some((fs, band)) = inner.leak {
             let t0 = std::time::Instant::now();
-            self.pool.install(|| cancel_chroma_leak(&mut out, &v, fs, band));
+            self.pool.install(|| cancel_chroma_leak(out, v, fs, band));
             if std::env::var_os("LD_TIMING").is_some() {
                 ld_decode::teeprintln!("STACKLEAK us={}", t0.elapsed().as_micros());
             }
         }
-        Ok(out)
     }
 }
 
@@ -1154,9 +1170,12 @@ struct AheadState {
 impl Ahead {
     /// The producer: compute the missing chunks of `[want, want + AHEAD)`,
     /// in order. On the GPU the next chunk's plan (its file reads, and the
-    /// wait for pass 0) is prepared while the current one runs.
+    /// wait for pass 0) is prepared while the current one runs, and the
+    /// previous one's cancellations run on the CPU meanwhile (`held`), that
+    /// chunk handed over once they are done.
     fn produce(&self, engine: &Engine) {
         let mut prepared: Option<(u64, Plan)> = None;
+        let mut held: Option<Held> = None;
         loop {
             let c = {
                 let mut st = self.state.lock().unwrap();
@@ -1165,53 +1184,40 @@ impl Ahead {
                         return;
                     }
                     let end = st.len.map_or(u64::MAX, |l| l.div_ceil(CHUNK as u64));
-                    if let Some(c) = (st.want..(st.want + AHEAD).min(end)).find(|c| !st.chunks.contains_key(c)) {
-                        break c;
+                    let h = held.as_ref().map(|h| h.c);
+                    if let Some(c) = (st.want..(st.want + AHEAD).min(end)).find(|c| !st.chunks.contains_key(c) && h != Some(*c)) {
+                        break Some(c);
+                    }
+                    if held.is_some() {
+                        break None;
                     }
                     st = self.cv.wait(st).unwrap();
                 }
             };
-            match self.compute_chunk(engine, c, &mut prepared) {
-                Ok(()) => {}
-                Err(e) => {
-                    self.state.lock().unwrap().error = Some(format!("{e:#}"));
-                    self.cv.notify_all();
-                    return;
-                }
+            let done = match c {
+                Some(c) => self.compute_chunk(engine, c, &mut prepared, &mut held),
+                // Nothing more to compute for now: hand the held chunk over.
+                None => held.take().map_or(Ok(()), |h| self.finish(engine, h)),
+            };
+            if let Err(e) = done {
+                self.state.lock().unwrap().error = Some(format!("{e:#}"));
+                self.cv.notify_all();
+                return;
             }
         }
     }
 
-    fn compute_chunk(&self, engine: &Engine, c: u64, prepared: &mut Option<(u64, Plan)>) -> Result<()> {
-        let s0 = c * CHUNK as u64;
-        // Wait for pass 0 to cover the chunk; that also says where the stream
-        // ends once it is known.
-        let len = engine.inner.live.wait_cover((s0 + (CHUNK + LOCK_MARGIN) as u64) as f64)?;
-        let n = len.map_or(CHUNK, |l| (l.saturating_sub(s0) as usize).min(CHUNK));
-        let plan = prepared.take().filter(|(pc, _)| *pc == c).map(|(_, p)| p);
-        let data = if engine.gpu.is_some() {
-            // Prepare the next chunk's plan alongside this chunk's GPU run.
-            let next = c + 1;
-            let next_ok = len.is_none_or(|l| next * (CHUNK as u64) < l);
-            // On the stack's own pool: from this plain thread a bare `join`
-            // would run on the global pool, which the decoders fill and then
-            // block on this very buffer.
-            let (data, next_plan) = engine.pool.install(|| rayon::join(
-                || engine.compute(s0, n, plan),
-                || -> Result<Option<(u64, Plan)>> {
-                    if !next_ok || engine.inner.live.wait_cover(((next + 1) * CHUNK as u64 + LOCK_MARGIN as u64) as f64)?.is_some() {
-                        return Ok(None);
-                    }
-                    Ok(Some((next, engine.gpu_plan(next * CHUNK as u64, CHUNK)?)))
-                },
-            ));
-            *prepared = next_plan?;
-            data?
-        } else {
-            engine.compute(s0, n, None)?
-        };
+    /// A combined chunk's cancellations, then the chunk handed over.
+    fn finish(&self, engine: &Engine, mut h: Held) -> Result<()> {
+        engine.cancel(&mut h.out, &h.v);
+        self.deliver(engine, h.c, h.out, h.len)
+    }
+
+    /// Chunk `c` (`data`) handed over to the decoder; `len` is the stream's
+    /// length once pass 0 knows it.
+    fn deliver(&self, engine: &Engine, c: u64, data: Vec<f32>, len: Option<u64>) -> Result<()> {
         if let Some(out) = &engine.rf_out {
-            out.write(s0, &data)?;
+            out.write(c * CHUNK as u64, &data)?;
         }
         let mut st = self.state.lock().unwrap();
         if let Some(l) = len {
@@ -1222,6 +1228,60 @@ impl Ahead {
         st.chunks.retain(|&k, _| k >= keep_from);
         self.cv.notify_all();
         Ok(())
+    }
+
+    fn compute_chunk(&self, engine: &Engine, c: u64, prepared: &mut Option<(u64, Plan)>, held: &mut Option<Held>) -> Result<()> {
+        let s0 = c * CHUNK as u64;
+        // Wait for pass 0 to cover the chunk; that also says where the stream
+        // ends once it is known.
+        let len = engine.inner.live.wait_cover((s0 + (CHUNK + LOCK_MARGIN) as u64) as f64)?;
+        let n = len.map_or(CHUNK, |l| (l.saturating_sub(s0) as usize).min(CHUNK));
+        let plan = prepared.take().filter(|(pc, _)| *pc == c).map(|(_, p)| p);
+        if engine.gpu.is_none() {
+            let data = engine.compute(s0, n, None)?;
+            return self.deliver(engine, c, data, len);
+        }
+        // Prepare the next chunk's plan, and finish the previous chunk,
+        // alongside this chunk's GPU run.
+        let next = c + 1;
+        let next_ok = len.is_none_or(|l| next * (CHUNK as u64) < l);
+        let prev = held.take();
+        // On the stack's own pool: from this plain thread a bare `join`
+        // would run on the global pool, which the decoders fill and then
+        // block on this very buffer.
+        let (combined, (next_plan, finished)) = engine.pool.install(|| {
+            rayon::join(
+                || engine.combine(s0, n, plan),
+                || {
+                    rayon::join(
+                        || -> Result<Option<(u64, Plan)>> {
+                            if !next_ok {
+                                return Ok(None);
+                            }
+                            // Only a whole chunk: the last one, shorter, is
+                            // planned when it is computed. (A known length
+                            // alone is no reason to stop: pass 0 locates the
+                            // whole primary well before the decode ends.)
+                            let end = engine.inner.live.wait_cover(((next + 1) * CHUNK as u64 + LOCK_MARGIN as u64) as f64)?;
+                            if end.is_some_and(|l| (next + 1) * CHUNK as u64 > l) {
+                                return Ok(None);
+                            }
+                            Ok(Some((next, engine.gpu_plan(next * CHUNK as u64, CHUNK)?)))
+                        },
+                        || prev.map_or(Ok(()), |h| self.finish(engine, h)),
+                    )
+                },
+            )
+        });
+        finished?;
+        *prepared = next_plan?;
+        let (out, v) = combined?;
+        if engine.inner.wants_band() {
+            *held = Some(Held { c, out, v, len });
+            Ok(())
+        } else {
+            self.deliver(engine, c, out, len)
+        }
     }
 
     /// Chunk `c`, waiting for the producer; None past the end.
@@ -1247,6 +1307,14 @@ impl Ahead {
             st = self.cv.wait(st).unwrap();
         }
     }
+}
+
+/// A combined chunk waiting for its cancellations (`Ahead::finish`).
+struct Held {
+    c: u64,
+    out: Vec<f32>,
+    v: Vec<Complex64>,
+    len: Option<u64>,
 }
 
 /// The read-time corrected (and, with several inputs, combined) RF stream.
@@ -1693,16 +1761,19 @@ impl CrystalLines {
         let (fs, block) = (self.fs, XTAL_BLOCK);
         let nb = raw.len() / block;
         let tau = 2.0 * std::f64::consts::PI;
+        // The block's DFT at f, phase from the super-block's first sample
+        // (Goertzel's recurrence, then its phase turned back).
         let at = |f: f64, a: usize| -> Complex64 {
-            let w = -tau * f / fs;
-            let step = Complex64::from_polar(1.0, w);
-            let mut p = Complex64::from_polar(1.0, w * a as f64);
-            let mut acc = Complex64::new(0.0, 0.0);
+            let w = tau * f / fs;
+            let k = 2.0 * w.cos();
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
             for &x in &raw[a..a + block] {
-                acc += p * f64::from(x);
-                p *= step;
+                let s0 = f64::from(x) + k * s1 - s2;
+                s2 = s1;
+                s1 = s0;
             }
-            acc * (2.0 / block as f64)
+            let y = Complex64::new(s1, 0.0) - Complex64::from_polar(s2, -w);
+            y * Complex64::from_polar(2.0 / block as f64, -w * (a + block - 1) as f64)
         };
         let mut f0 = self.f0;
         if !self.ks.is_empty() {
@@ -1741,21 +1812,36 @@ impl CrystalLines {
                 .collect();
             let span = &mut raw[(t - start) as usize..(b1 - start) as usize];
             let first = (t - b0) as usize;
-            span.par_chunks_mut(XTAL_BLOCK).enumerate().for_each(|(c, o)| {
-                let a = first + c * XTAL_BLOCK;
-                // Every sample from its own position in the super-block (no
-                // running phase): the same value whatever read it is in.
-                for (i, y) in o.iter_mut().enumerate() {
-                    let pos = a + i;
-                    let u = (pos as f64 + 0.5) / XTAL_BLOCK as f64 - 0.5;
-                    let j = (u.floor().max(0.0) as usize).min(nb - 1);
-                    let s = (u - j as f64).clamp(0.0, 1.0);
-                    let mut v = f64::from(*y);
-                    for (amp, &wl) in blk.amps.iter().zip(&w) {
-                        let g = if j + 1 < nb { amp[j] * (1.0 - s) + amp[j + 1] * s } else { amp[j] };
-                        v -= (g * Complex64::from_polar(1.0, wl * pos as f64)).re;
+            let turn: Vec<Complex64> = w.iter().map(|&wl| Complex64::from_polar(1.0, wl)).collect();
+            // Pieces aligned on every XTAL_SEED-th sample of the super-block
+            // (the first one up to the next): each line's phasor is exact at
+            // that sample and turned by one step from there (a read that
+            // starts between turns up to it), so a sample gets the same value
+            // whatever read it is in. A piece lies between two block centres,
+            // so every line's amplitude is one straight segment over it.
+            let head = ((XTAL_SEED - first % XTAL_SEED) % XTAL_SEED).min(span.len());
+            let (h, rest) = span.split_at_mut(head);
+            let pieces: Vec<(usize, &mut [f32])> =
+                std::iter::once((first, h)).chain(rest.chunks_mut(XTAL_SEED).enumerate().map(|(c, o)| (first + head + c * XTAL_SEED, o))).filter(|(_, o)| !o.is_empty()).collect();
+            pieces.into_par_iter().for_each(|(a, o)| {
+                let at = a - a % XTAL_SEED;
+                let u0 = (at as f64 + 0.5) / XTAL_BLOCK as f64 - 0.5;
+                let j = (u0.floor().max(0.0) as usize).min(nb - 1);
+                let s: Vec<f64> = (a..a + o.len()).map(|pos| ((pos as f64 + 0.5) / XTAL_BLOCK as f64 - 0.5 - j as f64).clamp(0.0, 1.0)).collect();
+                let mut v: Vec<f64> = o.iter().map(|&y| f64::from(y)).collect();
+                for ((amp, &wl), &tn) in blk.amps.iter().zip(&w).zip(&turn) {
+                    let (g0, dg) = if j + 1 < nb { (amp[j], amp[j + 1] - amp[j]) } else { (amp[j], Complex64::new(0.0, 0.0)) };
+                    let mut p = Complex64::from_polar(1.0, wl * at as f64);
+                    for _ in at..a {
+                        p *= tn;
                     }
-                    *y = v as f32;
+                    for (y, &si) in v.iter_mut().zip(&s) {
+                        *y -= ((g0 + dg * si) * p).re;
+                        p *= tn;
+                    }
+                }
+                for (o, y) in o.iter_mut().zip(&v) {
+                    *o = *y as f32;
                 }
             });
             t = b1;

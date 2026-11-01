@@ -7,6 +7,7 @@
 use std::sync::Mutex;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use ld_decode::opencl::{Arg, Buffer, Gpu, Kernel, Pinned, Queue};
 use rustfft::num_complex::Complex64;
 
@@ -519,17 +520,12 @@ impl StackGpu {
         st.q.read(&st.out, 0, out)?;
         if let Some(v) = v {
             if self.f64 {
-                let mut b = vec![0.0f64; 2 * out.len()];
-                st.q.read(&st.vout, 0, &mut b)?;
-                for (o, c) in v.iter_mut().zip(b.chunks_exact(2)) {
-                    *o = Complex64::new(c[0], c[1]);
-                }
+                // A `Complex64` is two f64, as the buffer holds them.
+                st.q.read(&st.vout, 0, &mut v[..out.len()])?;
             } else {
                 let mut b = vec![0.0f32; 2 * out.len()];
                 st.q.read(&st.vout, 0, &mut b)?;
-                for (o, c) in v.iter_mut().zip(b.chunks_exact(2)) {
-                    *o = Complex64::new(f64::from(c[0]), f64::from(c[1]));
-                }
+                v.par_iter_mut().zip(b.par_chunks_exact(2)).for_each(|(o, c)| *o = Complex64::new(f64::from(c[0]), f64::from(c[1])));
             }
         }
         if timing {
