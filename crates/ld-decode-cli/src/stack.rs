@@ -82,8 +82,10 @@ const XTALK_DEC: usize = 16;
 const XTALK_FIT_STRIDE: usize = 20;
 /// FFT length of the correction's high-pass, and the context it takes on
 /// each side of each block (seconds).
-const XTALK_FFT_LEN: usize = 1 << 16;
+const XTALK_FFT_LEN: usize = 1 << 15;
 const XTALK_OV_S: f64 = 2048.0 / 75.0e6;
+/// Kept samples per span of running sums of the full-rate boxcar.
+const XTALK_BOX_SPAN: usize = 1024;
 
 /// Chroma leak cancellation (NTSC): the band the leak is fitted in (rising
 /// and falling raised-cosine edges, Hz: the chroma, 3.58 MHz +- 0.6), the
@@ -1369,36 +1371,47 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
             })
             .collect()
     };
-    // Per carrier: its phasor at every sample (to mix down, and back up), and
-    // its narrow band at 0 Hz.
-    let mixed: Vec<(Vec<Complex64>, Vec<Complex64>)> = fa
+    // Per carrier: its phase step, and its narrow band at 0 Hz.
+    let ws: Vec<f64> = fa.iter().map(|&f| -tau * f / fs).collect();
+    let mixed: Vec<Vec<Complex64>> = ws
         .par_iter()
-        .map(|&f| {
-            let w = -tau * f / fs;
-            let e: Vec<Complex64> = (0..n).into_par_iter().map(|t| Complex64::from_polar(1.0, w * t as f64)).collect();
-            // The full-rate boxcar, summed directly at the kept samples only.
-            let first: Vec<Complex64> = (0..nd)
-                .into_par_iter()
-                .map(|k| {
-                    let lo = (k * dec).saturating_sub(boxl / 2);
-                    let mut acc = zero;
-                    for t in lo..(lo + boxl).min(n) {
-                        acc += e[t] * f64::from(out[t]);
-                    }
-                    acc / boxl as f64
-                })
-                .collect();
-            (e, boxcar(&boxcar(&first, box_d), box_d))
+        .map(|&w| {
+            // The full-rate boxcar at the kept samples only, from running sums
+            // over each span of XTALK_BOX_SPAN kept samples, the carrier's
+            // phasor exact at its start and turned by one step from there.
+            let turn = Complex64::from_polar(1.0, w);
+            let mut first = vec![zero; nd];
+            first.par_chunks_mut(XTALK_BOX_SPAN).enumerate().for_each(|(c, o)| {
+                let k0 = c * XTALK_BOX_SPAN;
+                let lo_at = |k: usize| (k * dec).saturating_sub(boxl / 2);
+                let (lo0, hi1) = (lo_at(k0), (lo_at(k0 + o.len() - 1) + boxl).min(n));
+                let mut sums = Vec::with_capacity(hi1 - lo0 + 1);
+                let mut run = zero;
+                let mut p = Complex64::from_polar(1.0, w * lo0 as f64);
+                sums.push(run);
+                for t in lo0..hi1 {
+                    run += p * f64::from(out[t]);
+                    p *= turn;
+                    sums.push(run);
+                }
+                for (j, y) in o.iter_mut().enumerate() {
+                    let lo = lo_at(k0 + j);
+                    *y = (sums[(lo + boxl).min(n) - lo0] - sums[lo - lo0]) / boxl as f64;
+                }
+            });
+            boxcar(&boxcar(&first, box_d), box_d)
         })
         .collect();
-    // The carrier at `t` (analytic, at its frequency again).
-    let carrier_at = |c: usize, t: usize| -> Complex64 {
+    // The carrier at `t` (analytic, at its frequency again), from its
+    // phasor there `ph` (mixing back up: `exp(-j w t)`).
+    let carrier_with = |c: usize, t: usize, ph: Complex64| -> Complex64 {
         let k = t / dec;
         let a = (t % dec) as f64 / dec as f64;
-        let (e, l) = &mixed[c];
+        let l = &mixed[c];
         let b = if k + 1 < nd { l[k] * (1.0 - a) + l[k + 1] * a } else { l[k] };
-        b * e[t].conj() * 2.0
+        b * ph * 2.0
     };
+    let carrier_at = |c: usize, t: usize| carrier_with(c, t, Complex64::from_polar(1.0, -ws[c] * t as f64));
     let cols = |t: usize| {
         let (r0, r1) = (carrier_at(0, t), carrier_at(1, t));
         [r0.re, r0.im, r1.re, r1.im]
@@ -1432,40 +1445,42 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
     }
     let Some(k) = solve4(ata, aty) else { return };
     let gain = [Complex64::new(k[0], -k[1]), Complex64::new(k[2], -k[3])];
-    let corr: Vec<f64> = (0..n)
-        .into_par_iter()
-        .map(|t| {
-            let mut th = 0.0;
-            for c in 0..2 {
-                th += (gain[c] * carrier_at(c, t) / Complex64::new(0.0, fa[c])).re;
-            }
-            let e = t.min(n - 1 - t);
-            if e < taper {
-                th *= 0.5 - 0.5 * (std::f64::consts::PI * e as f64 / taper as f64).cos();
-            }
-            // The turn is a few hundredths of a radian: its series, to the
-            // last bit that matters.
-            let (sn, cm1) = if th.abs() < 0.05 {
-                let t2 = th * th;
-                (th * (1.0 - t2 / 6.0), t2 * (t2 / 24.0 - 0.5))
-            } else {
-                let (sn, cs) = th.sin_cos();
-                (sn, cs - 1.0)
-            };
-            v[t].re * cm1 + v[t].im * sn
-        })
-        .collect();
+    // The correction at `t` (the carriers' phasors there `ph`), computed
+    // where the high-pass reads it.
+    let corr_with = |t: usize, ph: &[Complex64; 2]| -> f64 {
+        let mut th = 0.0;
+        for c in 0..2 {
+            th += (gain[c] * carrier_with(c, t, ph[c]) / Complex64::new(0.0, fa[c])).re;
+        }
+        let e = t.min(n - 1 - t);
+        if e < taper {
+            th *= 0.5 - 0.5 * (std::f64::consts::PI * e as f64 / taper as f64).cos();
+        }
+        // The turn is a few hundredths of a radian: its series, to the
+        // last bit that matters.
+        let (sn, cm1) = if th.abs() < 0.05 {
+            let t2 = th * th;
+            (th * (1.0 - t2 / 6.0), t2 * (t2 / 24.0 - 0.5))
+        } else {
+            let (sn, cs) = th.sin_cos();
+            (sn, cs - 1.0)
+        };
+        v[t].re * cm1 + v[t].im * sn
+    };
     // Only its part in the video band (`keep`, a raised-cosine edge): below,
     // turning the video band also moves what lands on the audio carriers and
     // the EFM, which the video never reads. Overlap-save, blocks in parallel.
+    // In single precision, ample for a correction this small; two blocks
+    // to each complex FFT, the first as its real part and the second as its
+    // imaginary part (the edge's gain is real and even).
     let size = XTALK_FFT_LEN;
     let ov = ((XTALK_OV_S * fs).round() as usize).clamp(1, size / 4);
     let step = size - 2 * ov;
     let (fwd, inv) = {
-        let mut planner = XTALK_FFT.get_or_init(|| Mutex::new(FftPlanner::new())).lock().unwrap();
+        let mut planner = LEAK_FFT.get_or_init(|| Mutex::new(FftPlanner::new())).lock().unwrap();
         (planner.plan_fft_forward(size), planner.plan_fft_inverse(size))
     };
-    let gain_at: Vec<f64> = (0..size)
+    let gain_at: Vec<f32> = (0..size)
         .map(|b| {
             let f = b.min(size - b) as f64 * fs / size as f64;
             let g = if f <= keep.0 {
@@ -1475,30 +1490,39 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
             } else {
                 0.5 - 0.5 * (std::f64::consts::PI * (f - keep.0) / (keep.1 - keep.0)).cos()
             };
-            g / size as f64
+            (g / size as f64) as f32
         })
         .collect();
-    out.par_chunks_mut(step).enumerate().for_each(|(blk, o)| {
-        let s0 = blk * step;
-        let mut buf: Vec<Complex64> = (0..size)
-            .map(|i| {
-                let t = (s0 + i) as isize - ov as isize;
-                if t >= 0 && (t as usize) < n { Complex64::new(corr[t as usize], 0.0) } else { zero }
-            })
-            .collect();
+    // A block's correction from `start`, the carriers' phasors exact there
+    // and turned by one step from there.
+    let unturn = [Complex64::from_polar(1.0, -ws[0]), Complex64::from_polar(1.0, -ws[1])];
+    let block = |start: isize, put: &mut dyn FnMut(usize, f32)| {
+        let mut ph = [Complex64::from_polar(1.0, -ws[0] * start as f64), Complex64::from_polar(1.0, -ws[1] * start as f64)];
+        for i in 0..size {
+            let t = start + i as isize;
+            put(i, if t >= 0 && (t as usize) < n { corr_with(t as usize, &ph) as f32 } else { 0.0 });
+            ph[0] *= unturn[0];
+            ph[1] *= unturn[1];
+        }
+    };
+    out.par_chunks_mut(2 * step).enumerate().for_each(|(pair, o)| {
+        let s0 = (2 * pair * step) as isize - ov as isize;
+        let mut buf = vec![Complex32::new(0.0, 0.0); size];
+        block(s0, &mut |i, x| buf[i].re = x);
+        block(s0 + step as isize, &mut |i, x| buf[i].im = x);
         fwd.process(&mut buf);
         for (x, g) in buf.iter_mut().zip(&gain_at) {
             *x *= *g;
         }
         inv.process(&mut buf);
         for (i, y) in o.iter_mut().enumerate() {
-            *y = (f64::from(*y) + buf[ov + i].re) as f32;
+            let d = if i < step { buf[ov + i].re } else { buf[ov + i - step].im };
+            *y += d;
         }
     });
 }
 
-/// FFT plans of `cancel_crosstalk`.
-static XTALK_FFT: OnceLock<Mutex<FftPlanner<f64>>> = OnceLock::new();
+/// FFT plans of `cancel_crosstalk` and `cancel_chroma_leak`.
 static LEAK_FFT: OnceLock<Mutex<FftPlanner<f32>>> = OnceLock::new();
 
 /// The narrow lines the player's and the capture's clocks put into a
