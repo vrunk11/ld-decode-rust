@@ -114,6 +114,8 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--gpu-precision <p>` | `double` | `single` runs the `--gpu-fast` demodulator in f32: faster on consumer cards with little f64 throughput, further from the reference. `--gpu` is always double. |
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
+| `--ldx` | off (on for an `OUTFILE` ending in `.ldx`) | Write one [LDX container](#ldx-output) instead of the separate files; with `-`, an LDX stream on stdout. |
+| `--ldx-codec <c>` | `raw` | Codec of the LDX video (`tbc`) track: `raw`, `flac`, or `auto` (= `flac`); the analog audio follows it. `ffv1` is for 10-bit CVBS and is refused for a `tbc` track. |
 
 Short flags are the reference's exactly: `-t` is threads and `-j` is NTSC-J
 (`-j` was `--threads` in this port before 2026-10-17, so older command lines
@@ -191,6 +193,38 @@ required for stdin (`INFILE` = `-`).
 | `<out>.efm` | EFM (digital audio) samples; `efmTValues` land in the JSON. |
 | `<out>.tbc.db` | SQLite copy of the field metadata. Row-identical to Python's, **not** byte-identical: WAL mode and a different SQLite build change the page layout on purpose. |
 | `<out>.log` | Everything the run printed, including per-field timings when asked. |
+
+### LDX output
+
+With `--ldx`, or an `OUTFILE` ending in `.ldx`, the decode is written as one
+[LDX](https://github.com/vrunk11/ld-decode-tools/blob/feature/container-format/docs/Specifications/container-format.md)
+file (`<out>.ldx`, plus `<out>.log`) for ld-decode-tools, in place of the
+separate files. It is a Matroska file (profile 1) with these tracks:
+
+| Track | Kind | Content |
+| --- | --- | --- |
+| 1 | `tbc` | One field per block: the bytes of the `.tbc`. |
+| 2 | `metadata` | ld-decode JSON: the parameters first, each field's entry just before its video, and at the end the whole set, identical to the `.tbc.json`. |
+| 3 | `pcm` | The analog audio (44.1 kHz stereo), unless `--disable-analog-audio`. |
+| 3 or 4 | `efm` | The EFM t-values in 64 KiB chunks, unless `--no-efm`. |
+
+With `OUTFILE` `-` the same tracks go to stdout as an LDX stream (no size, no
+cues), so the whole decode, audio and EFM included, can feed the next tool:
+`ld-decode capture.flac - --ldx | ld-analyse -`. The `.tbc.db` is not written in
+LDX mode.
+
+The `tbc` and `pcm` tracks are raw by default. A raw `tbc` track is declared as
+real video, `V_UNCOMPRESSED`, 16-bit grey (`ColourSpace` = the FourCC
+`Y1\0\x10`, 910x263 per field, `DefaultDuration` of a field), so ffmpeg-based
+players (ffplay, mpv) open and show it; the blocks are the same bytes as the
+`.tbc`, so a reader treats it like raw audio. VLC does not know that grey-16
+FourCC. `--ldx-codec flac` (or `auto`)
+writes them as FLAC the way the specification describes (section 6.1): frames of
+32,767 samples (the encoder's cap; the specification says 32,768 and a decoder reads any size), EBML-laced, at most 8 to a unit (a 910x263 field is 7 frames and
+a short one), each unit coded by an encoder of its own so a block decodes alone,
+the top bit of the unsigned TBC samples flipped before coding, and the stand-in
+48 kHz rate. The metadata and EFM tracks are always raw. FFV1 is only for the
+10-bit frames of a `cvbs` track, which this decoder does not produce.
 
 ## Verifying parity
 
