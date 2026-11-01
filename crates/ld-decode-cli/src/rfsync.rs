@@ -52,6 +52,9 @@ pub struct System {
     /// a field's first whose codes it takes.
     vbi_after_v: (f64, f64),
     vbi_lines: (usize, usize),
+    /// Lines from a first field's start to the next field's, and from a
+    /// second field's.
+    field_lines: (usize, usize),
 }
 
 impl System {
@@ -74,6 +77,7 @@ impl System {
             porch_us: (8.0, 9.0),
             vbi_after_v: (6.0, 14.0),
             vbi_lines: (12, 20),
+            field_lines: (263, 262),
         }
     }
 
@@ -95,6 +99,7 @@ impl System {
             porch_us: (8.3, 9.5),
             vbi_after_v: (8.0, 24.0),
             vbi_lines: (10, 30),
+            field_lines: (312, 313),
         }
     }
 }
@@ -131,6 +136,12 @@ const MARGIN: usize = 1 << 17;
 /// Lines each field record carries past the next field's first line, as the
 /// decoder's do.
 const OVERLAP_LINES: usize = 10;
+/// A vertical interval found within this many lines of where the field
+/// structure puts the next field's start is taken as that start.
+const FIELD_SLACK: usize = 3;
+/// Fields the structure fills in where their vertical intervals were not
+/// found (a dropout across them), at most.
+const FIELD_FILL: usize = 4;
 
 /// A complex band-pass FIR (Kaiser-windowed), as separate re/im taps.
 struct Fir {
@@ -253,6 +264,15 @@ struct Tracker {
     fields: Vec<(usize, bool)>,
     /// Frame code of the last first field sent (a second field inherits it).
     last_code: Option<(bool, Option<Vec<i64>>)>,
+    field_lines: (usize, usize),
+    /// The last field found (absolute first line, first field), and how many
+    /// fields in a row have followed the field structure up to it.
+    last_field: Option<(usize, bool)>,
+    lock: usize,
+    /// Pulses off the line grid since the last one on it.
+    rejected: Vec<f64>,
+    /// The last two first fields' frame codes that identified a frame.
+    recent_codes: Vec<Vec<i64>>,
 }
 
 impl Tracker {
@@ -271,6 +291,11 @@ impl Tracker {
             pending: None,
             fields: Vec::new(),
             last_code: None,
+            field_lines: sys.field_lines,
+            last_field: None,
+            lock: 0,
+            rejected: Vec::new(),
+            recent_codes: Vec::new(),
         }
     }
 
@@ -286,6 +311,85 @@ impl Tracker {
         self.last_h = None;
         self.fields.clear();
         self.in_vsync = false;
+        self.last_field = None;
+        self.lock = 0;
+        self.rejected.clear();
+    }
+
+    /// A first field's frame code, with what a dropout over a VBI line took
+    /// out of it put back: the words the last two codes share (a CLV disc's
+    /// constant word next to its time code) are added where missing. A code
+    /// left with only such words identifies no frame (every field has them)
+    /// and is dropped: the field stays unpaired rather than paired with a
+    /// wrong one.
+    fn repair_code(&mut self, code: Option<Vec<i64>>) -> Option<Vec<i64>> {
+        let shared: Vec<i64> = match self.recent_codes.as_slice() {
+            [a, b] => a.iter().copied().filter(|w| b.contains(w)).collect(),
+            _ => Vec::new(),
+        };
+        let mut c = code?;
+        for &w in &shared {
+            if !c.contains(&w) {
+                c.push(w);
+            }
+        }
+        c.sort_unstable();
+        if !shared.is_empty() && c.iter().all(|w| shared.contains(w)) {
+            return None;
+        }
+        self.recent_codes.push(c.clone());
+        if self.recent_codes.len() > 2 {
+            self.recent_codes.remove(0);
+        }
+        Some(c)
+    }
+
+    /// Lines from the start of a field of parity `first` to the next one.
+    fn field_len(&self, first: bool) -> usize {
+        if first { self.field_lines.0 } else { self.field_lines.1 }
+    }
+
+    /// A vertical interval found at line `li`. Once two fields in a row have
+    /// followed the field structure (alternating parities, fixed lengths),
+    /// a start within FIELD_SLACK lines of the next predicted one is taken as
+    /// that one, with its parity: a dropout over an hsync or an equalizing
+    /// pulse moves the detection by a line or flips its parity. Missed
+    /// intervals (up to FIELD_FILL fields) are filled in, and one found well
+    /// before the prediction is a false one and dropped. Anything else is a
+    /// jump in the capture: the structure starts over from it.
+    fn field_found(&mut self, li: usize, first: bool) {
+        if let (Some((last, lf)), true) = (self.last_field, self.lock >= 2) {
+            let (mut e, mut ef) = (last + self.field_len(lf), !lf);
+            let mut fill = Vec::new();
+            while e + FIELD_SLACK < li && fill.len() < FIELD_FILL {
+                fill.push((e, ef));
+                e += self.field_len(ef);
+                ef = !ef;
+            }
+            if li + FIELD_SLACK >= e && li <= e + FIELD_SLACK {
+                self.fields.extend(fill);
+                self.fields.push((e, ef));
+                self.last_field = Some((e, ef));
+                self.lock += 1;
+                return;
+            }
+            if li + FIELD_SLACK < last + self.field_len(lf) {
+                return;
+            }
+        }
+        let follows = self.last_field.is_some_and(|(last, lf)| last + self.field_len(lf) == li && lf != first);
+        self.lock = if follows { self.lock + 1 } else { 1 };
+        self.fields.push((li, first));
+        self.last_field = Some((li, first));
+    }
+
+    /// Whether the rejected pulses lie on a line grid of their own: a jump
+    /// in the capture, rather than a dropout's noise.
+    fn rejected_on_grid(&self) -> bool {
+        self.rejected.windows(2).all(|w| {
+            let kr = ((w[1] - w[0]) / self.hlen).round();
+            (1.0..=40.0).contains(&kr) && (w[1] - w[0] - kr * self.hlen).abs() <= (0.4 + 0.15 * (kr - 1.0)) * self.fs / 1e6
+        })
     }
 
     fn pulse(&mut self, p: Pulse, fine: Fine) {
@@ -298,10 +402,17 @@ impl Tracker {
                     // seen): a false pulse (dropout).
                     let off = (p.start - ls - kr * self.hlen).abs();
                     if kr < 1.0 || off > (0.4 + 0.15 * (kr - 1.0)) * self.fs / 1e6 {
+                        // Four pulses off the grid in a row start a new one
+                        // only if they agree among themselves: in a dropout
+                        // the false pulses do not, and the grid holds.
                         self.rejects += 1;
-                        if self.rejects >= 4 {
+                        self.rejected.push(p.start);
+                        if self.rejects >= 4 && self.rejected_on_grid() {
                             self.reset();
                         } else {
+                            if self.rejected.len() >= 4 {
+                                self.rejected.remove(0);
+                            }
                             return;
                         }
                     } else if kr > 40.0 {
@@ -318,6 +429,7 @@ impl Tracker {
                     }
                 }
                 self.rejects = 0;
+                self.rejected.clear();
                 self.lines.push(fine);
                 self.last_h = Some((self.end() - 1, p.start));
                 self.in_vsync = false;
@@ -327,8 +439,8 @@ impl Tracker {
                 let Some((li, ls)) = self.last_h else { return };
                 if self.in_vsync {
                     if p.kind == Kind::V {
-                        if let Some(f) = self.pending.take() {
-                            self.fields.push(f);
+                        if let Some((li, first)) = self.pending.take() {
+                            self.field_found(li, first);
                         }
                     }
                     return;
@@ -451,7 +563,7 @@ impl Tracker {
                         .iter()
                         .filter_map(|l| l.code)
                         .collect();
-                    Some(frame_code(&words)).filter(|c| !c.is_empty())
+                    self.repair_code(Some(frame_code(&words)).filter(|c| !c.is_empty()))
                 } else {
                     self.last_code.as_ref().filter(|p| p.0).and_then(|p| p.1.clone())
                 };
