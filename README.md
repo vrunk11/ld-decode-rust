@@ -111,11 +111,13 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--deemp <high,low>` | reference constants | De-emphasis time constants in microseconds. |
 | `--no-agc` | off | Disable automatic gain control. |
 | `--no-dod` | off | Disable dropout detection. |
-| `--ntsc-color-notch` | off | Notch filter on the decoded video, reduces colour wobble. |
+| `--ntsc-color-notch` | off | Notch filter on the decoded video, reduces colour wobble. With `--tbc read` the chroma leak behind it is already cancelled (see `--keep-chroma-leak`). |
 | `--lowband` | off | Lower-bandwidth (lowband) decode settings. |
 | `-i`, `--input <file>` / `-o`, `--output <base>` | — | The sources and the output base name, instead of the positional form; repeat `-i` to stack captures. |
-| `--tbc <read\|resample>` | `read` | Time-base correction. `read` reads the RF at the corrected positions before demodulation (and cancels the audio crosstalk); `resample` resamples the demodulated video, the reference decoder's way and **its bytes**. Where `read` cannot run on a single source (stdin, `.flac`/`.ldf`, no lines found) the decode falls back to `resample` with a warning. Several sources always use `read`. |
+| `--tbc <read\|resample>` | `read` | Time-base correction. `read` reads the RF at the corrected positions before demodulation (and cancels the audio crosstalk, the clock lines and the chroma leak); `resample` resamples the demodulated video, the reference decoder's way and **its bytes**. Where `read` cannot run on a single source (stdin, `.flac`/`.ldf`, no lines found) the decode falls back to `resample` with a warning. Several sources always use `read`. |
 | `--keep-audio-crosstalk` | off | Leave the analog audio carriers' crosstalk in the video (`read` cancels it by default). |
+| `--keep-crystal-lines` | off | Leave the clock lines in the RF (`read` subtracts them by default): the player's EFM decoder crystal, its 4fsc video clock, the capture board's clocks. |
+| `--keep-chroma-leak` | off | Leave the chroma that leaks into the RF (NTSC; `read` cancels it by default). |
 | `--stack-weight <w>` | `adaptive` | How a stack weighs its inputs: `adaptive` (per sample, by carrier amplitude, with an alignment guard) or `fixed` (one weight per input, the earlier stack). |
 | `--rf-out <file>` | off | Also write the RF the decoder reads (the stacked or time-base corrected stream, s16 at the input rate). |
 | `--device <cpu\|opencl>` | `cpu` | Where the FM demodulator and the read-time TBC / stack run. `opencl` runs them on a GPU through the driver's OpenCL runtime. See [GPU demodulation](#gpu-demodulation). |
@@ -192,6 +194,36 @@ from the VITS): one capture +0.48 to +0.83 dB / +0.57 to +0.68 dB over
 `--tbc resample`. On PAL `ld-1100` captures at 40 MHz it is neutral (within
 ±0.03 dB): the PAL audio carriers sit far below the video.
 
+Before anything else the clocks' lines are subtracted from each capture's
+samples: narrow lines that stand at one frequency all through it, found on
+four stretches spread over the capture. The player's EFM decoder crystal
+(16.9344 MHz) leaves the multiples of its 192nd, 88.2 kHz, with its drift
+followed as it goes; its 4fsc video clock, the capture board's clocks and,
+at a low sample rate, whatever of them folds into the video band leave
+others. Each line's amplitude and phase is measured on every 2^16 samples.
+Left out: the bands where the disc's own signal makes steady lines (the
+audio carriers, the chroma leak's band, the video carrier's swing) and any
+comb spaced by the line frequency (a still picture's). Measured (wSNR):
++0.09 dB on one NTSC capture at 75 MHz, +0.14 dB at 40 MHz where more
+lines fold into the band, neutral in a stack (the inputs' lines, at
+unrelated phases, already average down) and on PAL.
+
+On NTSC the composite chroma leaks into the RF baseband around 3.58 MHz and
+beats with the video carrier into fine wavering vertical stripes in
+saturated areas ("colour wobble"; the player's own CVBS output shows them,
+so it is in the disc's or the player's signal). On every chunk the decoded
+chroma (the video band's instantaneous frequency through 3.0-4.2 MHz) is
+fitted to the RF's same band with a 13-tap filter and the predicted leak
+subtracted before demodulation, where the chroma explains at least 5% of
+that band (a disc without the leak is left byte for byte as it was). The
+stripes' 4.73-4.95 MHz bump over its neighbours goes from +5.8 dB to -0.2
+on one capture, +7.1 to -0.2 on three copies; the VITS measures do not
+move.
+
+Per 2^21-sample chunk (28 ms of signal at 75 MHz, 3 inputs) the two
+cancellations take about 10.5 ms (audio crosstalk) and 8.5 ms (chroma
+leak) on the CPU pool.
+
 Repeating `-i` stacks captures of the same disc (several passes, or several
 copies): the fields are paired by their VBI frame codes, every input is read
 at its own positions, phase-locked onto the primary's carrier and weighed per
@@ -265,7 +297,7 @@ the top bit of the unsigned TBC samples flipped before coding, and the stand-in
 ## Verifying parity
 
 **Run the comparison with `--tbc resample`.** The default `--tbc read` (and the
-audio crosstalk cancellation it carries) is a better decode than the
+cancellations it carries) is a better decode than the
 reference's and therefore not its bytes; `--tbc resample` is the reference's
 time-base correction, byte-identical as below.
 

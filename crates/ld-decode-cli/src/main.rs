@@ -79,9 +79,11 @@ struct Args {
     /// left as they are.
     #[arg(long)]
     keep_audio_crosstalk: bool,
-    /// Leave the lines of the player's EFM decoder crystal in the RF. By
-    /// default `--tbc read` finds that crystal (16.9344 MHz) in the capture
-    /// and subtracts its lines (multiples of 88.2 kHz) from the stream.
+    /// Leave the clock lines in the RF. By default `--tbc read` finds the
+    /// narrow lines the player's and the capture's clocks leave in each
+    /// capture (the EFM decoder crystal's multiples of 88.2 kHz, the 4fsc
+    /// video clock, the capture board's clocks, what of them folds down at a
+    /// low sample rate) and subtracts them from its samples as they are read.
     #[arg(long)]
     keep_crystal_lines: bool,
     /// Leave the chroma that leaks into the RF (NTSC). By default `--tbc
