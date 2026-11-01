@@ -85,6 +85,31 @@ const XTALK_FIT_STRIDE: usize = 20;
 const XTALK_FFT_LEN: usize = 1 << 16;
 const XTALK_OV_S: f64 = 2048.0 / 75.0e6;
 
+/// A player's EFM decoder crystal (384 x 44.1 kHz) and the divisor its lines
+/// in the RF are multiples of (its 192nd, 88.2 kHz).
+const EFM_XTAL_HZ: f64 = 16.9344e6;
+const XTAL_DIV: f64 = 192.0;
+/// The crystal is looked for within this fraction of `EFM_XTAL_HZ`.
+const XTAL_SEARCH: f64 = 2e-3;
+/// Detection spectrum: FFT length, segments averaged, and the span around a
+/// bin its floor is the median of (Hz).
+const XTAL_FFT: usize = 1 << 21;
+const XTAL_SEGMENTS: usize = 4;
+const XTAL_FLOOR_HZ: f64 = 20e3;
+/// Power over the floor for the crystal itself to count as found, and for a
+/// multiple to be subtracted (10 dB both).
+const XTAL_FIND: f64 = 10.0;
+const XTAL_KEEP: f64 = 10.0;
+/// Lines above this are left: nothing the decoder reads reaches that high
+/// (its video band ends at 13.8 MHz).
+const XTAL_TOP_HZ: f64 = 14.5e6;
+/// Samples a line's amplitude and phase are measured over, and the
+/// super-blocks the crystal's drift is followed on (aligned on the capture,
+/// so every read of a sample cleans it alike); super-blocks kept measured.
+const XTAL_BLOCK: usize = 1 << 16;
+const XTAL_SUPER: usize = 1 << 22;
+const XTAL_CACHE: usize = 16;
+
 /// Band used to estimate each input's noise floor (no signal there), kept
 /// below `NOISE_TOP` of the Nyquist frequency (the capture's anti-alias
 /// filter); where less than `NOISE_MIN_BW` of it remains (a capture at 30
@@ -527,11 +552,13 @@ pub(crate) fn frame_code(words: &[i64]) -> Vec<i64> {
 pub struct StackInput {
     pub path: String,
     reader: RawFile,
+    /// The player's EFM decoder crystal lines, subtracted as it is read.
+    xtal: Option<CrystalLines>,
 }
 
 impl StackInput {
     pub fn new(path: &str, format: SampleFormat) -> Result<Self> {
-        Ok(Self { path: path.to_string(), reader: RawFile::open(path, format)? })
+        Ok(Self { path: path.to_string(), reader: RawFile::open(path, format)?, xtal: None })
     }
 
     /// Length in samples.
@@ -873,7 +900,8 @@ impl InputSpan {
 impl Inner {
     /// Whether every input has 16-bit codes (see `RawFile::code`).
     pub(crate) fn has_codes(&self) -> bool {
-        self.inputs.iter().all(|s| s.reader.code.is_some())
+        // The cleaned samples are no longer codes.
+        self.inputs.iter().all(|s| s.reader.code.is_some() && s.xtal.is_none())
     }
 
     fn plan(&self, s0: f64, len: usize, codes: bool) -> Result<Plan> {
@@ -938,6 +966,9 @@ impl Inner {
                 } else {
                     raw = vec![0f32; (end - start) as usize];
                     self.inputs[i].reader.read_at(start, &mut raw)?;
+                    if let Some(x) = &self.inputs[i].xtal {
+                        x.clean(&self.inputs[i].reader, start, &mut raw)?;
+                    }
                 }
                 Ok(Some(InputSpan { raw, codes: codes16, off, start, a0, slope }))
             })
@@ -1183,11 +1214,18 @@ pub struct VirtualSource {
 }
 
 impl VirtualSource {
-    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, carrier: bool, xtalk: bool, rf_out: Option<RfOut>) -> Result<Self> {
+    pub fn new(inputs: Vec<StackInput>, live: Arc<Live>, fs: f64, pal: bool, opencl: bool, exact: bool, carrier: bool, xtalk: bool, xtal: bool, rf_out: Option<RfOut>) -> Result<Self> {
         // 1/sigma^2 from each input's noise floor, measured where pass 0
         // first located it (the stream starts before the rest is known).
         let mut weight = Vec::new();
-        for (s, first) in inputs.iter().zip(live.first_lines()?) {
+        let firsts = live.first_lines()?;
+        let mut inputs = inputs;
+        if xtal {
+            for (s, first) in inputs.iter_mut().zip(&firsts) {
+                s.xtal = CrystalLines::detect(&s.reader, first.unwrap_or(0.0) as i64, fs, &s.path)?;
+            }
+        }
+        for (s, first) in inputs.iter().zip(firsts) {
             let at = first.unwrap_or(0.0) as i64;
             let sig2 = noise_floor(&s.reader, at, fs)?;
             tracing::info!("stack: {} noise floor {:.4e} (weight {:.4e})", s.path, sig2, 1.0 / sig2);
@@ -1417,6 +1455,180 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
 
 /// FFT plans of `cancel_crosstalk`.
 static XTALK_FFT: OnceLock<Mutex<FftPlanner<f64>>> = OnceLock::new();
+
+/// The lines a player's EFM decoder crystal puts into a capture: its
+/// frequency near `EFM_XTAL_HZ`, found in the capture, and the multiples of
+/// its 192nd (`XTAL_DIV`, 88.2 kHz: the decoder's dividers all come down to
+/// it) that stand out of the spectrum around them. They are subtracted from
+/// the capture's samples as they are read (`clean`), before anything else.
+pub(crate) struct CrystalLines {
+    /// The 192nd of the crystal (Hz), and the multiples found.
+    f0: f64,
+    ks: Vec<u32>,
+    /// The strongest line's multiple: the one the drift is followed on.
+    reference: u32,
+    fs: f64,
+    /// Measured super-blocks (absolute index), the most recent last.
+    cache: Mutex<Vec<(i64, Arc<CrystalBlock>)>>,
+}
+
+/// The crystal's lines over one super-block of the capture
+/// (`XTAL_SUPER` samples from `k * XTAL_SUPER`): the frequency there, and
+/// every line's complex amplitude on each `XTAL_BLOCK` within it.
+struct CrystalBlock {
+    f0: f64,
+    amps: Vec<Vec<Complex64>>,
+}
+
+impl CrystalLines {
+    fn detect(file: &RawFile, start: i64, fs: f64, path: &str) -> Result<Option<Self>> {
+        let n = XTAL_FFT;
+        let fft = FftPlanner::new().plan_fft_forward(n);
+        let win: Vec<f64> = (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos()).collect();
+        let mut power = vec![0.0f64; n / 2];
+        let mut raw = vec![0f32; n];
+        for seg in 0..XTAL_SEGMENTS {
+            file.read_at(start + (seg * n) as i64, &mut raw)?;
+            let mean = raw.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+            let mut x: Vec<Complex64> = raw.iter().zip(&win).map(|(&v, w)| Complex64::new((f64::from(v) - mean) * w, 0.0)).collect();
+            fft.process(&mut x);
+            for (p, v) in power.iter_mut().zip(&x) {
+                *p += v.norm_sqr();
+            }
+        }
+        let bin = fs / n as f64;
+        // A line's height over the median of the spectrum within XTAL_FLOOR_HZ.
+        let floor = |b: usize| {
+            let h = (XTAL_FLOOR_HZ / bin) as usize;
+            let mut around: Vec<f64> = power[b.saturating_sub(h)..(b + h).min(power.len())].to_vec();
+            around.sort_by(f64::total_cmp);
+            around[around.len() / 2]
+        };
+        // The highest bin within `w` bins of `b`, with its parabolic offset.
+        let peak = |b: usize, w: usize| -> (usize, f64) {
+            let k = (b.saturating_sub(w)..=(b + w).min(power.len() - 2)).max_by(|&i, &j| power[i].total_cmp(&power[j])).unwrap_or(b);
+            let (l, c, r) = (power[k.max(1) - 1].ln(), power[k].ln(), power[k + 1].ln());
+            let d = l - 2.0 * c + r;
+            (k, if d < 0.0 { 0.5 * (l - r) / d } else { 0.0 })
+        };
+        let (lo, hi) = ((EFM_XTAL_HZ * (1.0 - XTAL_SEARCH) / bin) as usize, (EFM_XTAL_HZ * (1.0 + XTAL_SEARCH) / bin) as usize);
+        if hi + 2 >= power.len() {
+            return Ok(None);
+        }
+        let (k, off) = peak((lo + hi) / 2, (hi - lo) / 2);
+        if power[k] < floor(k) * XTAL_FIND {
+            return Ok(None);
+        }
+        let f0 = (k as f64 + off) * bin / XTAL_DIV;
+        let (mut ks, mut best) = (Vec::new(), (0.0f64, 0u32));
+        let top = (XTAL_TOP_HZ.min(0.49 * fs) / f0) as u32;
+        for m in 1..=top {
+            let b = (f64::from(m) * f0 / bin).round() as usize;
+            let (k, _) = peak(b, 3);
+            let h = power[k] / floor(k);
+            if h >= XTAL_KEEP {
+                ks.push(m);
+                if h > best.0 {
+                    best = (h, m);
+                }
+            }
+        }
+        tracing::info!(
+            "stack: {path}: EFM decoder crystal at {:.5} MHz, {} of its lines subtracted ({} MHz)",
+            f0 * XTAL_DIV / 1e6,
+            ks.len(),
+            ks.iter().map(|&m| format!("{:.4}", f64::from(m) * f0 / 1e6)).collect::<Vec<_>>().join(", ")
+        );
+        Ok((!ks.is_empty()).then_some(Self { f0, ks, reference: best.1, fs, cache: Mutex::new(Vec::new()) }))
+    }
+
+    /// Super-block `k`, measured or from the cache.
+    fn block(&self, file: &RawFile, k: i64) -> Result<Arc<CrystalBlock>> {
+        if let Some((_, b)) = self.cache.lock().unwrap().iter().find(|(i, _)| *i == k) {
+            return Ok(Arc::clone(b));
+        }
+        let mut raw = vec![0f32; XTAL_SUPER];
+        file.read_at(k * XTAL_SUPER as i64, &mut raw)?;
+        let b = Arc::new(self.measure(&raw));
+        let mut cache = self.cache.lock().unwrap();
+        if !cache.iter().any(|(i, _)| *i == k) {
+            cache.push((k, Arc::clone(&b)));
+            if cache.len() > XTAL_CACHE {
+                cache.remove(0);
+            }
+        }
+        Ok(b)
+    }
+
+    /// The lines over one super-block: the crystal's drift there from the
+    /// reference line's phase advance from block to block, then every line's
+    /// amplitude on every block at that frequency. Phases are counted from the
+    /// super-block's first sample.
+    fn measure(&self, raw: &[f32]) -> CrystalBlock {
+        let (fs, block) = (self.fs, XTAL_BLOCK);
+        let nb = raw.len() / block;
+        let tau = 2.0 * std::f64::consts::PI;
+        let at = |f: f64, a: usize| -> Complex64 {
+            let w = -tau * f / fs;
+            let step = Complex64::from_polar(1.0, w);
+            let mut p = Complex64::from_polar(1.0, w * a as f64);
+            let mut acc = Complex64::new(0.0, 0.0);
+            for &x in &raw[a..a + block] {
+                acc += p * f64::from(x);
+                p *= step;
+            }
+            acc * (2.0 / block as f64)
+        };
+        let fr = f64::from(self.reference) * self.f0;
+        let phases: Vec<f64> = (0..nb).into_par_iter().map(|b| at(fr, b * block).arg()).collect();
+        let mut adv = 0.0;
+        for w in phases.windows(2) {
+            let mut d = w[1] - w[0];
+            d -= tau * (d / tau).round();
+            adv += d;
+        }
+        let df = adv / (nb - 1) as f64 / (tau * block as f64 / fs);
+        let f0 = self.f0 * (1.0 + df / fr);
+        let amps = self.ks.par_iter().map(|&m| (0..nb).map(|b| at(f64::from(m) * f0, b * block)).collect()).collect();
+        CrystalBlock { f0, amps }
+    }
+
+    /// Subtract the lines from `raw`, the capture's samples from `start`.
+    fn clean(&self, file: &RawFile, start: i64, raw: &mut [f32]) -> Result<()> {
+        let sb = XTAL_SUPER as i64;
+        let end = (start + raw.len() as i64).min(file.len as i64);
+        let mut t = start.max(0);
+        let tau = 2.0 * std::f64::consts::PI;
+        let nb = XTAL_SUPER / XTAL_BLOCK;
+        while t < end {
+            let k = t.div_euclid(sb);
+            let (b0, b1) = (k * sb, ((k + 1) * sb).min(end));
+            let blk = self.block(file, k)?;
+            let span = &mut raw[(t - start) as usize..(b1 - start) as usize];
+            let first = (t - b0) as usize;
+            span.par_chunks_mut(XTAL_BLOCK).enumerate().for_each(|(c, o)| {
+                let a = first + c * XTAL_BLOCK;
+                // Every sample from its own position in the super-block (no
+                // running phase): the same value whatever read it is in.
+                for (i, y) in o.iter_mut().enumerate() {
+                    let pos = a + i;
+                    let u = (pos as f64 + 0.5) / XTAL_BLOCK as f64 - 0.5;
+                    let j = (u.floor().max(0.0) as usize).min(nb - 1);
+                    let s = (u - j as f64).clamp(0.0, 1.0);
+                    let mut v = f64::from(*y);
+                    for (amp, &m) in blk.amps.iter().zip(&self.ks) {
+                        let g = if j + 1 < nb { amp[j] * (1.0 - s) + amp[j + 1] * s } else { amp[j] };
+                        let p = Complex64::from_polar(1.0, tau * f64::from(m) * blk.f0 / self.fs * pos as f64);
+                        v -= (g * p).re;
+                    }
+                    *y = v as f32;
+                }
+            });
+            t = b1;
+        }
+        Ok(())
+    }
+}
 
 /// Solve the 4x4 system `a x = b` (Gaussian elimination, partial pivoting);
 /// `None` when it is singular.

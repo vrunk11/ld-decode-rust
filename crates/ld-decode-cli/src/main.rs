@@ -79,6 +79,11 @@ struct Args {
     /// left as they are.
     #[arg(long)]
     keep_audio_crosstalk: bool,
+    /// Leave the lines of the player's EFM decoder crystal in the RF. By
+    /// default `--tbc read` finds that crystal (16.9344 MHz) in the capture
+    /// and subtracts its lines (multiples of 88.2 kHz) from the stream.
+    #[arg(long)]
+    keep_crystal_lines: bool,
     /// Where the FM demodulation and the read-time TBC / stack run: `cpu`
     /// (bit-exact to the reference), or `opencl` (a GPU through its driver's
     /// OpenCL runtime; see --gpu-precision).
@@ -397,7 +402,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, args.rf_out.as_deref()) {
+        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, args.rf_out.as_deref()) {
             Ok(v) => Box::new(v),
             // Read was the default, not asked for: a source it cannot read
             // (stdin, a compressed format) or finds no lines in still
@@ -629,6 +634,7 @@ fn read_tbc_source(
     preset: Preset,
     stack_weight: StackWeight,
     xtalk: bool,
+    xtal: bool,
     rf_out: Option<&str>,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
@@ -669,7 +675,7 @@ fn read_tbc_source(
         })?;
     }
     let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
-    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, rf_out)
+    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, xtal, rf_out)
 }
 
 /// The sample rate a Domesday Duplicator capture records in the `.yaml`
