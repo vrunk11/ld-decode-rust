@@ -43,7 +43,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "feat/**"]
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 

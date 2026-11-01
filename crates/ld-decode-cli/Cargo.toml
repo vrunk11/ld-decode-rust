@@ -20,5 +20,7 @@ mimalloc = "0.1"
 rayon = "1"
 rustfft = "6"
 claxon = "0.4"
+# FLAC encoder for the LDX tbc/pcm tracks (--ldx-codec flac)
+flacenc = "0.5"
 ogg = "0.9"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
