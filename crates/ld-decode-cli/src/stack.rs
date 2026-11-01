@@ -78,6 +78,8 @@ const XTALK_TAPER_S: f64 = 1024.0 / 75.0e6;
 const XTALK_KEEP_HZ: (f64, f64) = (3.0e6, 3.6e6);
 /// The carriers, once at 0 Hz, are kept every this many samples.
 const XTALK_DEC: usize = 16;
+/// The crosstalk gains are fitted on every this many samples of a chunk.
+const XTALK_FIT_STRIDE: usize = 20;
 /// FFT length of the correction's high-pass, and the context it takes on
 /// each side of each block (seconds).
 const XTALK_FFT_LEN: usize = 1 << 16;
@@ -1292,17 +1294,16 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
         .map(|&f| {
             let w = -tau * f / fs;
             let e: Vec<Complex64> = (0..n).into_par_iter().map(|t| Complex64::from_polar(1.0, w * t as f64)).collect();
-            let mut c = Vec::with_capacity(n + 1);
-            let mut run = zero;
-            c.push(run);
-            for (&x, &p) in out.iter().zip(&e) {
-                run += p * f64::from(x);
-                c.push(run);
-            }
+            // The full-rate boxcar, summed directly at the kept samples only.
             let first: Vec<Complex64> = (0..nd)
+                .into_par_iter()
                 .map(|k| {
                     let lo = (k * dec).saturating_sub(boxl / 2);
-                    (c[(lo + boxl).min(n)] - c[lo]) / boxl as f64
+                    let mut acc = zero;
+                    for t in lo..(lo + boxl).min(n) {
+                        acc += e[t] * f64::from(out[t]);
+                    }
+                    acc / boxl as f64
                 })
                 .collect();
             (e, boxcar(&boxcar(&first, box_d), box_d))
@@ -1320,8 +1321,9 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
         let (r0, r1) = (carrier_at(0, t), carrier_at(1, t));
         [r0.re, r0.im, r1.re, r1.im]
     };
-    // Least squares on every 5th sample away from the edges, means removed.
-    let idx: Vec<usize> = (taper..n - taper).step_by(5).collect();
+    // Least squares on every XTALK_FIT_STRIDE-th sample away from the edges,
+    // means removed.
+    let idx: Vec<usize> = (taper..n - taper).step_by(XTALK_FIT_STRIDE).collect();
     let cnt = idx.len() as f64;
     let rows: Vec<([f64; 4], f64)> = idx.par_iter().map(|&t| (cols(t), (v[t] * v[t - 1].conj()).arg() * fs / tau)).collect();
     let (mut mx, mut my) = ([0.0f64; 4], 0.0f64);
@@ -1359,8 +1361,16 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
             if e < taper {
                 th *= 0.5 - 0.5 * (std::f64::consts::PI * e as f64 / taper as f64).cos();
             }
-            let (sn, cs) = th.sin_cos();
-            v[t].re * (cs - 1.0) + v[t].im * sn
+            // The turn is a few hundredths of a radian: its series, to the
+            // last bit that matters.
+            let (sn, cm1) = if th.abs() < 0.05 {
+                let t2 = th * th;
+                (th * (1.0 - t2 / 6.0), t2 * (t2 / 24.0 - 0.5))
+            } else {
+                let (sn, cs) = th.sin_cos();
+                (sn, cs - 1.0)
+            };
+            v[t].re * cm1 + v[t].im * sn
         })
         .collect();
     // Only its part in the video band (`keep`, a raised-cosine edge): below,
