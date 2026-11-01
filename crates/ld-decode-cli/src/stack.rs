@@ -28,7 +28,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{bail, Context as _, Result};
 use rayon::prelude::*;
-use rustfft::num_complex::Complex64;
+use rustfft::num_complex::{Complex32, Complex64};
 use rustfft::FftPlanner;
 
 use crate::reader::{SampleFormat, SampleSource};
@@ -95,6 +95,11 @@ const LEAK_STEP: usize = 2;
 const LEAK_FIT_STRIDE: usize = 7;
 /// A chunk is corrected only where the leak explains at least this share of
 /// the RF's chroma band (a disc or a stretch with no leak is left untouched).
+/// FFT length of the band filter (overlap-save blocks: enough of them to
+/// share out over the cores).
+const LEAK_FFT_LEN: usize = 1 << 15;
+/// Fit samples per parallel span of the normal equations.
+const LEAK_FIT_SPAN: usize = 1 << 12;
 const LEAK_MIN_SHARE: f64 = 0.05;
 
 /// A player's EFM decoder crystal (384 x 44.1 kHz) and the divisor its lines
@@ -1494,6 +1499,7 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
 
 /// FFT plans of `cancel_crosstalk`.
 static XTALK_FFT: OnceLock<Mutex<FftPlanner<f64>>> = OnceLock::new();
+static LEAK_FFT: OnceLock<Mutex<FftPlanner<f32>>> = OnceLock::new();
 
 /// The narrow lines the player's and the capture's clocks put into a
 /// capture, subtracted from its samples as they are read (`clean`), before
@@ -1734,15 +1740,20 @@ impl CrystalLines {
     }
 }
 
-/// `x` through a band of raised-cosine edges `rise` and `fall` (Hz), by
-/// overlap-save FFT blocks in parallel (zero outside `x`).
-fn band_filter(x: &[f64], fs: f64, rise: (f64, f64), fall: (f64, f64)) -> Vec<f64> {
+/// The chroma leak cancellation's two signals through a band of
+/// raised-cosine edges `rise` and `fall` (Hz): the instantaneous frequency
+/// of the video band `v` (Hz) and the RF `x`, by overlap-save FFT blocks in
+/// parallel (zero outside them), each block computing its own stretch of
+/// both. One complex FFT carries the pair, the frequency as its real part
+/// and the RF as its imaginary part, the band's gain being real and even;
+/// in single precision, ample for a correction this small.
+fn leak_bands(v: &[Complex64], x: &[f32], fs: f64, rise: (f64, f64), fall: (f64, f64)) -> (Vec<f32>, Vec<f32>) {
     let n = x.len();
-    let size = XTALK_FFT_LEN;
+    let size = LEAK_FFT_LEN;
     let ov = ((XTALK_OV_S * fs).round() as usize).clamp(1, size / 4);
     let step = size - 2 * ov;
     let (fwd, inv) = {
-        let mut planner = XTALK_FFT.get_or_init(|| Mutex::new(FftPlanner::new())).lock().unwrap();
+        let mut planner = LEAK_FFT.get_or_init(|| Mutex::new(FftPlanner::new())).lock().unwrap();
         (planner.plan_fft_forward(size), planner.plan_fft_inverse(size))
     };
     let rc = |f: f64, (a, b): (f64, f64)| {
@@ -1754,19 +1765,27 @@ fn band_filter(x: &[f64], fs: f64, rise: (f64, f64), fall: (f64, f64)) -> Vec<f6
             0.5 - 0.5 * (std::f64::consts::PI * (f - a) / (b - a)).cos()
         }
     };
-    let gain: Vec<f64> = (0..size)
+    let gain: Vec<f32> = (0..size)
         .map(|b| {
             let f = b.min(size - b) as f64 * fs / size as f64;
-            rc(f, rise) * (1.0 - rc(f, fall)) / size as f64
+            (rc(f, rise) * (1.0 - rc(f, fall)) / size as f64) as f32
         })
         .collect();
-    let mut out = vec![0.0f64; n];
-    out.par_chunks_mut(step).enumerate().for_each(|(blk, o)| {
+    let hz = fs / (2.0 * std::f64::consts::PI);
+    let (mut oc, mut or) = (vec![0.0f32; n], vec![0.0f32; n]);
+    oc.par_chunks_mut(step).zip(or.par_chunks_mut(step)).enumerate().for_each(|(blk, (a, b))| {
         let s0 = blk * step;
-        let mut buf: Vec<Complex64> = (0..size)
+        let mut buf: Vec<Complex32> = (0..size)
             .map(|i| {
                 let t = (s0 + i) as isize - ov as isize;
-                Complex64::new(if t >= 0 && (t as usize) < n { x[t as usize] } else { 0.0 }, 0.0)
+                if t >= 1 && (t as usize) < n {
+                    let t = t as usize;
+                    Complex32::new(((v[t] * v[t - 1].conj()).arg() * hz) as f32, x[t])
+                } else if t == 0 {
+                    Complex32::new(0.0, x[0])
+                } else {
+                    Complex32::new(0.0, 0.0)
+                }
             })
             .collect();
         fwd.process(&mut buf);
@@ -1774,11 +1793,11 @@ fn band_filter(x: &[f64], fs: f64, rise: (f64, f64), fall: (f64, f64)) -> Vec<f6
             *v *= *g;
         }
         inv.process(&mut buf);
-        for (i, y) in o.iter_mut().enumerate() {
-            *y = buf[ov + i].re;
+        for (i, (p, q)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
+            (*p, *q) = (buf[ov + i].re, buf[ov + i].im);
         }
     });
-    out
+    (oc, or)
 }
 
 /// Solve the n x n system `a x = b` (Gaussian elimination, partial
@@ -1828,22 +1847,41 @@ fn cancel_chroma_leak(out: &mut [f32], v: &[Complex64], fs: f64, band: ((f64, f6
     if n < 4 * taper + 2 * half {
         return;
     }
-    let tau = 2.0 * std::f64::consts::PI;
-    let f: Vec<f64> = (0..n).into_par_iter().map(|t| if t == 0 { 0.0 } else { (v[t] * v[t - 1].conj()).arg() * fs / tau }).collect();
-    let c = band_filter(&f, fs, band.0, band.1);
-    let x: Vec<f64> = out.iter().map(|&s| f64::from(s)).collect();
-    let r = band_filter(&x, fs, band.0, band.1);
+    let (c, r) = leak_bands(v, out, fs, band.0, band.1);
     let lags: Vec<isize> = (0..LEAK_TAPS).map(|k| (k * LEAK_STEP) as isize - half as isize).collect();
-    let col = |t: usize, k: usize| c[(t as isize + lags[k]) as usize];
+    let col = |t: usize, k: usize| f64::from(c[(t as isize + lags[k]) as usize]);
     let m = lags.len();
+    // The normal equations, summed over fixed spans in parallel and the
+    // spans added in order: the same sums whatever the thread count.
+    let fit: Vec<usize> = (taper + half..n - taper - half).step_by(LEAK_FIT_STRIDE).collect();
+    let parts: Vec<(Vec<Vec<f64>>, Vec<f64>, f64)> = fit
+        .par_chunks(LEAK_FIT_SPAN)
+        .map(|ts| {
+            let (mut ata, mut aty, mut yy) = (vec![vec![0.0f64; m]; m], vec![0.0f64; m], 0.0f64);
+            let mut row = vec![0.0f64; m];
+            for &t in ts {
+                for (k, v) in row.iter_mut().enumerate() {
+                    *v = col(t, k);
+                }
+                let rt = f64::from(r[t]);
+                yy += rt * rt;
+                for a in 0..m {
+                    aty[a] += row[a] * rt;
+                    for b in a..m {
+                        ata[a][b] += row[a] * row[b];
+                    }
+                }
+            }
+            (ata, aty, yy)
+        })
+        .collect();
     let (mut ata, mut aty, mut yy) = (vec![vec![0.0f64; m]; m], vec![0.0f64; m], 0.0f64);
-    for t in (taper + half..n - taper - half).step_by(LEAK_FIT_STRIDE) {
-        yy += r[t] * r[t];
+    for (pa, py, pyy) in &parts {
+        yy += pyy;
         for a in 0..m {
-            let ca = col(t, a);
-            aty[a] += ca * r[t];
+            aty[a] += py[a];
             for b in a..m {
-                ata[a][b] += ca * col(t, b);
+                ata[a][b] += pa[a][b];
             }
         }
     }
@@ -1860,19 +1898,24 @@ fn cancel_chroma_leak(out: &mut [f32], v: &[Complex64], fs: f64, band: ((f64, f6
     if !(share >= LEAK_MIN_SHARE) {
         return;
     }
-    out.par_iter_mut().enumerate().for_each(|(t, o)| {
-        if t < half || t + half >= n {
-            return;
+    const SPAN: usize = 1 << 14;
+    out.par_chunks_mut(SPAN).enumerate().for_each(|(blk, o)| {
+        for (i, o) in o.iter_mut().enumerate() {
+            let t = blk * SPAN + i;
+            if t < half || t + half >= n {
+                continue;
+            }
+            let w = &c[t - half..=t + half];
+            let mut leak = 0.0;
+            for (k, hk) in h.iter().enumerate() {
+                leak += hk * f64::from(w[k * LEAK_STEP]);
+            }
+            let e = t.min(n - 1 - t);
+            if e < taper {
+                leak *= 0.5 - 0.5 * (std::f64::consts::PI * e as f64 / taper as f64).cos();
+            }
+            *o = (f64::from(*o) - leak) as f32;
         }
-        let mut leak = 0.0;
-        for (k, hk) in h.iter().enumerate() {
-            leak += hk * col(t, k);
-        }
-        let e = t.min(n - 1 - t);
-        if e < taper {
-            leak *= 0.5 - 0.5 * (std::f64::consts::PI * e as f64 / taper as f64).cos();
-        }
-        *o = (f64::from(*o) - leak) as f32;
     });
 }
 
