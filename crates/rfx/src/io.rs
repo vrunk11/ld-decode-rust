@@ -100,3 +100,18 @@ pub fn add_words(f: &File, lo: i64, hi: i64, shift: u32, sub: i32, dst: &mut [f3
         Ok(())
     })
 }
+
+/// Like [`add_words`] with each term multiplied by `scale`.
+pub fn add_words_scaled(f: &File, lo: i64, hi: i64, shift: u32, sub: i32, scale: f32, dst: &mut [f32]) -> io::Result<()> {
+    debug_assert!(lo >= 0 && hi - lo == dst.len() as i64);
+    SCRATCH.with(|s| {
+        let mut buf = s.borrow_mut();
+        buf.resize(dst.len() * 2, 0);
+        read_exact_at(f, &mut buf, lo as u64 * 2)?;
+        for (o, w) in dst.iter_mut().zip(buf.chunks_exact(2)) {
+            let v = (i16::from_le_bytes([w[0], w[1]]) >> shift) as i32 - sub;
+            *o += scale * v as f32;
+        }
+        Ok(())
+    })
+}

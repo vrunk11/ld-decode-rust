@@ -50,6 +50,44 @@ pub struct SrcMeta {
     pub lam_bits: u32,
     /// Earlier sources this one is predicted from (those it shares frames with).
     pub refs: Vec<usize>,
+    /// Weight of each reference in the mean they make (they add up to 1); empty
+    /// means equal weights.
+    #[serde(default)]
+    pub weights: Vec<f32>,
+    /// Where this capture stood on the command line (the archive may hold it
+    /// in another place).
+    #[serde(default)]
+    pub position: usize,
+    /// Noise against signal measured by [`crate::order`] (smaller is cleaner).
+    #[serde(default)]
+    pub noise: Option<f64>,
+    /// Files that sit beside the capture (its `.yaml`), kept as they were.
+    #[serde(default)]
+    pub sidecars: Vec<Sidecar>,
+}
+
+/// A small file stored whole in the metadata and given back by `unpack`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Sidecar {
+    pub name: String,
+    pub sha256: String,
+    pub data: Vec<u8>,
+}
+
+/// Largest sidecar kept.
+const SIDECAR_MAX: u64 = 1 << 20;
+
+/// The `.yaml` the Domesday Duplicator writes beside a capture
+/// (`x.ddd.s16` -> `x.ddd.yaml`), if there is one.
+fn find_sidecars(capture: &Path) -> Vec<Sidecar> {
+    let p = capture.with_extension("yaml");
+    match (std::fs::metadata(&p), p.file_name()) {
+        (Ok(m), Some(name)) if m.is_file() && m.len() <= SIDECAR_MAX => match std::fs::read(&p) {
+            Ok(data) => vec![Sidecar { name: name.to_string_lossy().into_owned(), sha256: hex(&Sha256::digest(&data)), data }],
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 impl SrcMeta {
@@ -73,8 +111,18 @@ pub enum Device {
     Gpu,
 }
 
+/// In which order the captures are coded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OrderMode {
+    /// The order on the command line.
+    Given,
+    /// Each group of captures of one programme from the cleanest to the
+    /// noisiest ([`crate::order::plan`]).
+    Auto,
+}
 
 pub struct PackOpts {
+    pub order: OrderMode,
     pub device: Device,
     pub level: u32,
     pub segment: usize,
@@ -90,6 +138,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+#[derive(Clone)]
 struct Stats {
     size: u64,
     sha: String,
@@ -154,15 +203,19 @@ impl Refs<'_> {
         Ok(out)
     }
 
-    /// [`Refs::window`] into the first `refwin_len` values of `out`. The sums
-    /// of the sources are whole numbers, exact in f32.
+    /// [`Refs::window`] into the first `refwin_len` values of `out`: the
+    /// weighted sum of the references, added in the order of `refs`, each term
+    /// a product rounded and then added (no fused multiply-add), so every
+    /// machine gets the same bits.
     pub(crate) fn window_into(&self, k: usize, s0: i64, n: usize, out: &mut [f32]) -> Result<()> {
         let sm = &self.meta.sources[k];
         let len = refwin_len(n, &sm.preset());
         let p0 = s0 - sm.taps as i64;
         let out = &mut out[..len];
         out.fill(0.0);
-        for &j in &sm.refs {
+        let equal = 1.0f32 / sm.refs.len().max(1) as f32;
+        for (idx, &j) in sm.refs.iter().enumerate() {
+            let w = if sm.weights.len() == sm.refs.len() { sm.weights[idx] } else { equal };
             let rj = &self.meta.sources[j];
             let t = &self.tables[&(k, j)];
             for (a, b, lag) in runs(t, p0, p0 + len as i64) {
@@ -172,15 +225,53 @@ impl Refs<'_> {
                     continue;
                 }
                 let base = (lo - lag - p0) as usize;
-                crate::io::add_words(&self.files[j], lo, hi, rj.shift, rj.mean, &mut out[base..base + (hi - lo) as usize])?;
+                crate::io::add_words_scaled(&self.files[j], lo, hi, rj.shift, rj.mean, w, &mut out[base..base + (hi - lo) as usize])?;
             }
-        }
-        let inv = if sm.refs.is_empty() { 0.0 } else { 1.0f32 / sm.refs.len() as f32 };
-        for o in out.iter_mut() {
-            *o *= inv;
         }
         Ok(())
     }
+}
+
+/// Windows (of `CHOOSE_WINDOW` samples, spread through the target) on which
+/// the references of a capture are compared.
+const CHOOSE_WINDOWS: usize = 4;
+const CHOOSE_WINDOW: usize = 131072;
+/// A reference's weight falls by half for each `1 / CHOOSE_STEEP` bit its
+/// cost alone is above the best one's.
+const CHOOSE_STEEP: f64 = 8.0;
+/// References weighing less than this (of the best's 1) are dropped, with
+/// their lag tables.
+const CHOOSE_FLOOR: f32 = 0.2;
+
+/// The references of capture `k` and their weights. The mean of every
+/// earlier capture treats a good reference (another capture of the same disc,
+/// which shares the disc's own noise) like a poor one (another disc); each is
+/// weighed by how well it predicts the capture alone.
+fn choose_refs(refs: &Refs, k: usize) -> Result<(Vec<usize>, Vec<f32>)> {
+    let sm = &refs.meta.sources[k];
+    if sm.refs.len() < 2 {
+        return Ok((sm.refs.clone(), vec![1.0; sm.refs.len()]));
+    }
+    let pre = sm.preset();
+    let win = CHOOSE_WINDOW.min(sm.words as usize);
+    let starts: Vec<usize> = (0..CHOOSE_WINDOWS).map(|w| ((sm.words as usize - win) * (2 * w + 1)) / (2 * CHOOSE_WINDOWS)).collect();
+    let work: Vec<(usize, usize)> = (0..sm.refs.len()).flat_map(|r| starts.iter().map(move |&s| (r, s))).collect();
+    let costs: Vec<f64> = work
+        .par_iter()
+        .map(|&(r, s0)| -> Result<f64> {
+            let y: Vec<i32> = read_words(&refs.files[k], sm.words, s0 as i64, win, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let w = refs.window_with(k, s0 as i64, win, &[(sm.refs[r], 1.0)])?;
+            let preds = seg::predict_all(&y, &pre, true, &w);
+            let res: Vec<i32> = y.iter().zip(&preds).map(|(a, b)| a - b).collect();
+            Ok(seg::encode_residuals(&res).len() as f64 * 8.0 / win as f64)
+        })
+        .collect::<Result<_>>()?;
+    let cost = |r: usize| costs[r * starts.len()..(r + 1) * starts.len()].iter().sum::<f64>() / starts.len() as f64;
+    let best = (0..sm.refs.len()).map(cost).fold(f64::MAX, f64::min);
+    let raw: Vec<f32> = (0..sm.refs.len()).map(|r| 2f64.powf(-CHOOSE_STEEP * (cost(r) - best)) as f32).collect();
+    let keep: Vec<usize> = (0..raw.len()).filter(|&r| raw[r] >= CHOOSE_FLOOR).collect();
+    let sum: f32 = keep.iter().map(|&r| raw[r]).sum();
+    Ok((keep.iter().map(|&r| sm.refs[r]).collect(), keep.iter().map(|&r| raw[r] / sum).collect()))
 }
 
 pub struct SourceReport {
@@ -190,7 +281,17 @@ pub struct SourceReport {
     pub refs: usize,
 }
 
-pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceReport>> {
+/// What `pack` works out before it writes anything: the captures in coding
+/// order, the metadata, the lag tables and the open files.
+pub(crate) struct Prepared {
+    pub(crate) inputs: Vec<PathBuf>,
+    pub(crate) names: Vec<String>,
+    pub(crate) meta: Meta,
+    pub(crate) tables: HashMap<(usize, usize), LagTable>,
+    pub(crate) files: Vec<File>,
+}
+
+pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Prepared> {
     if inputs.is_empty() {
         bail!("no input");
     }
@@ -206,8 +307,9 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
     eprintln!("hashing and scanning {} files", inputs.len());
     let stats: Vec<Stats> = inputs.par_iter().map(|p| file_stats(p)).collect::<Result<_>>()?;
 
-    // Lag tables between the captures, from ld-decode's pass 0.
-    let mut tables: HashMap<(usize, usize), LagTable> = HashMap::new();
+    // Where the lines of every capture are, from ld-decode's pass 0 (in the
+    // order given), then the order to code them in.
+    let mut fields: Vec<Vec<crate::align::Field>> = Vec::new();
     if inputs.len() > 1 {
         let dir = match &o.pass0_dir {
             Some(d) => d.clone(),
@@ -218,7 +320,34 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
                 d
             }
         };
-        let fields: Vec<_> = (0..inputs.len()).map(|i| parse_pass0(&dir.join(format!("pass0_{i}.txt")))).collect::<Result<_>>()?;
+        fields = (0..inputs.len()).map(|i| parse_pass0(&dir.join(format!("pass0_{i}.txt")))).collect::<Result<_>>()?;
+    }
+    let mut noise: Vec<Option<f64>> = vec![None; inputs.len()];
+    let mut ord: Vec<usize> = (0..inputs.len()).collect();
+    if inputs.len() > 1 && o.order == OrderMode::Auto {
+        let (order, scores) = crate::order::plan(inputs, &fields);
+        ord = order;
+        noise = scores;
+        if ord.iter().enumerate().any(|(k, &i)| k != i) {
+            eprintln!("coding order, cleanest first (noise against signal, smaller is cleaner):");
+            for (k, &i) in ord.iter().enumerate() {
+                match noise[i] {
+                    Some(c) => eprintln!("  {k:>2}: {} (was {i}, {c:.3})", names[i]),
+                    None => eprintln!("  {k:>2}: {} (was {i})", names[i]),
+                }
+            }
+        }
+    }
+    // From here on, everything is in coding order; `ord[k]` is the place on
+    // the command line.
+    let inputs: Vec<PathBuf> = ord.iter().map(|&i| inputs[i].clone()).collect();
+    let names: Vec<String> = ord.iter().map(|&i| names[i].clone()).collect();
+    let stats: Vec<Stats> = ord.iter().map(|&i| stats[i].clone()).collect();
+    let noise: Vec<Option<f64>> = ord.iter().map(|&i| noise[i]).collect();
+    let mut tables: HashMap<(usize, usize), LagTable> = HashMap::new();
+    if inputs.len() > 1 {
+        let mut slots: Vec<Option<Vec<crate::align::Field>>> = fields.into_iter().map(Some).collect();
+        let fields: Vec<Vec<crate::align::Field>> = ord.iter().map(|&i| slots[i].take().expect("each once")).collect();
         for k in 1..inputs.len() {
             for j in 0..k {
                 match build_table(&fields[k], &fields[j], stats[k].size / 2) {
@@ -258,12 +387,43 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
                 every: preset.every,
                 lam_bits: preset.lam_bits,
                 refs: (0..k).filter(|j| tables.contains_key(&(k, *j))).collect(),
+                weights: Vec::new(),
+                position: ord[k],
+                noise: noise[k],
+                sidecars: find_sidecars(p),
             })
         })
         .collect::<Result<_>>()?;
     let meta = Meta { format: "rfx".into(), version: 1, segment: o.segment, sources };
     let files: Vec<File> = inputs.iter().map(|p| File::open(p).map_err(Into::into)).collect::<Result<_>>()?;
-    let refs = Refs { files: &files, meta: &meta, tables: &tables };
+    // Weigh the references of each capture by how well each predicts it.
+    let mut meta = meta;
+    if inputs.len() > 1 {
+        let choice: Vec<(Vec<usize>, Vec<f32>)> = {
+            let refs = Refs { files: &files, meta: &meta, tables: &tables };
+            (0..inputs.len()).map(|k| choose_refs(&refs, k)).collect::<Result<_>>()?
+        };
+        for (k, (r, w)) in choice.into_iter().enumerate() {
+            for j in meta.sources[k].refs.clone() {
+                if !r.contains(&j) {
+                    tables.remove(&(k, j));
+                }
+            }
+            if r.len() > 1 && std::env::var_os("RFX_TIMING").is_some() {
+                let list: Vec<String> = r.iter().zip(&w).map(|(j, w)| format!("{}:{:.2}", j, w)).collect();
+                eprintln!("  {k:>2} {}: {} references [{}]", names[k], r.len(), list.join(" "));
+            }
+            meta.sources[k].refs = r;
+            meta.sources[k].weights = w;
+        }
+    }
+    Ok(Prepared { inputs, names, meta, tables, files })
+}
+
+pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceReport>> {
+    let p = prepare(inputs, out, o)?;
+    let Prepared { inputs, names, meta, tables, files } = &p;
+    let refs = Refs { files, meta, tables };
 
     let n_src = inputs.len() as u64;
     let mut w = std::io::BufWriter::new(File::create(out).with_context(|| format!("creating {}", out.display()))?);
@@ -398,6 +558,9 @@ pub fn info(path: &Path) -> Result<()> {
             sm.every
         );
         println!("     sha256 {}", sm.sha256);
+        let noise = sm.noise.map(|c| format!("  noise {c:.3}")).unwrap_or_default();
+        let side: Vec<&str> = sm.sidecars.iter().map(|s| s.name.as_str()).collect();
+        println!("     on the command line: {}{}  sidecars {:?}", sm.position, noise, side);
     }
     Ok(())
 }
@@ -472,6 +635,16 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -
             bail!("{}: SHA-256 differs from the original ({got} against {})", sm.name, sm.sha256);
         }
         eprintln!("{}: {} bytes, SHA-256 matches, {:.1} Msmp/s", sm.name, sm.size, sm.words as f64 / secs / 1e6);
+        if only.is_none() || only == Some(k) {
+            for sc in &sm.sidecars {
+                let got = hex(&Sha256::digest(&sc.data));
+                if got != sc.sha256 {
+                    bail!("{}: the stored copy of {} is damaged", sm.name, sc.name);
+                }
+                let name = Path::new(&sc.name).file_name().context("bad sidecar name in the archive")?;
+                std::fs::write(outdir.join(name), &sc.data)?;
+            }
+        }
     }
     if let Some(keep) = only {
         drop(outs);
@@ -595,5 +768,100 @@ pub fn bench_pred(path: &Path, level: u32, nseg: usize, segment: usize) -> Resul
         let dt = t.elapsed().as_secs_f64();
         println!("{name:<22} {:>7.1} Msmp/s  ({:.0} ns/sample)", (nseg * n) as f64 / dt / 1e6, dt * 1e9 / (nseg * n) as f64);
     }
+    Ok(())
+}
+
+impl Refs<'_> {
+    /// Like [`Refs::window_into`] over the references `(source, weight)` given
+    /// (an experiment: any subset, any weights).
+    pub(crate) fn window_with(&self, k: usize, s0: i64, n: usize, which: &[(usize, f32)]) -> Result<Vec<f32>> {
+        let sm = &self.meta.sources[k];
+        let len = refwin_len(n, &sm.preset());
+        let p0 = s0 - sm.taps as i64;
+        let mut out = vec![0f32; len];
+        for &(j, w) in which {
+            let rj = &self.meta.sources[j];
+            let t = &self.tables[&(k, j)];
+            for (a, b, lag) in runs(t, p0, p0 + len as i64) {
+                let lo = (a + lag).max(0);
+                let hi = (b + lag).min(rj.words as i64);
+                if hi <= lo {
+                    continue;
+                }
+                let base = (lo - lag - p0) as usize;
+                crate::io::add_words_scaled(&self.files[j], lo, hi, rj.shift, rj.mean, w, &mut out[base..base + (hi - lo) as usize])?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Development: what would a different choice of references have cost, for
+/// the target `k`, on `nseg` segments spread through the capture? Prints the
+/// cost of the mean of all its references (what `pack` does), of each one
+/// alone, of the best few together, and the best choice segment by segment.
+pub fn refsel(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Result<()> {
+    let p = prepare(inputs, Path::new("refsel.rfx"), o)?;
+    let Prepared { names, meta, tables, files, .. } = &p;
+    let refs = Refs { files, meta, tables };
+    let sm = &meta.sources[k];
+    let pre = sm.preset();
+    let s = meta.segment;
+    let total = (sm.words as usize).div_ceil(s);
+    if sm.refs.len() < 2 {
+        bail!("{} has {} reference(s): nothing to choose from", sm.name, sm.refs.len());
+    }
+    let segs: Vec<usize> = (0..nseg).map(|i| total / 10 + (total * 8 / 10) * i / nseg.max(1)).collect();
+    let cost = |y: &[i32], win: &[f32]| -> f64 {
+        let preds = seg::predict_all(y, &pre, true, win);
+        let res: Vec<i32> = y.iter().zip(&preds).map(|(a, b)| a - b).collect();
+        seg::encode_residuals(&res).len() as f64 * 8.0 / y.len() as f64
+    };
+    // [segment][config] costs; configs: all, then each reference, then top-m.
+    let tops = [2usize, 3, 5, 8];
+    let rows: Vec<(Vec<f64>, Vec<f64>)> = segs
+        .par_iter()
+        .map(|&q| -> Result<(Vec<f64>, Vec<f64>)> {
+            let s0 = q * s;
+            let n = s.min(sm.words as usize - s0);
+            let y: Vec<i32> = read_words(&files[k], sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let nr = sm.refs.len();
+            let all = refs.window_with(k, s0 as i64, n, &sm.refs.iter().map(|&j| (j, 1.0 / nr as f32)).collect::<Vec<_>>())?;
+            let mut costs = vec![cost(&y, &all)];
+            let mut single = Vec::new();
+            for &j in &sm.refs {
+                let w = refs.window_with(k, s0 as i64, n, &[(j, 1.0)])?;
+                single.push(cost(&y, &w));
+            }
+            costs.extend(&single);
+            let mut rank: Vec<usize> = (0..nr).collect();
+            rank.sort_by(|&a, &b| single[a].partial_cmp(&single[b]).unwrap());
+            for &m in &tops {
+                let m = m.min(nr);
+                let which: Vec<(usize, f32)> = rank[..m].iter().map(|&r| (sm.refs[r], 1.0 / m as f32)).collect();
+                costs.push(cost(&y, &refs.window_with(k, s0 as i64, n, &which)?));
+            }
+for e in [2.0f32, 4.0, 8.0] {                let best = single.iter().cloned().fold(f64::MAX, f64::min);                let raw: Vec<f32> = single.iter().map(|c| 2f32.powf(-e * (*c - best) as f32)).collect();                let sum: f32 = raw.iter().sum();                let which: Vec<(usize, f32)> = sm.refs.iter().zip(&raw).map(|(&j, w)| (j, w / sum)).collect();                costs.push(cost(&y, &refs.window_with(k, s0 as i64, n, &which)?));            }
+            Ok((costs, single))
+        })
+        .collect::<Result<_>>()?;
+    let nc = rows[0].0.len();
+    let mean = |c: usize| rows.iter().map(|r| r.0[c]).sum::<f64>() / rows.len() as f64;
+    println!("target {} ({} references), {} segments of {} samples", sm.name, sm.refs.len(), segs.len(), s);
+    println!("  mean of all references (current)      {:.4} bits/sample", mean(0));
+    for (i, &j) in sm.refs.iter().enumerate() {
+        println!("  reference {:<28} alone {:.4}", names[j], mean(1 + i));
+    }
+    let nr = sm.refs.len();
+    for (i, &m) in tops.iter().enumerate() {
+        println!("  best {:<2} of them, chosen per segment   {:.4}", m.min(nr), mean(1 + nr + i));
+    }
+    for (i, e) in [2.0, 4.0, 8.0].iter().enumerate() {
+        println!("  all of them, weights 2^(-{e} x excess cost)   {:.4}", mean(1 + nr + tops.len() + i));
+    }
+    let best_fixed = (0..nc).map(|c| (c, mean(c))).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
+    let oracle = rows.iter().map(|r| r.0.iter().cloned().fold(f64::MAX, f64::min)).sum::<f64>() / rows.len() as f64;
+    println!("  best single configuration for all segments  {:.4} (config {})", best_fixed.1, best_fixed.0);
+    println!("  best configuration segment by segment       {:.4}  ({:+.2}% against the mean of all)", oracle, 100.0 * (oracle / mean(0) - 1.0));
     Ok(())
 }

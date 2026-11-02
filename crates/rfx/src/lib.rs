@@ -5,6 +5,7 @@ pub mod gpu;
 mod gpupipe;
 pub mod io;
 pub mod model;
+pub mod order;
 pub mod pack;
 pub mod pred;
 pub mod rc;
