@@ -7,6 +7,7 @@
 //! The line positions come from ld-decode's pass 0 (`LD_DUMP_PASS0`): for
 //! each field its frame code (VBI) and the sample position of every line.
 //! The tables are stored in the file, so unpacking needs no pass 0.
+use crate::rc::{Decoder, Encoder, P2};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -86,33 +87,208 @@ impl LagTable {
         (lo, hi)
     }
 
+    /// Compact form: a few varints, then a range-coded stream. The positions
+    /// are multiples of a unit (the grid), their gaps are coded against the
+    /// previous gap (the drift between two captures changes slowly), and a
+    /// step of the lag is nearly always +-1 in the direction of the last one.
     pub fn encode(&self) -> Vec<u8> {
+        let n = self.pos.len();
+        let unit = self.pos.windows(2).map(|w| w[1] - w[0]).fold(0, gcd).max(1);
         let mut out = Vec::new();
-        put_varint(&mut out, self.pos.len() as u64);
-        let (mut pp, mut pl) = (0u64, 0i64);
-        for (&p, &l) in self.pos.iter().zip(&self.lag) {
-            put_varint(&mut out, p - pp);
-            put_varint(&mut out, zigzag(l - pl));
-            pp = p;
-            pl = l;
+        put_varint(&mut out, n as u64);
+        put_varint(&mut out, unit);
+        if n == 0 {
+            return out;
         }
+        put_varint(&mut out, self.pos[0]);
+        put_varint(&mut out, zigzag(self.lag[0]));
+        let mut enc = Encoder::new();
+        let mut m = TableModel::new();
+        for i in 1..n {
+            let gap = (self.pos[i] - self.pos[i - 1]) / unit;
+            m.put_gap(&mut enc, gap);
+            m.put_step(&mut enc, self.lag[i] - self.lag[i - 1]);
+        }
+        out.extend(enc.finish());
         out
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut at = 0;
         let n = get_varint(buf, &mut at)? as usize;
-        let (mut t, mut p, mut l) = (Self::default(), 0u64, 0i64);
-        for _ in 0..n {
-            p += get_varint(buf, &mut at)?;
-            l += unzigzag(get_varint(buf, &mut at)?);
-            t.pos.push(p);
-            t.lag.push(l);
-        }
-        if n == 0 || t.pos[0] != 0 {
+        let unit = get_varint(buf, &mut at)?;
+        let mut t = Self::default();
+        if n == 0 {
             bail!("a lag table must start at position 0");
         }
+        let p0 = get_varint(buf, &mut at)?;
+        let l0 = unzigzag(get_varint(buf, &mut at)?);
+        if p0 != 0 {
+            bail!("a lag table must start at position 0");
+        }
+        t.pos.push(p0);
+        t.lag.push(l0);
+        let mut dec = Decoder::new(&buf[at..]);
+        let mut m = TableModel::new();
+        for _ in 1..n {
+            let gap = m.get_gap(&mut dec);
+            let step = m.get_step(&mut dec);
+            if dec.overrun() {
+                bail!("truncated lag table");
+            }
+            t.pos.push(t.pos[t.pos.len() - 1] + gap * unit);
+            t.lag.push(t.lag[t.lag.len() - 1].wrapping_add(step));
+        }
         Ok(t)
+    }
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+fn bits_of(v: u64) -> usize {
+    (64 - v.leading_zeros()) as usize
+}
+
+/// Adaptive model of a lag table's gaps and steps (see [`LagTable::encode`]).
+struct TableModel {
+    cls: Vec<[P2; 65]>,
+    mant: [P2; 65],
+    sign: [P2; 3],
+    esc: P2,
+    same: [P2; 2],
+    smag: [[P2; 3]; 4],
+    prev_mag: usize,
+    prev_gap: u64,
+    prev_sign: usize,
+    prev_up: usize,
+}
+
+impl TableModel {
+    fn new() -> Self {
+        Self { cls: vec![[P2::INIT; 65]; 24], mant: [P2::INIT; 65], sign: [P2::INIT; 3], esc: P2::INIT, same: [P2::INIT; 2], smag: [[P2::INIT; 3]; 4], prev_mag: 0, prev_gap: 1, prev_sign: 0, prev_up: 0 }
+    }
+
+    fn ctx(&self) -> usize {
+        bits_of(self.prev_gap).min(23)
+    }
+
+    fn put_gap(&mut self, enc: &mut Encoder, gap: u64) {
+        let d = gap as i64 - self.prev_gap as i64;
+        let mag = d.unsigned_abs();
+        let nb = bits_of(mag);
+        let c = self.ctx();
+        for j in 0..nb {
+            enc.bit2(&mut self.cls[c][j], 1);
+        }
+        if nb < 64 {
+            enc.bit2(&mut self.cls[c][nb], 0);
+        }
+        if nb >= 2 {
+            enc.bit2(&mut self.mant[nb], ((mag >> (nb - 2)) & 1) as u32);
+            put_direct(enc, mag & ((1u64 << (nb - 2)) - 1), nb - 2);
+        }
+        if nb >= 1 {
+            let neg = u32::from(d < 0);
+            enc.bit2(&mut self.sign[self.prev_sign], neg);
+            self.prev_sign = 1 + neg as usize;
+        } else {
+            self.prev_sign = 0;
+        }
+        self.prev_gap = gap;
+    }
+
+    fn get_gap(&mut self, dec: &mut Decoder) -> u64 {
+        let c = self.ctx();
+        let mut nb = 0;
+        while nb < 64 && dec.bit2(&mut self.cls[c][nb]) == 1 {
+            nb += 1;
+        }
+        let mut mag = u64::from(nb >= 1);
+        if nb >= 2 {
+            mag = (mag << 1) | u64::from(dec.bit2(&mut self.mant[nb]));
+            mag = (mag << (nb - 2)) | get_direct(dec, nb - 2);
+        }
+        let mut d = mag as i64;
+        if nb >= 1 {
+            let neg = dec.bit2(&mut self.sign[self.prev_sign]);
+            if neg == 1 {
+                d = d.wrapping_neg();
+            }
+            self.prev_sign = 1 + neg as usize;
+        } else {
+            self.prev_sign = 0;
+        }
+        self.prev_gap = (self.prev_gap as i64).wrapping_add(d) as u64;
+        self.prev_gap
+    }
+
+    fn put_step(&mut self, enc: &mut Encoder, step: i64) {
+        let mag = step.unsigned_abs();
+        if (1..=4).contains(&mag) {
+            enc.bit2(&mut self.esc, 0);
+            for j in 1..mag {
+                enc.bit2(&mut self.smag[self.prev_mag][j as usize - 1], 1);
+            }
+            if mag < 4 {
+                enc.bit2(&mut self.smag[self.prev_mag][mag as usize - 1], 0);
+            }
+            let up = u32::from(step > 0);
+            enc.bit2(&mut self.same[self.prev_up], up);
+            self.prev_up = up as usize;
+            self.prev_mag = mag as usize - 1;
+        } else {
+            enc.bit2(&mut self.esc, 1);
+            let z = zigzag(step);
+            enc.direct(bits_of(z) as u32, 7);
+            put_direct(enc, z, bits_of(z));
+        }
+    }
+
+    fn get_step(&mut self, dec: &mut Decoder) -> i64 {
+        if dec.bit2(&mut self.esc) == 0 {
+            let mut mag = 1usize;
+            while mag < 4 && dec.bit2(&mut self.smag[self.prev_mag][mag - 1]) == 1 {
+                mag += 1;
+            }
+            let up = dec.bit2(&mut self.same[self.prev_up]);
+            self.prev_up = up as usize;
+            self.prev_mag = mag - 1;
+            if up == 1 {
+                mag as i64
+            } else {
+                -(mag as i64)
+            }
+        } else {
+            let nb = (dec.direct(7) as usize).min(64);
+            unzigzag(get_direct(dec, nb))
+        }
+    }
+}
+
+/// `n` (<= 64) equiprobable bits of `v`, high first.
+fn put_direct(enc: &mut Encoder, v: u64, n: usize) {
+    if n > 32 {
+        enc.direct((v >> 32) as u32 & ((1u64 << (n - 32)) - 1) as u32, (n - 32) as u32);
+        enc.direct(v as u32, 32);
+    } else if n > 0 {
+        enc.direct(v as u32 & (((1u64 << n) - 1) as u32), n as u32);
+    }
+}
+
+fn get_direct(dec: &mut Decoder, n: usize) -> u64 {
+    if n > 32 {
+        let hi = u64::from(dec.direct((n - 32) as u32));
+        (hi << 32) | u64::from(dec.direct(32))
+    } else if n > 0 {
+        u64::from(dec.direct(n as u32))
+    } else {
+        0
     }
 }
 
@@ -149,14 +325,18 @@ fn unzigzag(v: u64) -> i64 {
 
 const GRID: u64 = 64;
 /// The lag must leave the nearest integer by more than this to change.
-const HYSTERESIS: f64 = 0.75;
+pub const HYST_FINE: f64 = 0.75;
+/// Coarser tables (half as many steps, a fifth of the bytes) for captures whose
+/// predictor has a channel for each of its best references, which absorb the
+/// misalignment.
+pub const HYST_COARSE: f64 = 1.5;
 /// Lines over which the line-to-line lag is averaged.
 const SMOOTH_LINES: f64 = 16.0;
 
 /// Lag of `tgt` (sample positions in the later source) against `rf`, from
 /// the fields both located with the same frame code. `None` when they share
 /// no field.
-pub fn build_table(tgt: &[Field], rf: &[Field], tgt_words: u64) -> Option<LagTable> {
+pub fn build_table(tgt: &[Field], rf: &[Field], tgt_words: u64, hyst: f64) -> Option<LagTable> {
     let mut first_rf: HashMap<(&str, bool), usize> = HashMap::new();
     for (i, f) in rf.iter().enumerate() {
         if let Some(c) = &f.code {
@@ -211,7 +391,7 @@ pub fn build_table(tgt: &[Field], rf: &[Field], tgt_words: u64) -> Option<LagTab
     for g in 0..ng {
         let (a, b) = (g.saturating_sub(h), (g + h + 1).min(ng));
         let l = (pre[b] - pre[a]) / (b - a) as f64;
-        if g == 0 || (l - d as f64).abs() > HYSTERESIS {
+        if g == 0 || (l - d as f64).abs() > hyst {
             let nd = l.round() as i64;
             if g == 0 || nd != d {
                 t.pos.push(g as u64 * GRID);
@@ -240,6 +420,22 @@ mod tests {
     }
 
     #[test]
+    fn coded_table_roundtrip_with_drift_and_jumps() {
+        let mut t = LagTable { pos: vec![0], lag: vec![-123456789012] };
+        let (mut p, mut l, mut x) = (0u64, t.lag[0], 7u32);
+        for i in 0..5000u64 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            p += 64 * (90 + (i % 40) + u64::from(x >> 29));
+            l += if i % 700 == 699 { 1 << 33 } else if i % 900 == 5 { -77 } else if (i / 300) % 2 == 0 { 1 } else { -1 };
+            t.pos.push(p);
+            t.lag.push(l);
+        }
+        let bytes = t.encode();
+        assert_eq!(LagTable::decode(&bytes).unwrap(), t);
+        assert!(bytes.len() < 5000 * 2, "{} bytes", bytes.len());
+    }
+
+    #[test]
     fn steady_drift_gives_one_slip_per_sample_of_drift() {
         // The later source runs 1e-3 slower: 100 lines of 1000 samples.
         let mk = |scale: f64, off: f64| Field {
@@ -249,7 +445,7 @@ mod tests {
         };
         let tgt = [mk(1.0, 0.0)];
         let rf = [mk(1.001, 50.0)];
-        let t = build_table(&tgt, &rf, 100_000).unwrap();
+        let t = build_table(&tgt, &rf, 100_000, HYST_FINE).unwrap();
         // The lag grows from 50 to about 50 + 99 (the ends are averaged inward).
         assert!((50..=60).contains(&t.lag[0]), "{}", t.lag[0]);
         let last = *t.lag.last().unwrap();

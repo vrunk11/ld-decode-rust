@@ -106,6 +106,22 @@ enum Cmd {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
     },
+    /// Development: experiments on predictor and model (see lab.rs).
+    Lab {
+        /// model, tables or spectrum
+        what: String,
+        #[arg(long)]
+        target: usize,
+        #[arg(long, default_value_t = 12)]
+        segments: usize,
+        #[arg(long)]
+        pass0: PathBuf,
+        /// Number of tones for the tones experiment.
+        #[arg(long, default_value_t = 16)]
+        tones: usize,
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+    },
     /// List the sources of a .rfx file.
     Info { input: PathBuf },
 }
@@ -120,6 +136,19 @@ fn main() -> Result<()> {
         }
         Cmd::Unpack { input, outdir, only, device } => unpack(&input, &outdir, only, parse_device(&device)?)?,
         Cmd::Info { input } => info(&input)?,
+        Cmd::Lab { what, target, segments, pass0, tones, inputs } => {
+            let opts = PackOpts { order: OrderMode::Given, device: Device::Cpu, level: 3, segment: 262144, verify: false, pass0_dir: Some(pass0), ld_decode: PathBuf::from("ld-decode"), rate_mhz: 75.0, format: "s16".into() };
+            match what.as_str() {
+                "model" => rfx::labmodel::model(&inputs, &opts, target, segments)?,
+                "tables" => rfx::labtables::tables(&inputs, &opts)?,
+                "spectrum" => rfx::labspec::spectrum(&inputs, &opts, target, segments)?,
+                "cascade" => rfx::labspec::cascade(&inputs, &opts, target, segments)?,
+                "tones" => rfx::labtones::tones(&inputs, &opts, target, segments, tones)?,
+                "residual" => rfx::labresid::residual(&inputs, &opts, target, segments)?,
+                "precision" => rfx::labprec::precision(&inputs, &opts, target, segments)?,
+                other => anyhow::bail!("unknown experiment {other}"),
+            }
+        }
         Cmd::Refsel { target, segments, pass0, inputs } => {
             let opts = PackOpts { order: OrderMode::Given, device: Device::Cpu, level: 3, segment: 262144, verify: false, pass0_dir: Some(pass0), ld_decode: PathBuf::from("ld-decode"), rate_mhz: 75.0, format: "s16".into() };
             rfx::pack::refsel(&inputs, &opts, target, segments)?

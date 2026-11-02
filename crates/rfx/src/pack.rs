@@ -13,7 +13,7 @@
 //! sources of its `refs` (all earlier), read at the lag tables' positions in
 //! the files themselves, so a segment needs nothing but its own block and
 //! the earlier sources: segments are coded and decoded in parallel.
-use crate::align::{build_table, parse_pass0, run_pass0, LagTable};
+use crate::align::{build_table, parse_pass0, run_pass0, LagTable, HYST_COARSE, HYST_FINE};
 use crate::ebml;
 use crate::gpu::GpuSeg;
 use crate::io::{read_exact_at, read_words, write_all_at};
@@ -44,7 +44,16 @@ pub struct SrcMeta {
     pub shift: u32,
     pub mean: i32,
     pub own: usize,
+    /// Own past samples when the source has no reference (0: same as `own`).
+    #[serde(default)]
+    pub solo: usize,
     pub taps: usize,
+    /// References with a channel of their own (the best ones by weight), and
+    /// the taps of each.
+    #[serde(default)]
+    pub ntop: usize,
+    #[serde(default)]
+    pub ttaps: usize,
     pub stride: usize,
     pub every: usize,
     pub lam_bits: u32,
@@ -91,8 +100,19 @@ fn find_sidecars(capture: &Path) -> Vec<Sidecar> {
 }
 
 impl SrcMeta {
-    fn preset(&self) -> Preset {
-        Preset { own: self.own, taps: self.taps, stride: self.stride, every: self.every, lam_bits: self.lam_bits }
+    pub(crate) fn preset(&self) -> Preset {
+        let solo = if self.solo == 0 { self.own } else { self.solo };
+        Preset { own: self.own, solo, plain: self.own, taps: self.taps, ntop: self.ntop, ttaps: self.ttaps, stride: self.stride, every: self.every, lam_bits: self.lam_bits }
+    }
+
+    /// The `ntop` references with their own channels, heaviest first (ties by
+    /// place in `refs`).
+    pub(crate) fn tops(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..self.refs.len()).collect();
+        if self.weights.len() == self.refs.len() {
+            idx.sort_by(|&a, &b| self.weights[b].partial_cmp(&self.weights[a]).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        idx.into_iter().take(self.ntop).map(|i| self.refs[i]).collect()
     }
 }
 
@@ -196,26 +216,29 @@ fn runs(t: &LagTable, p0: i64, p1: i64) -> Vec<(i64, i64, i64)> {
 }
 
 impl Refs<'_> {
-    /// Mean of the reference sources over positions `[s0 - taps, s0 + n + taps)`.
+    /// The reference window over positions `[s0 - taps, s0 + n + taps)`, the
+    /// channels one after the other.
     pub(crate) fn window(&self, k: usize, s0: i64, n: usize) -> Result<Vec<f32>> {
-        let mut out = vec![0f32; refwin_len(n, &self.meta.sources[k].preset())];
-        self.window_into(k, s0, n, &mut out)?;
+        let pre = self.meta.sources[k].preset();
+        let mut out = vec![0f32; refwin_len(n, &pre)];
+        self.window_into(k, s0, n, n + 2 * pre.taps, &mut out)?;
         Ok(out)
     }
 
-    /// [`Refs::window`] into the first `refwin_len` values of `out`: the
-    /// weighted sum of the references, added in the order of `refs`, each term
-    /// a product rounded and then added (no fused multiply-add), so every
-    /// machine gets the same bits.
-    pub(crate) fn window_into(&self, k: usize, s0: i64, n: usize, out: &mut [f32]) -> Result<()> {
+    /// [`Refs::window`] into `out`, whose channels start `l` apart (`l` at
+    /// least `n + 2 * taps`). Channel 0 is the weighted sum of the references,
+    /// added in the order of `refs`, each term a product rounded and then
+    /// added (no fused multiply-add), so every machine gets the same bits;
+    /// channel `c` is the reference `tops()[c - 1]` alone.
+    pub(crate) fn window_into(&self, k: usize, s0: i64, n: usize, l: usize, out: &mut [f32]) -> Result<()> {
         let sm = &self.meta.sources[k];
-        let len = refwin_len(n, &sm.preset());
+        let len = n + 2 * sm.taps;
         let p0 = s0 - sm.taps as i64;
-        let out = &mut out[..len];
+        let tops = sm.tops();
+        let out = &mut out[..(1 + tops.len()) * l];
         out.fill(0.0);
         let equal = 1.0f32 / sm.refs.len().max(1) as f32;
-        for (idx, &j) in sm.refs.iter().enumerate() {
-            let w = if sm.weights.len() == sm.refs.len() { sm.weights[idx] } else { equal };
+        let mut add = |j: usize, w: f32, dst: &mut [f32]| -> Result<()> {
             let rj = &self.meta.sources[j];
             let t = &self.tables[&(k, j)];
             for (a, b, lag) in runs(t, p0, p0 + len as i64) {
@@ -225,8 +248,16 @@ impl Refs<'_> {
                     continue;
                 }
                 let base = (lo - lag - p0) as usize;
-                crate::io::add_words_scaled(&self.files[j], lo, hi, rj.shift, rj.mean, w, &mut out[base..base + (hi - lo) as usize])?;
+                crate::io::add_words_scaled(&self.files[j], lo, hi, rj.shift, rj.mean, w, &mut dst[base..base + (hi - lo) as usize])?;
             }
+            Ok(())
+        };
+        for (idx, &j) in sm.refs.iter().enumerate() {
+            let w = if sm.weights.len() == sm.refs.len() { sm.weights[idx] } else { equal };
+            add(j, w, &mut out[..len])?;
+        }
+        for (c, &j) in tops.iter().enumerate() {
+            add(j, 1.0, &mut out[(c + 1) * l..(c + 1) * l + len])?;
         }
         Ok(())
     }
@@ -345,12 +376,18 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
     let stats: Vec<Stats> = ord.iter().map(|&i| stats[i].clone()).collect();
     let noise: Vec<Option<f64>> = ord.iter().map(|&i| noise[i]).collect();
     let mut tables: HashMap<(usize, usize), LagTable> = HashMap::new();
-    if inputs.len() > 1 {
+    let fields: Vec<Vec<crate::align::Field>> = {
         let mut slots: Vec<Option<Vec<crate::align::Field>>> = fields.into_iter().map(Some).collect();
-        let fields: Vec<Vec<crate::align::Field>> = ord.iter().map(|&i| slots[i].take().expect("each once")).collect();
+        if slots.is_empty() {
+            Vec::new()
+        } else {
+            ord.iter().map(|&i| slots[i].take().expect("each once")).collect()
+        }
+    };
+    if inputs.len() > 1 {
         for k in 1..inputs.len() {
             for j in 0..k {
-                match build_table(&fields[k], &fields[j], stats[k].size / 2) {
+                match build_table(&fields[k], &fields[j], stats[k].size / 2, HYST_FINE) {
                     Some(t) => {
                         tables.insert((k, j), t);
                     }
@@ -382,7 +419,10 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
                 shift: st.shift,
                 mean: st.mean,
                 own: preset.own,
+                solo: preset.solo,
                 taps: preset.taps,
+                ntop: 0,
+                ttaps: preset.ttaps,
                 stride: preset.stride,
                 every: preset.every,
                 lam_bits: preset.lam_bits,
@@ -415,6 +455,38 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
             }
             meta.sources[k].refs = r;
             meta.sources[k].weights = w;
+        }
+        // With three references or more, try giving the best ones channels of
+        // their own (and a shorter own history) against the plain mean, and keep
+        // what costs less on a few windows.
+        for k in 0..inputs.len() {
+            let nr = meta.sources[k].refs.len();
+            meta.sources[k].own = preset.plain;
+            meta.sources[k].ntop = 0;
+            if nr < 3 {
+                continue;
+            }
+            let plain = trial_cost(&Refs { files: &files, meta: &meta, tables: &tables }, k)?;
+            // The channels take up the misalignment: try them with coarse tables.
+            let fine: Vec<(usize, LagTable)> = meta.sources[k].refs.iter().filter_map(|&j| tables.get(&(k, j)).map(|t| (j, t.clone()))).collect();
+            for &(j, _) in &fine {
+                if let Some(t) = build_table(&fields[k], &fields[j], meta.sources[k].words, HYST_COARSE) {
+                    tables.insert((k, j), t);
+                }
+            }
+            meta.sources[k].own = preset.own;
+            meta.sources[k].ntop = preset.ntop.min(nr);
+            let split = trial_cost(&Refs { files: &files, meta: &meta, tables: &tables }, k)?;
+            if std::env::var_os("RFX_TIMING").is_some() {
+                eprintln!("  {k:>2} {}: plain mean {plain:.4}, with channels {split:.4} bits/sample", names[k]);
+            }
+            if split >= plain {
+                meta.sources[k].own = preset.plain;
+                meta.sources[k].ntop = 0;
+                for (j, t) in fine {
+                    tables.insert((k, j), t);
+                }
+            }
         }
     }
     Ok(Prepared { inputs, names, meta, tables, files })
@@ -667,16 +739,23 @@ pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize, with_ref:
     let mut input = vec![0i32; nseg * segment];
     let mut lens = Vec::new();
     let mut cpu = Vec::new();
-    let rw = refwin_len(segment, &pre);
+    let l = segment + 2 * pre.taps;
+    let rw = pre.chans() * l;
     let mut refw = if with_ref { vec![0f32; nseg * rw] } else { Vec::new() };
     for g in 0..nseg {
         let n = segment.min((words as usize).saturating_sub(g * segment));
         let y: Vec<i32> = read_words(&f, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect();
         input[g * segment..g * segment + n].copy_from_slice(&y);
         lens.push(n as i32);
-        let win: Vec<f32> = if with_ref { (0..refwin_len(n, &pre)).map(|i| y[(i + 5).min(n - 1)] as f32).collect() } else { Vec::new() };
+        let ln = n + 2 * pre.taps;
+        let val = |c: usize, i: usize| y[(i + 5 + 3 * c).min(n - 1)] as f32;
+        let win: Vec<f32> = if with_ref { (0..pre.chans()).flat_map(|c| (0..ln).map(move |i| (c, i))).map(|(c, i)| val(c, i)).collect() } else { Vec::new() };
         if with_ref {
-            refw[g * rw..g * rw + win.len()].copy_from_slice(&win);
+            for c in 0..pre.chans() {
+                for i in 0..ln {
+                    refw[g * rw + c * l + i] = val(c, i);
+                }
+            }
         }
         cpu.push(seg::predict_all(&y, &pre, with_ref, &win));
     }
@@ -776,7 +855,7 @@ impl Refs<'_> {
     /// (an experiment: any subset, any weights).
     pub(crate) fn window_with(&self, k: usize, s0: i64, n: usize, which: &[(usize, f32)]) -> Result<Vec<f32>> {
         let sm = &self.meta.sources[k];
-        let len = refwin_len(n, &sm.preset());
+        let len = n + 2 * sm.taps;
         let p0 = s0 - sm.taps as i64;
         let mut out = vec![0f32; len];
         for &(j, w) in which {
@@ -805,7 +884,7 @@ pub fn refsel(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Result
     let Prepared { names, meta, tables, files, .. } = &p;
     let refs = Refs { files, meta, tables };
     let sm = &meta.sources[k];
-    let pre = sm.preset();
+    let pre = Preset { ntop: 0, ..sm.preset() };
     let s = meta.segment;
     let total = (sm.words as usize).div_ceil(s);
     if sm.refs.len() < 2 {
@@ -864,4 +943,24 @@ for e in [2.0f32, 4.0, 8.0] {                let best = single.iter().cloned().f
     println!("  best single configuration for all segments  {:.4} (config {})", best_fixed.1, best_fixed.0);
     println!("  best configuration segment by segment       {:.4}  ({:+.2}% against the mean of all)", oracle, 100.0 * (oracle / mean(0) - 1.0));
     Ok(())
+}
+
+/// Cost, in bits per sample, of coding the trial windows of capture `k` with
+/// the predictor its metadata describes.
+fn trial_cost(refs: &Refs, k: usize) -> Result<f64> {
+    let sm = &refs.meta.sources[k];
+    let pre = sm.preset();
+    let win = CHOOSE_WINDOW.min(sm.words as usize);
+    let starts: Vec<usize> = (0..CHOOSE_WINDOWS).map(|w| ((sm.words as usize - win) * (2 * w + 1)) / (2 * CHOOSE_WINDOWS)).collect();
+    let costs: Vec<f64> = starts
+        .par_iter()
+        .map(|&s0| -> Result<f64> {
+            let y: Vec<i32> = read_words(&refs.files[k], sm.words, s0 as i64, win, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let w = refs.window(k, s0 as i64, win)?;
+            let preds = seg::predict_all(&y, &pre, true, &w);
+            let res: Vec<i32> = y.iter().zip(&preds).map(|(a, b)| a - b).collect();
+            Ok(seg::encode_residuals(&res).len() as f64 * 8.0 / win as f64)
+        })
+        .collect::<Result<_>>()?;
+    Ok(costs.iter().sum::<f64>() / costs.len() as f64)
 }

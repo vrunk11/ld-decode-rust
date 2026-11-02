@@ -6,17 +6,19 @@ use crate::model::Model;
 use crate::pred::{Pred, Preset};
 use crate::rc::{Decoder, Encoder};
 
-/// Length the reference window must have for `n` samples.
+/// Length the reference window must have for `n` samples: the channels one
+/// after the other, each `n + 2 * taps` long.
 pub fn refwin_len(n: usize, pre: &Preset) -> usize {
-    n + 2 * pre.taps
+    pre.window_len(n)
 }
 
 fn run(n: usize, pre: &Preset, use_ref: bool, refwin: &[f32], mut step: impl FnMut(usize, i32) -> i32) -> Vec<i32> {
     assert!(!use_ref || refwin.len() >= refwin_len(n, pre));
+    let ls = refwin.len() / pre.chans();
     let mut pred = Pred::new(*pre, use_ref);
     let mut ys: Vec<i32> = Vec::with_capacity(n);
     for i in 0..n {
-        let p = pred.predict(refwin, i);
+        let p = pred.predict(refwin, ls, i);
         let y = step(i, p);
         ys.push(y);
         pred.update(i, y);
@@ -97,7 +99,8 @@ mod tests {
         let y: Vec<i32> = (0..n).map(|i| sig[i + 8] + noise()).collect();
         for level in 1..=4 {
             let pre = Preset::level(level).unwrap();
-            let refwin: Vec<f32> = (0..refwin_len(n, &pre)).map(|i| (sig[i + 8 - pre.taps] + noise()) as f32).collect();
+            let l = n + 2 * pre.taps;
+            let refwin: Vec<f32> = (0..refwin_len(n, &pre)).map(|i| (sig[i % l + 8 - pre.taps] + noise()) as f32).collect();
             for use_ref in [false, true] {
                 let bytes = encode(&y, &pre, use_ref, &refwin);
                 let back = decode(&bytes, n, &pre, use_ref, &refwin).unwrap();

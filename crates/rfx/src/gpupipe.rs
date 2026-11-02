@@ -174,7 +174,8 @@ pub(crate) fn pack_source(
     let use_ref = !sm.refs.is_empty();
     let nseg = (sm.words as usize).div_ceil(s);
     let mut verifier = if verify { Some(GpuSeg::new(pre, use_ref, s)?) } else { None };
-    let rw = s + 2 * pre.taps;
+    let l = s + 2 * pre.taps;
+    let rw = pre.chans() * l;
     let (tx1, rx1) = sync_channel::<Result<Chunk>>(1);
     let mut packed = 0u64;
     let wall = Instant::now();
@@ -188,7 +189,7 @@ pub(crate) fn pack_source(
                     let n = s.min(sm.words as usize - s0);
 crate::io::read_words_into(&files[k], sm.words, s0 as i64, &mut inp[..n], sm.shift, sm.mean)?;
                     if use_ref {
-refs.window_into(k, s0 as i64, n, win)?;
+                        refs.window_into(k, s0 as i64, n, l, win)?;
                     }
                     Ok(())
                 });
@@ -259,7 +260,8 @@ pub(crate) fn unpack_source(
 ) -> Result<()> {
     let use_ref = !sm.refs.is_empty();
     let nseg = (sm.words as usize).div_ceil(s);
-    let rw = s + 2 * pre.taps;
+    let l = s + 2 * pre.taps;
+    let rw = pre.chans() * l;
     let (tx1, rx1) = sync_channel::<Result<Chunk>>(1);
     let wall = Instant::now();
     let res = std::thread::scope(|sc| -> Result<()> {
@@ -276,7 +278,7 @@ pub(crate) fn unpack_source(
                     let res = seg::decode_residuals(&bytes, n).with_context(|| format!("{}: segment {q} is corrupt", sm.name))?;
                     inp[..n].copy_from_slice(&res);
                     if use_ref {
-refs.window_into(k, s0 as i64, n, win)?;
+                        refs.window_into(k, s0 as i64, n, l, win)?;
                     }
                     Ok(())
                 });

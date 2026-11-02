@@ -5,15 +5,15 @@
 //! follows the noise level without any side information, and the model
 //! depends on past residuals only (a decoder can parse every residual
 //! before it knows a single prediction).
-use crate::rc::{Decoder, Encoder, PROB_INIT};
+use crate::rc::{Decoder, Encoder, P2};
 
 const NCTX: usize = 48;
 const NCLS: usize = 33;
 
 pub struct Model {
-    unary: Box<[[u16; NCLS]; NCTX]>,
-    m1: [u16; NCLS],
-    m2: [[u16; 2]; NCLS],
+    unary: Box<[[P2; NCLS]; NCTX]>,
+    m1: [P2; NCLS],
+    m2: [[P2; 2]; NCLS],
     avg: u32,
 }
 
@@ -25,7 +25,7 @@ impl Default for Model {
 
 impl Model {
     pub fn new() -> Self {
-        Self { unary: Box::new([[PROB_INIT; NCLS]; NCTX]), m1: [PROB_INIT; NCLS], m2: [[PROB_INIT; 2]; NCLS], avg: 64 }
+        Self { unary: Box::new([[P2::INIT; NCLS]; NCTX]), m1: [P2::INIT; NCLS], m2: [[P2::INIT; 2]; NCLS], avg: 64 }
     }
 
     fn ctx(&self) -> usize {
@@ -44,15 +44,15 @@ impl Model {
         let nb = 31 - v.leading_zeros();
         let c = self.ctx();
         for i in 0..nb as usize {
-            enc.bit(&mut self.unary[c][i], 1);
+            enc.bit2(&mut self.unary[c][i], 1);
         }
-        enc.bit(&mut self.unary[c][nb as usize], 0);
+        enc.bit2(&mut self.unary[c][nb as usize], 0);
         if nb >= 1 {
             let top = (v >> (nb - 1)) & 1;
-            enc.bit(&mut self.m1[nb as usize], top);
+            enc.bit2(&mut self.m1[nb as usize], top);
             if nb >= 2 {
                 let second = (v >> (nb - 2)) & 1;
-                enc.bit(&mut self.m2[nb as usize][top as usize], second);
+                enc.bit2(&mut self.m2[nb as usize][top as usize], second);
                 if nb >= 3 {
                     enc.direct(v & ((1 << (nb - 2)) - 1), nb - 2);
                 }
@@ -64,15 +64,15 @@ impl Model {
     pub fn decode(&mut self, dec: &mut Decoder) -> i32 {
         let c = self.ctx();
         let mut nb = 0usize;
-        while nb < NCLS - 1 && dec.bit(&mut self.unary[c][nb]) == 1 {
+        while nb < NCLS - 1 && dec.bit2(&mut self.unary[c][nb]) == 1 {
             nb += 1;
         }
         let mut v = 1u32;
         if nb >= 1 {
-            let top = dec.bit(&mut self.m1[nb]);
+            let top = dec.bit2(&mut self.m1[nb]);
             v = (v << 1) | top;
             if nb >= 2 {
-                let second = dec.bit(&mut self.m2[nb][top as usize]);
+                let second = dec.bit2(&mut self.m2[nb][top as usize]);
                 v = (v << 1) | second;
                 if nb >= 3 {
                     v = (v << (nb - 2)) | dec.direct(nb as u32 - 2);

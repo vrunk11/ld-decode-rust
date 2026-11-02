@@ -47,6 +47,8 @@ pub struct Runner {
     lam: f32,
     seg: usize,
     rw: usize,
+    /// Distance between the channels of a reference window.
+    ls: usize,
 }
 
 pub struct Downloader {
@@ -60,9 +62,11 @@ pub fn open(pre: &Preset, use_ref: bool, seg: usize) -> Result<(Uploader, Runner
     let gpu = Gpu::get()?;
     let d = pre.dim(use_ref);
     let options = format!(
-        "-DOWN={} -DTAPS={} -DUSEREF={} -DSTRIDE={} -DEVERY={} -DD={} -DDP={}",
-        pre.own,
+        "-DOWN={} -DTAPS={} -DNTOP={} -DTT={} -DUSEREF={} -DSTRIDE={} -DEVERY={} -DD={} -DDP={}",
+        pre.own_for(use_ref),
         pre.taps,
+        if use_ref { pre.ntop } else { 0 },
+        pre.ttaps,
         i32::from(use_ref),
         pre.stride,
         pre.every,
@@ -73,16 +77,17 @@ pub fn open(pre: &Preset, use_ref: bool, seg: usize) -> Result<(Uploader, Runner
     let options = format!("{options} {}", std::env::var("RFX_GPU_DEFS").unwrap_or_default());
     eprintln!("OpenCL device {}", gpu.name);
     let kernel = gpu.kernels(SOURCE, &options, &["rfx_seg"])?.remove(0);
-    let rw = seg + 2 * pre.taps;
+    let ls = seg + 2 * pre.taps;
+    let rw = pre.chans() * ls;
     Ok((
         Uploader { queue: gpu.queue()?, gpu: Arc::clone(&gpu), seg, rw },
-        Runner { queue: gpu.queue()?, kernel, lam: f32::from_bits(pre.lam_bits), seg, rw },
+        Runner { queue: gpu.queue()?, kernel, lam: f32::from_bits(pre.lam_bits), seg, rw, ls },
         Downloader { queue: gpu.queue()?, seg },
     ))
 }
 
 impl Uploader {
-    /// Reference window length per segment (`seg + 2 * taps`).
+    /// Reference window length per segment (all channels).
     pub fn window_len(&self) -> usize {
         self.rw
     }
@@ -124,6 +129,7 @@ impl Runner {
             Arg::Buf(&dev.lens),
             Arg::I32(self.seg as i32),
             Arg::I32(self.rw as i32),
+            Arg::I32(self.ls as i32),
             Arg::F32(self.lam),
             Arg::I32(mode),
         ])?;

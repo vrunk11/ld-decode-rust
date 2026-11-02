@@ -3,6 +3,35 @@
 //! so an encoder and a decoder agree on any machine.
 
 pub const PROB_INIT: u16 = 1024;
+
+/// A bit probability kept at two speeds (16-bit states, shifts 5 and 8); the
+/// coder uses their mean. Integer only.
+#[derive(Clone, Copy)]
+pub struct P2 {
+    f: u16,
+    s: u16,
+}
+
+impl P2 {
+    pub const INIT: P2 = P2 { f: 32768, s: 32768 };
+
+    /// Probability of a 0 bit in 1/32768, kept away from the ends.
+    #[inline]
+    fn p15(self) -> u32 {
+        (((u32::from(self.f) + u32::from(self.s)) >> 2).clamp(24, 32768 - 24)) as u32
+    }
+
+    #[inline]
+    fn learn(&mut self, bit: u32) {
+        if bit == 0 {
+            self.f += (65535 - self.f) >> 5;
+            self.s += (65535 - self.s) >> 8;
+        } else {
+            self.f -= self.f >> 5;
+            self.s -= self.s >> 8;
+        }
+    }
+}
 const TOP: u32 = 1 << 24;
 
 pub struct Encoder {
@@ -40,6 +69,22 @@ impl Encoder {
         }
         self.cache_size += 1;
         self.low = (self.low & 0x00FF_FFFF) << 8;
+    }
+
+    #[inline]
+    pub fn bit2(&mut self, prob: &mut P2, bit: u32) {
+        let bound = (self.range >> 15) * prob.p15();
+        if bit == 0 {
+            self.range = bound;
+        } else {
+            self.low += u64::from(bound);
+            self.range -= bound;
+        }
+        prob.learn(bit);
+        while self.range < TOP {
+            self.range <<= 8;
+            self.shift_low();
+        }
     }
 
     #[inline]
@@ -102,6 +147,26 @@ impl<'a> Decoder<'a> {
         let b = self.data.get(self.pos).copied().unwrap_or(0);
         self.pos += 1;
         b
+    }
+
+    #[inline]
+    pub fn bit2(&mut self, prob: &mut P2) -> u32 {
+        let bound = (self.range >> 15) * prob.p15();
+        let bit;
+        if self.code < bound {
+            self.range = bound;
+            bit = 0;
+        } else {
+            self.code -= bound;
+            self.range -= bound;
+            bit = 1;
+        }
+        prob.learn(bit);
+        while self.range < TOP {
+            self.range <<= 8;
+            self.code = (self.code << 8) | u32::from(self.next());
+        }
+        bit
     }
 
     #[inline]

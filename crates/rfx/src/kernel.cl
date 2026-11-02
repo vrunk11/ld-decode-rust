@@ -15,7 +15,11 @@
 // product's tree and the shift of the own history are lane shuffles, with no
 // barrier per sample. Elsewhere the same steps go through local memory.
 //
-// Defines: OWN, TAPS, USEREF, STRIDE, EVERY (powers of two), D (regressors),
+// The reference window has NTOP + 1 channels LS apart: the mean of the
+// references (2 * TAPS + 1 regressors) and NTOP single references (2 * TT + 1
+// each, the middle of the same span).
+//
+// Defines: OWN, TAPS, NTOP, TT, USEREF, STRIDE, EVERY (powers of two), D (regressors),
 // DP (leaves), and NVIDIA on NVIDIA devices.
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #pragma OPENCL FP_CONTRACT OFF
@@ -23,6 +27,8 @@
 #define LANES 32
 #define BLK 256
 #define K2 (2 * TAPS + 1)
+#define KS (2 * TT + 1)
+#define SP (BLK + K2)
 #define NTRI (D * (D + 1) / 2)
 
 #if defined(NVIDIA) && D <= 32
@@ -80,9 +86,17 @@ static inline float fdiv(float a, float b) { return (float)((double)a / (double)
 static inline float fsq(float a) { return (float)sqrt((double)a); }
 #endif
 
+// Offset, in the staged window of a block, of regressor `idx` (>= OWN) for sample 0.
+static inline int roff(int idx) {
+    const int u = idx - OWN;
+    if (u < K2) return u;
+    const int v = u - K2;
+    return (1 + v / KS) * SP + (TAPS - TT) + v % KS;
+}
+
 __kernel __attribute__((reqd_work_group_size(32, 1, 1)))
 void rfx_seg(__global const int* yin, __global const float* refwin, __global int* out,
-             __global const int* lens, const int S, const int RW, const float lam, const int mode)
+             __global const int* lens, const int S, const int RW, const int LS, const float lam, const int mode)
 {
     const int lane = get_local_id(0);
     const int seg = get_group_id(0);
@@ -93,7 +107,7 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
 
     __local float a[D * D], m[D * D], b[D], w[D], r[32], sv[D], rd[D];
     __local uchar2 tri[NTRI];
-    __local float rwl[BLK + K2];
+    __local float rwl[(1 + NTOP) * SP];
     __local int xl[BLK], ol[BLK];
 #ifndef FAST
     __local float t[DP];
@@ -114,6 +128,9 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
     r[lane] = 0.0f;
     SYNC();
 
+#if defined(FAST) && USEREF
+    const int myoff = (lane >= OWN && lane < D) ? roff(lane) : 0;
+#endif
 #ifdef FAST
     float rv = 0.0f;  // regressor `lane`
     float wv = 0.0f;  // weight `lane`
@@ -123,7 +140,8 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
         const int cnt = min(BLK, n - i0);
         for (int j = lane; j < cnt; j += LANES) xl[j] = X[i0 + j];
 #if USEREF
-        for (int j = lane; j < cnt + K2 - 1; j += LANES) rwl[j] = R0[i0 + j];
+        for (int c = 0; c <= NTOP; c++)
+            for (int j = lane; j < cnt + K2 - 1; j += LANES) rwl[c * SP + j] = R0[(long)c * LS + i0 + j];
 #endif
         SYNC();
 
@@ -133,7 +151,7 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
 
 #ifdef FAST
 #if USEREF
-            if (lane >= OWN) rv = (lane < D) ? rwl[jj + lane - OWN] : 0.0f;
+            if (lane >= OWN) rv = (lane < D) ? rwl[jj + myoff] : 0.0f;
 #endif
             float tl = MUL(rv, wv);
             for (int st = DP / 2; st >= 1; st >>= 1) {
@@ -152,7 +170,7 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
                 }
 #if USEREF
                 else {
-                    v = rwl[jj + idx - OWN];
+                    v = rwl[jj + roff(idx)];
                 }
 #endif
                 r[idx] = v;

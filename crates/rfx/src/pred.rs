@@ -1,11 +1,12 @@
 //! The predictor: exponentially weighted least squares on the past only, so
 //! an encoder and a decoder compute the same weights and none are stored.
 //!
-//! Regressors of sample `i`: the `own` previous samples of the segment, and
-//! `2*taps+1` values of the reference window (the mean of the already coded
-//! sources, read at the lag tables' positions) centred on `i`. The
-//! covariance is updated every `stride` samples and the weights re-solved
-//! every `every` samples.
+//! Regressors of sample `i`: the `own` previous samples of the segment; `2*taps+1`
+//! values of the reference window centred on `i` (the weighted mean of the
+//! already coded sources, read at the lag tables' positions); and for each of
+//! the `ntop` best references `2*ttaps+1` values of that reference alone, so
+//! the fit can weigh the sources itself. The covariance is updated every
+//! `stride` samples and the weights re-solved every `every` samples.
 //!
 //! Arithmetic is fixed so that any implementation (this one, the OpenCL
 //! kernel) gets the same bits:
@@ -25,8 +26,18 @@
 
 #[derive(Clone, Copy, Debug)]
 pub struct Preset {
+    /// Own past samples used with references.
     pub own: usize,
+    /// Own past samples used when there are none (a primary source).
+    pub solo: usize,
+    /// Own past samples with the plain mean of the references (no channels).
+    pub plain: usize,
+    /// The mean of the references has `2 * taps + 1` values around the sample.
     pub taps: usize,
+    /// References that also get a channel of their own, with `2 * ttaps + 1`
+    /// values each.
+    pub ntop: usize,
+    pub ttaps: usize,
     pub stride: usize,
     pub every: usize,
     /// Forgetting factor per covariance update, as f32 bits.
@@ -36,20 +47,40 @@ pub struct Preset {
 impl Preset {
     /// Levels 1 (fast) to 4 (strongest). Memory is 1024 samples throughout.
     pub fn level(level: u32) -> Option<Self> {
-        let (own, taps, stride, every) = match level {
-            1 => (8, 3, 8, 128),
-            2 => (16, 4, 8, 128),
-            3 => (16, 6, 4, 64),
-            4 => (32, 6, 1, 32),
+        let (own, solo, plain, taps, ntop, stride, every) = match level {
+            1 => (6, 8, 8, 3, 2, 8, 128),
+            2 => (8, 16, 16, 4, 3, 4, 64),
+            3 => (8, 32, 16, 6, 3, 1, 16),
+            4 => (12, 48, 24, 6, 4, 1, 16),
             _ => return None,
         };
         let lam = (1.0f64 - 1.0 / 1024.0).powi(stride as i32) as f32;
-        Some(Self { own, taps, stride, every, lam_bits: lam.to_bits() })
+        Some(Self { own, solo, plain, taps, ntop, ttaps: 1, stride, every, lam_bits: lam.to_bits() })
+    }
+
+    /// Own past samples in use.
+    pub fn own_for(&self, use_ref: bool) -> usize {
+        if use_ref {
+            self.own
+        } else {
+            self.solo
+        }
+    }
+
+    /// Channels of reference window: the mean, then one per top reference.
+    pub fn chans(&self) -> usize {
+        1 + self.ntop
+    }
+
+    /// Values of a reference window for `n` samples, all channels: each is
+    /// `n + 2 * taps` long, or the stride `l` between channels when given.
+    pub fn window_len(&self, n: usize) -> usize {
+        self.chans() * (n + 2 * self.taps)
     }
 
     /// `stride` and `every` are powers of two (tested with a mask).
     pub fn dim(&self, use_ref: bool) -> usize {
-        self.own + if use_ref { 2 * self.taps + 1 } else { 0 }
+        self.own_for(use_ref) + if use_ref { 2 * self.taps + 1 + self.ntop * (2 * self.ttaps + 1) } else { 0 }
     }
 
     /// Leaves of the dot product tree: the next power of two.
@@ -61,6 +92,8 @@ impl Preset {
 pub struct Pred {
     pre: Preset,
     use_ref: bool,
+    /// Own past samples in use.
+    own: usize,
     d: usize,
     dp: usize,
     /// Row length of the matrices (`d`).
@@ -81,6 +114,7 @@ pub struct Pred {
 
 impl Pred {
     pub fn new(pre: Preset, use_ref: bool) -> Self {
+        let own = pre.own_for(use_ref);
         let d = pre.dim(use_ref);
         let dp = pre.leaves(use_ref);
         assert!(d <= 64, "at most 64 regressors");
@@ -88,6 +122,7 @@ impl Pred {
         Self {
             pre,
             use_ref,
+            own,
             d,
             dp,
             ds,
@@ -104,12 +139,20 @@ impl Pred {
     }
 
     /// Prediction of sample `i` from the samples learnt so far (`update`) and
-    /// `refwin[i..i + 2*taps + 1]`.
-    pub fn predict(&mut self, refwin: &[f32], i: usize) -> i32 {
-        let own = self.pre.own;
+    /// the reference window: channel `c` starts at `c * ls`; the mean (channel
+    /// 0) is read at `[i..i + 2*taps + 1]`, a top reference (channels 1..)
+    /// at the middle `2*ttaps + 1` of the same span.
+    pub fn predict(&mut self, refwin: &[f32], ls: usize, i: usize) -> i32 {
+        let own = self.own;
         if self.use_ref {
             let n = 2 * self.pre.taps + 1;
             self.r[own..own + n].copy_from_slice(&refwin[i..i + n]);
+            let (m, tt) = (2 * self.pre.ttaps + 1, self.pre.taps - self.pre.ttaps);
+            for c in 1..=self.pre.ntop {
+                let at = own + n + (c - 1) * m;
+                let from = c * ls + i + tt;
+                self.r[at..at + m].copy_from_slice(&refwin[from..from + m]);
+            }
         }
         let dot = match self.dp {
             2 => tree::<1>(&self.r, &self.w),
@@ -144,7 +187,7 @@ let row = &mut self.a[p * ds..p * ds + p + 1];                for (v, &rq) in ro
             }
         }
         // The newest sample becomes the first of the own history.
-        let own = self.pre.own;
+        let own = self.own;
         self.r.copy_within(0..own - 1, 1);
         self.r[0] = yf;
     }
