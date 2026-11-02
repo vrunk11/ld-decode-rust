@@ -1,0 +1,24 @@
+[package]
+name = "rfx"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Lossless archive of several RF captures of one disc (.rfx)"
+
+[lib]
+name = "rfx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rfx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+ld-decode = { path = "../ld-decode" }
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

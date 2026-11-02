@@ -684,6 +684,12 @@ fn read_tbc_source(
             live.finish(i, run.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))));
         })?;
     }
+    // `LD_PASS0_ONLY`: locate the lines of every input (see `LD_DUMP_PASS0`)
+    // and stop, for tools that need the alignment between captures.
+    if std::env::var_os("LD_PASS0_ONLY").is_some() {
+        live.wait_done()?;
+        std::process::exit(0);
+    }
     let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
     stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, xtal, leak, rf_out)
 }

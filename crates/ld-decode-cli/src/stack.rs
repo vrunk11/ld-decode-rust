@@ -381,6 +381,19 @@ impl Live {
         self.cv.notify_all();
     }
 
+    /// Block until pass 0 has ended on every input (and written its
+    /// `LD_DUMP_PASS0` record); an error of any of them is returned.
+    pub fn wait_done(&self) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        while !st.done.iter().all(|&d| d) {
+            st = self.cv.wait(st).unwrap();
+        }
+        match &st.error {
+            Some(e) => Err(anyhow::anyhow!("{e}")),
+            None => Ok(()),
+        }
+    }
+
     /// The stacked decode is over: pass 0 can stop.
     pub(crate) fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
