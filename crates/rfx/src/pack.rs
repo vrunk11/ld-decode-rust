@@ -74,7 +74,7 @@ pub enum Device {
 }
 
 /// Segments sent to the GPU at once.
-const GPU_CHUNK: usize = 512;
+const GPU_CHUNK: usize = 384;
 
 pub struct PackOpts {
     pub device: Device,
@@ -124,10 +124,10 @@ fn file_stats(path: &Path) -> Result<Stats> {
 }
 
 /// Source `j`'s files, as the predictor of a later source reads them.
-struct Refs<'a> {
-    files: &'a [File],
-    meta: &'a Meta,
-    tables: &'a HashMap<(usize, usize), LagTable>,
+pub(crate) struct Refs<'a> {
+    pub(crate) files: &'a [File],
+    pub(crate) meta: &'a Meta,
+    pub(crate) tables: &'a HashMap<(usize, usize), LagTable>,
 }
 
 /// Runs `(from, to, lag)` of constant lag covering positions `[p0, p1)`.
@@ -150,7 +150,7 @@ fn runs(t: &LagTable, p0: i64, p1: i64) -> Vec<(i64, i64, i64)> {
 
 impl Refs<'_> {
     /// Mean of the reference sources over positions `[s0 - taps, s0 + n + taps)`.
-    fn window(&self, k: usize, s0: i64, n: usize) -> Result<Vec<f32>> {
+    pub(crate) fn window(&self, k: usize, s0: i64, n: usize) -> Result<Vec<f32>> {
         let sm = &self.meta.sources[k];
         let len = refwin_len(n, &sm.preset());
         let p0 = s0 - sm.taps as i64;
@@ -286,64 +286,13 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
         let nseg = (sm.words as usize).div_ceil(s);
         let t0 = std::time::Instant::now();
         let mut packed = 0u64;
-        let chunk = if o.device == Device::Gpu { GPU_CHUNK } else { rayon::current_num_threads() * 4 };
-        let mut gpu = if o.device == Device::Gpu { Some(GpuSeg::new(&pre, use_ref, s)?) } else { None };
-        for first in (0..nseg).step_by(chunk) {
+        if o.device == Device::Gpu {
+            packed = crate::gpupipe::pack_source(k, sm, &pre, s, GPU_CHUNK, o.verify, &files, &refs, &mut w)?;
+        }
+        let chunk = rayon::current_num_threads() * 4;
+        let nseg_cpu = if o.device == Device::Gpu { 0 } else { nseg };
+        for first in (0..nseg_cpu).step_by(chunk) {
             let segs: Vec<usize> = (first..(first + chunk).min(nseg)).collect();
-            if let Some(g) = gpu.as_mut() {
-                let rw = g.window_len();
-                let prepared: Vec<Result<(Vec<i32>, Vec<f32>)>> = segs
-                    .par_iter()
-                    .map(|&q| {
-                        let s0 = q * s;
-                        let n = s.min(sm.words as usize - s0);
-                        let y: Vec<i32> = read_words(&files[k], sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
-                        let win = if use_ref { refs.window(k, s0 as i64, n)? } else { Vec::new() };
-                        Ok((y, win))
-                    })
-                    .collect();
-                let prepared: Vec<(Vec<i32>, Vec<f32>)> = prepared.into_iter().collect::<Result<_>>()?;
-                let mut input = vec![0i32; segs.len() * s];
-                let mut refw = if use_ref { vec![0f32; segs.len() * rw] } else { Vec::new() };
-                let mut lens = Vec::new();
-                for (i, (y, win)) in prepared.iter().enumerate() {
-                    input[i * s..i * s + y.len()].copy_from_slice(y);
-                    if use_ref {
-                        refw[i * rw..i * rw + win.len()].copy_from_slice(win);
-                    }
-                    lens.push(y.len() as i32);
-                }
-                let preds = g.run(0, &input, &refw, &lens)?;
-                let coded: Vec<(Vec<u8>, Vec<i32>)> = prepared
-                    .par_iter()
-                    .enumerate()
-                    .map(|(i, (y, _))| {
-                        let res: Vec<i32> = y.iter().zip(&preds[i * s..]).map(|(a, b)| a - b).collect();
-                        (seg::encode_residuals(&res), res)
-                    })
-                    .collect();
-                if o.verify {
-                    let decoded: Vec<Option<Vec<i32>>> = coded.par_iter().zip(&prepared).map(|((bytes, _), (y, _))| seg::decode_residuals(bytes, y.len())).collect();
-                    let mut flat = vec![0i32; segs.len() * s];
-                    for (i, ((_, res), d)) in coded.iter().zip(&decoded).enumerate() {
-                        match d {
-                            Some(d) if d == res => flat[i * s..i * s + d.len()].copy_from_slice(d),
-                            _ => bail!("self-check failed: segment {} of {} does not decode to its residuals", segs[i], sm.name),
-                        }
-                    }
-                    let back = g.run(1, &flat, &refw, &lens)?;
-                    for (i, (y, _)) in prepared.iter().enumerate() {
-                        if back[i * s..i * s + y.len()] != y[..] {
-                            bail!("self-check failed: segment {} of {} does not decode to itself on the GPU", segs[i], sm.name);
-                        }
-                    }
-                }
-                for (q, (bytes, _)) in segs.iter().zip(&coded) {
-                    packed += bytes.len() as u64;
-                    w.write_all(&ebml::cluster(*q as u64, k as u64 + 1, bytes))?;
-                }
-                continue;
-            }
             let blocks: Vec<Result<Vec<u8>>> = segs
                 .par_iter()
                 .map(|&g| {
@@ -472,48 +421,13 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -
         let use_ref = !sm.refs.is_empty();
         let nseg = (sm.words as usize).div_ceil(s);
         let t0 = std::time::Instant::now();
-        let chunk = if device == Device::Gpu { GPU_CHUNK } else { rayon::current_num_threads() * 4 };
-        let mut gpu = if device == Device::Gpu { Some(GpuSeg::new(&pre, use_ref, s)?) } else { None };
-        for first in (0..nseg).step_by(chunk) {
+        if device == Device::Gpu {
+            crate::gpupipe::unpack_source(k, sm, &pre, s, GPU_CHUNK, &o.blocks[k], &o.file, &refs, &outs[k])?;
+        }
+        let chunk = rayon::current_num_threads() * 4;
+        let nseg_cpu = if device == Device::Gpu { 0 } else { nseg };
+        for first in (0..nseg_cpu).step_by(chunk) {
             let segs: Vec<usize> = (first..(first + chunk).min(nseg)).collect();
-            if let Some(g) = gpu.as_mut() {
-                let rw = g.window_len();
-                let prepared: Vec<Result<(Vec<i32>, Vec<f32>)>> = segs
-                    .par_iter()
-                    .map(|&q| {
-                        let s0 = q * s;
-                        let n = s.min(sm.words as usize - s0);
-                        let &(off, len) = o.blocks[k].get(&(q as u64)).with_context(|| format!("{}: segment {q} is missing", sm.name))?;
-                        let mut bytes = vec![0u8; len as usize];
-                        read_exact_at(&o.file, &mut bytes, off)?;
-                        let res = seg::decode_residuals(&bytes, n).with_context(|| format!("{}: segment {q} is corrupt", sm.name))?;
-                        let win = if use_ref { refs.window(k, s0 as i64, n)? } else { Vec::new() };
-                        Ok((res, win))
-                    })
-                    .collect();
-                let prepared: Vec<(Vec<i32>, Vec<f32>)> = prepared.into_iter().collect::<Result<_>>()?;
-                let mut input = vec![0i32; segs.len() * s];
-                let mut refw = if use_ref { vec![0f32; segs.len() * rw] } else { Vec::new() };
-                let mut lens = Vec::new();
-                for (i, (res, win)) in prepared.iter().enumerate() {
-                    input[i * s..i * s + res.len()].copy_from_slice(res);
-                    if use_ref {
-                        refw[i * rw..i * rw + win.len()].copy_from_slice(win);
-                    }
-                    lens.push(res.len() as i32);
-                }
-                let ys = g.run(1, &input, &refw, &lens)?;
-                segs.par_iter().enumerate().try_for_each(|(i, &q)| -> Result<()> {
-                    let n = lens[i] as usize;
-                    let mut raw = Vec::with_capacity(n * 2);
-                    for &v in &ys[i * s..i * s + n] {
-                        raw.extend_from_slice(&(((v + sm.mean) << sm.shift) as i16).to_le_bytes());
-                    }
-                    write_all_at(&outs[k], &raw, (q * s) as u64 * 2)?;
-                    Ok(())
-                })?;
-                continue;
-            }
             segs.par_iter().try_for_each(|&g| -> Result<()> {
                 let s0 = g * s;
                 let n = s.min(sm.words as usize - s0);
@@ -565,7 +479,7 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -
 
 /// Development check: the predictions of the first `nseg` segments of a file,
 /// CPU against GPU, and the first sample where they differ.
-pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize) -> Result<()> {
+pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize, with_ref: bool) -> Result<()> {
     let pre = Preset::level(level).context("level 1 to 4")?;
     let st = file_stats(path)?;
     let f = File::open(path)?;
@@ -573,17 +487,33 @@ pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize) -> Result
     let mut input = vec![0i32; nseg * segment];
     let mut lens = Vec::new();
     let mut cpu = Vec::new();
+    let rw = refwin_len(segment, &pre);
+    let mut refw = if with_ref { vec![0f32; nseg * rw] } else { Vec::new() };
     for g in 0..nseg {
         let n = segment.min((words as usize).saturating_sub(g * segment));
         let y: Vec<i32> = read_words(&f, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect();
         input[g * segment..g * segment + n].copy_from_slice(&y);
         lens.push(n as i32);
-        cpu.push(seg::predict_all(&y, &pre, false, &[]));
+        let win: Vec<f32> = if with_ref { (0..refwin_len(n, &pre)).map(|i| y[(i + 5).min(n - 1)] as f32).collect() } else { Vec::new() };
+        if with_ref {
+            refw[g * rw..g * rw + win.len()].copy_from_slice(&win);
+        }
+        cpu.push(seg::predict_all(&y, &pre, with_ref, &win));
     }
-    let mut gpu = GpuSeg::new(&pre, false, segment)?;
-    let t0 = std::time::Instant::now();
-    let out = gpu.run(0, &input, &[], &lens)?;
-    eprintln!("GPU: {:.1} Msmp/s", lens.iter().sum::<i32>() as f64 / t0.elapsed().as_secs_f64() / 1e6);
+    let mut gpu = GpuSeg::new(&pre, with_ref, segment)?;
+    let _ = gpu.run(0, &input, &refw, &lens)?;
+    gpu.t_upload = 0.0;
+    gpu.t_kernel = 0.0;
+    gpu.t_download = 0.0;
+    let out = gpu.run(0, &input, &refw, &lens)?;
+    let total = lens.iter().sum::<i32>() as f64;
+    eprintln!(
+        "GPU: kernel {:.1} Msmp/s ({:.3} s), upload {:.3} s, download {:.3} s",
+        total / gpu.t_kernel / 1e6,
+        gpu.t_kernel,
+        gpu.t_upload,
+        gpu.t_download
+    );
     for g in 0..nseg {
         let n = lens[g] as usize;
         let diff = (0..n).filter(|&i| cpu[g][i] != out[g * segment + i]).collect::<Vec<_>>();

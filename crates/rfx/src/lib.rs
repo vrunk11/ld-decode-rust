@@ -2,6 +2,7 @@
 pub mod align;
 pub mod ebml;
 pub mod gpu;
+mod gpupipe;
 pub mod io;
 pub mod model;
 pub mod pack;

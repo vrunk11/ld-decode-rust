@@ -58,6 +58,9 @@ enum Cmd {
     },
     /// Development: compare the CPU and GPU predictors on one file.
     GpuCheck {
+        /// Predict from a (synthetic) reference window too.
+        #[arg(long)]
+        with_ref: bool,
         input: PathBuf,
         #[arg(short, long, default_value_t = 3)]
         level: u32,
@@ -94,7 +97,7 @@ fn main() -> Result<()> {
             rfx::pack::bench(&input, level, segments, segment)?;
             rfx::pack::bench_pred(&input, level, segments, segment)?
         }
-        Cmd::GpuCheck { input, level, segments, segment } => rfx::pack::gpu_check(&input, level, segments, segment)?,
+        Cmd::GpuCheck { input, level, segments, segment, with_ref } => rfx::pack::gpu_check(&input, level, segments, segment, with_ref)?,
     }
     Ok(())
 }

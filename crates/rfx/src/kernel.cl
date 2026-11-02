@@ -6,21 +6,38 @@
 //
 // It must give the CPU's bits, so the arithmetic is the CPU's: f32 with every
 // product and sum rounded on its own (no statement holds a multiply and an
-// add on the same value), division and square root through f64 (correctly
-// rounded for f32 operands), the dot product as the same binary tree, the
-// Cholesky solve in the same order of operations per element.
+// add on the same value), division and square root correctly rounded, the dot
+// product as the same binary tree, the Cholesky solve in the same order of
+// operations per element.
 //
-// Defines: OWN, TAPS, USEREF, STRIDE, EVERY, D (regressors), DP (leaves).
+// On NVIDIA with up to 32 regressors (FAST) the group is one warp and each
+// work-item holds one regressor and one weight in registers: the dot
+// product's tree and the shift of the own history are lane shuffles, with no
+// barrier per sample. Elsewhere the same steps go through local memory.
+//
+// Defines: OWN, TAPS, USEREF, STRIDE, EVERY (powers of two), D (regressors),
+// DP (leaves), and NVIDIA on NVIDIA devices.
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #pragma OPENCL FP_CONTRACT OFF
 
 #define LANES 32
 #define BLK 256
 #define K2 (2 * TAPS + 1)
+#define NTRI (D * (D + 1) / 2)
+
+#if defined(NVIDIA) && D <= 32
+#define FAST 1
+#endif
 
 #ifdef NVIDIA
-// The compiler folds the f64 detour into an f32 division, which NVIDIA does
-// not round correctly by default: ask for the rounded instructions.
+// NVIDIA's compiler fuses a*b+c into a fused multiply-add whatever the
+// pragma says, and folds an f64 division detour into an f32 division it does
+// not round correctly: ask for the rounded instructions.
+static inline float MUL(float a, float b) {
+    float r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
 static inline float fdiv(float a, float b) {
     float r;
     asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
@@ -31,22 +48,25 @@ static inline float fsq(float a) {
     asm("sqrt.rn.f32 %0, %1;" : "=f"(r) : "f"(a));
     return r;
 }
-#else
-static inline float fdiv(float a, float b) { return (float)((double)a / (double)b); }
-static inline float fsq(float a) { return (float)sqrt((double)a); }
-#endif
-
-// A product that the compiler cannot fuse into a following add: NVIDIA's
-// compiler contracts a*b+c into a fused multiply-add whatever the pragma says,
-// the CPU does not, so the product is rounded on its own (`mul.rn`).
-#ifdef NVIDIA
-static inline float MUL(float a, float b) {
+static inline float shfl_down(float v, int delta) {
     float r;
-    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    asm volatile("shfl.sync.down.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(r) : "f"(v), "r"(delta));
+    return r;
+}
+static inline float shfl_up(float v, int delta) {
+    float r;
+    asm volatile("shfl.sync.up.b32 %0, %1, %2, 0x0, 0xffffffff;" : "=f"(r) : "f"(v), "r"(delta));
+    return r;
+}
+static inline float shfl_first(float v) {
+    float r;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=f"(r) : "f"(v));
     return r;
 }
 #else
 static inline float MUL(float a, float b) { return a * b; }
+static inline float fdiv(float a, float b) { return (float)((double)a / (double)b); }
+static inline float fsq(float a) { return (float)sqrt((double)a); }
 #endif
 
 __kernel __attribute__((reqd_work_group_size(32, 1, 1)))
@@ -60,16 +80,33 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
     __global const float* R0 = refwin + (long)seg * RW;
     __global int* O = out + (long)seg * S;
 
-    __local float a[D * D], m[D * D], b[D], w[D], r[D], sv[D], t[DP];
+    __local float a[D * D], m[D * D], b[D], w[D], r[32], sv[D];
+    __local uchar2 tri[NTRI];
     __local float rwl[BLK + K2];
-    __local int xl[BLK], ol[BLK], ring[64];
+    __local int xl[BLK], ol[BLK];
+#ifndef FAST
+    __local float t[DP];
+    __local int ring[64];
+#endif
     __local int okf;
     __local float ridge;
 
     for (int i = lane; i < D * D; i += LANES) a[i] = 0.0f;
     for (int i = lane; i < D; i += LANES) { b[i] = 0.0f; w[i] = 0.0f; }
+    for (int p = lane; p < D; p += LANES) {
+        const int base = p * (p + 1) / 2;
+        for (int q = 0; q <= p; q++) tri[base + q] = (uchar2)((uchar)p, (uchar)q);
+    }
+#ifndef FAST
     for (int i = lane; i < 64; i += LANES) ring[i] = 0;
+#endif
+    r[lane] = 0.0f;
     barrier(CLK_LOCAL_MEM_FENCE);
+
+#ifdef FAST
+    float rv = 0.0f;  // regressor `lane`
+    float wv = 0.0f;  // weight `lane`
+#endif
 
     for (int i0 = 0; i0 < n; i0 += BLK) {
         const int cnt = min(BLK, n - i0);
@@ -81,7 +118,22 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
 
         for (int jj = 0; jj < cnt; jj++) {
             const int i = i0 + jj;
+            int pred;
 
+#ifdef FAST
+#if USEREF
+            if (lane >= OWN) rv = (lane < D) ? rwl[jj + lane - OWN] : 0.0f;
+#endif
+            float tl = MUL(rv, wv);
+            for (int st = DP / 2; st >= 1; st >>= 1) {
+                float v = shfl_down(tl, st);
+                tl = tl + v;
+            }
+            float s0 = shfl_first(tl);
+            float pf = floor(s0 + 0.5f);
+            pf = clamp(pf, -4194304.0f, 4194304.0f);
+            pred = (int)pf;
+#else
             for (int idx = lane; idx < D; idx += LANES) {
                 float v = 0.0f;
                 if (idx < OWN) {
@@ -95,7 +147,6 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
                 r[idx] = v;
             }
             barrier(CLK_LOCAL_MEM_FENCE);
-
             for (int q = lane; q < DP; q += LANES) {
                 float lf = 0.0f;
                 if (q < D) lf = MUL(r[q], w[q]);
@@ -112,7 +163,8 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
             }
             float pf = floor(t[0] + 0.5f);
             pf = clamp(pf, -4194304.0f, 4194304.0f);
-            const int pred = (int)pf;
+            pred = (int)pf;
+#endif
 
             int y;
             if (mode == 0) {
@@ -122,27 +174,51 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
                 y = pred + xl[jj];
                 if (lane == 0) ol[jj] = y;
             }
-            if (lane == 0) ring[i & 63] = y;
             const float yf = (float)y;
+#ifndef FAST
+            if (lane == 0) ring[i & 63] = y;
+#endif
 
-            if (i % STRIDE == 0) {
+#ifndef NO_UPDATE
+            if ((i & (STRIDE - 1)) == 0) {
+#ifdef FAST
+                r[lane] = rv;
+                barrier(CLK_LOCAL_MEM_FENCE);
+#endif
                 for (int p = lane; p < D; p += LANES) {
                     float tt = MUL(r[p], yf);
                     float lb = MUL(lam, b[p]);
                     b[p] = lb + tt;
                 }
-                for (int p = 0; p < D; p++) {
-                    const float rp = r[p];
-                    for (int q = lane; q <= p; q += LANES) {
-                        float tt = MUL(rp, r[q]);
-                        float la = MUL(lam, a[p * D + q]);
-                        a[p * D + q] = la + tt;
-                    }
+                for (int e = lane; e < NTRI; e += LANES) {
+                    const uchar2 pq = tri[e];
+                    const int ai = pq.x * D + pq.y;
+                    float tt = MUL(r[pq.x], r[pq.y]);
+                    float la = MUL(lam, a[ai]);
+                    a[ai] = la + tt;
                 }
+#ifdef FAST
+                barrier(CLK_LOCAL_MEM_FENCE);
+#endif
             }
+#endif
+#ifndef FAST
             barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
-            if (i % EVERY == EVERY - 1 && i > 4 * D) {
+#ifdef FAST
+            {
+                float up = shfl_up(rv, 1);
+                if (lane == 0) rv = yf;
+                else if (lane < OWN) rv = up;
+            }
+#endif
+
+#ifndef NO_SOLVE
+            if ((i & (EVERY - 1)) == EVERY - 1 && i > 4 * D) {
+#ifdef FAST
+                barrier(CLK_LOCAL_MEM_FENCE);
+#endif
                 for (int idx = lane; idx < D * D; idx += LANES) m[idx] = a[idx];
                 for (int idx = lane; idx < D; idx += LANES) sv[idx] = b[idx];
                 barrier(CLK_LOCAL_MEM_FENCE);
@@ -201,7 +277,11 @@ void rfx_seg(__global const int* yin, __global const float* refwin, __global int
                     for (int idx = lane; idx < D; idx += LANES) w[idx] = sv[idx];
                 }
                 barrier(CLK_LOCAL_MEM_FENCE);
+#ifdef FAST
+                wv = (lane < D) ? w[lane] : 0.0f;
+#endif
             }
+#endif
         }
         for (int j = lane; j < cnt; j += LANES) O[i0 + j] = ol[j];
         barrier(CLK_LOCAL_MEM_FENCE);

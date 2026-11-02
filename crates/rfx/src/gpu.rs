@@ -20,6 +20,10 @@ pub struct GpuSeg {
     refwin: Buffer,
     out: Buffer,
     lens: Buffer,
+    /// Seconds spent so far moving data to the device, running, and back.
+    pub t_upload: f64,
+    pub t_kernel: f64,
+    pub t_download: f64,
 }
 
 impl GpuSeg {
@@ -38,6 +42,7 @@ impl GpuSeg {
             pre.leaves(use_ref)
         );
         let options = if gpu.name.contains("NVIDIA") { format!("{options} -DNVIDIA=1") } else { options };
+        let options = format!("{options} {}", std::env::var("RFX_GPU_DEFS").unwrap_or_default());
         eprintln!("OpenCL device {}", gpu.name);
         let kernel = gpu.kernels(SOURCE, &options, &["rfx_seg"])?.remove(0);
         Ok(Self {
@@ -50,6 +55,9 @@ impl GpuSeg {
             refwin: gpu.buffer(1)?,
             out: gpu.buffer(1)?,
             lens: gpu.buffer(1)?,
+            t_upload: 0.0,
+            t_kernel: 0.0,
+            t_download: 0.0,
             gpu,
         })
     }
@@ -67,6 +75,7 @@ impl GpuSeg {
     pub fn run(&mut self, mode: i32, input: &[i32], refwin: &[f32], lens: &[i32]) -> Result<Vec<i32>> {
         let b = lens.len();
         let _ = &self.gpu;
+        let t0 = std::time::Instant::now();
         self.input.ensure(input.len() * 4)?;
         self.out.ensure(input.len() * 4)?;
         self.lens.ensure(lens.len() * 4)?;
@@ -76,6 +85,8 @@ impl GpuSeg {
         if !refwin.is_empty() {
             self.queue.write(&self.refwin, 0, refwin)?;
         }
+        self.queue.finish()?;
+        let t1 = std::time::Instant::now();
         self.kernel.args(&[
             Arg::Buf(&self.input),
             Arg::Buf(&self.refwin),
@@ -87,9 +98,15 @@ impl GpuSeg {
             Arg::I32(mode),
         ])?;
         self.queue.launch(&self.kernel, &[b * 32], 32)?;
+        self.queue.finish()?;
+        let t2 = std::time::Instant::now();
         let mut out = vec![0i32; input.len()];
         self.queue.read(&self.out, 0, &mut out)?;
         self.queue.finish()?;
+        let t3 = std::time::Instant::now();
+        self.t_upload += (t1 - t0).as_secs_f64();
+        self.t_kernel += (t2 - t1).as_secs_f64();
+        self.t_download += (t3 - t2).as_secs_f64();
         Ok(out)
     }
 }
