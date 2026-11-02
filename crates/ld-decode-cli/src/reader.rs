@@ -120,6 +120,20 @@ fn open_source(path: &str, file: File, format: SampleFormat, rate_hz: u32) -> Re
     })
 }
 
+/// Bytes per sample and widening function of the fixed-width raw formats, the
+/// ones a random-access reader can address by sample index (`None` for packed
+/// and compressed formats).
+pub fn raw_layout(format: SampleFormat) -> Option<(usize, fn(&[u8], &mut [f32]))> {
+    Some(match format {
+        SampleFormat::S16Le => (2, widen_s16 as fn(&[u8], &mut [f32])),
+        SampleFormat::U16Le => (2, widen_u16),
+        SampleFormat::U8Le => (1, widen_u8),
+        SampleFormat::S8Le => (1, widen_s8),
+        SampleFormat::F32Le => (4, widen_f32),
+        _ => return None,
+    })
+}
+
 fn unpack_lds(b: &[u8], out: &mut [f32]) {
     out[..4].copy_from_slice(&unpack_lds_group(b));
 }

@@ -7,6 +7,9 @@ mod db;
 mod ldx;
 mod prefetch;
 mod reader;
+mod rfsync;
+mod opencl;
+mod stack;
 mod writer;
 
 use std::fs::File;
@@ -32,12 +35,81 @@ use writer::DecodeWriter;
 )]
 struct Args {
     /// Source file (.lds, .s16, .r16, .rf, .r30, .ldf, .flac); "-" reads
-    /// stdin (needs --format; --start/--seek can only skip forward there)
-    infile: String,
+    /// stdin (needs --format; --start/--seek can only skip forward there).
+    /// Alternatively give the sources with -i and the output with -o.
+    infile: Option<String>,
     /// Base name for the output .tbc and .tbc.json files; "-" streams the
     /// .tbc picture to stdout (sidecar outputs are then disabled). A name
     /// ending in .ldx (or --ldx) writes one LDX file instead
-    outfile: String,
+    outfile: Option<String>,
+    /// Source file; repeat to stack several captures of the same disc (the
+    /// first one is the primary). Needs -o; not combined with the positional
+    /// form.
+    #[arg(short = 'i', long = "input")]
+    inputs: Vec<String>,
+    /// Output base name, with -i
+    #[arg(short = 'o', long = "output")]
+    output: Option<String>,
+    /// Time-base correction: `read` reads the RF at the corrected positions
+    /// before demodulation (and takes the audio crosstalk out), `resample`
+    /// resamples the demodulated video (the reference decoder's way, its
+    /// bytes). Default: read (measured +0.5 to +0.8 dB on one capture); where
+    /// it cannot run on one source (stdin, a compressed format, no lines
+    /// found), resample. Several sources always use read.
+    #[arg(long, value_enum)]
+    tbc: Option<TbcMode>,
+    /// Also write the RF the decoder reads to this file (s16 at the input
+    /// rate): the stacked captures with `-i` repeated, the time-base
+    /// corrected capture with one. Needs `--tbc read` (the default with it).
+    #[arg(long, value_name = "FILE")]
+    rf_out: Option<String>,
+    /// How the stack weighs its inputs. `adaptive` (default): each input at
+    /// each sample by its carrier amplitude, so an input in a dropout gives
+    /// way to the others, with a guard against a misaligned input. `fixed`:
+    /// one weight per input for the whole run, from its noise floor measured
+    /// once at the start; captures from one player measure within a few
+    /// percent, so this is close to a plain average (the earlier stack).
+    #[arg(long, value_enum, default_value = "adaptive")]
+    stack_weight: StackWeight,
+    /// Leave the analog audio carriers' crosstalk in the video. By default
+    /// `--tbc read` takes it out: the part of the demodulated video that
+    /// follows them, measured on every chunk and turned back in the RF's
+    /// video band (+0.5 to +0.9 dB measured). It is the same on every copy of
+    /// a disc, so stacking alone does not remove it. The audio and EFM are
+    /// left as they are.
+    #[arg(long)]
+    keep_audio_crosstalk: bool,
+    /// Leave the clock lines in the RF. By default `--tbc read` finds the
+    /// narrow lines the player's and the capture's clocks leave in each
+    /// capture (the EFM decoder crystal's multiples of 88.2 kHz, the 4fsc
+    /// video clock, the capture board's clocks, what of them folds down at a
+    /// low sample rate) and subtracts them from its samples as they are read.
+    #[arg(long)]
+    keep_crystal_lines: bool,
+    /// Leave the chroma that leaks into the RF (NTSC). By default `--tbc
+    /// read` takes it out: the composite chroma leaks into the RF baseband
+    /// around 3.58 MHz and beats with the video carrier into fine wavering
+    /// stripes in saturated areas ("colour wobble"); it is fitted on the
+    /// decoded chroma on every chunk and subtracted before demodulation.
+    #[arg(long)]
+    keep_chroma_leak: bool,
+    /// Where the FM demodulation and the read-time TBC / stack run: `cpu`
+    /// (bit-exact to the reference), or `opencl` (a GPU through its driver's
+    /// OpenCL runtime; see --gpu-precision).
+    #[arg(long, value_enum, default_value = "cpu")]
+    device: Device,
+    /// Speed/exactness preset. `slow`: nothing traded for speed (the GPU
+    /// demodulator runs the reference's FFT plan and `atan2`, the stack's FIRs
+    /// and phase lock run in double precision in one fixed order, so the GPU
+    /// gives the CPU's output). `fast`: the GPU demodulator takes a Stockham
+    /// FFT (not byte-identical) and the stack's FIRs run in single precision
+    /// (measured without visible loss).
+    #[arg(long, value_enum, default_value = "slow")]
+    preset: Preset,
+    /// Precision of the GPU demodulation with `--preset fast`; default double.
+    /// `--preset slow` is always double.
+    #[arg(long, value_enum)]
+    gpu_precision: Option<GpuPrecision>,
     /// Write an LDX container (ld-decode-tools): <outfile>.ldx holding the
     /// TBC, its metadata, the analog audio and the EFM as tracks; with "-",
     /// an LDX stream on stdout that carries all of them
@@ -73,23 +145,6 @@ struct Args {
     /// Use lower-bandwidth (lowband) decode settings
     #[arg(long)]
     lowband: bool,
-    /// Run the FM demodulator on an OpenCL device (the driver's OpenCL
-    /// runtime, loaded at start-up), with the reference's arithmetic: ducc's
-    /// FFT plan and a port of the UCRT `atan2` run on the device, so the output
-    /// is byte-identical to the CPU kernel -- and therefore to Python 7.4.0.
-    #[arg(long)]
-    gpu: bool,
-    /// Run the *fast* GPU demodulator instead: a Stockham FFT and the device's
-    /// `atan2`. About 5% quicker than --gpu on a full disc (1390 -> 1320 s for
-    /// 168 566 fields) and not byte-identical (measured: 1 LSB on one pixel per
-    /// ~25 GB of `.tbc`, with `.pcm`/`.efm`/`.tbc.json` identical). See
-    /// --gpu-precision and `LD_GPU_CHECK`.
-    #[arg(long)]
-    gpu_fast: bool,
-    /// Precision of --gpu-fast: `double` (default) or `single` (faster on
-    /// consumer GPUs, further from the reference). --gpu is always double.
-    #[arg(long, value_enum)]
-    gpu_precision: Option<GpuPrecision>,
     /// Source is in NTSC-J format (IRE 0 black): `black16bIre` stays at the
     /// 0 IRE level instead of NTSC's 7.5 IRE setup.
     #[arg(long = "NTSCJ", short = 'j', visible_aliases = ["ntscj", "ntsc-j"])]
@@ -125,6 +180,36 @@ struct Args {
     /// get a quarter of this; `LD_PF_POOL` overrides the split.
     #[arg(long, short = 't', default_value_t = default_threads())]
     threads: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum TbcMode {
+    Read,
+    Resample,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum StackWeight {
+    Adaptive,
+    Fixed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Preset {
+    Slow,
+    Fast,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum GpuPrecision {
+    Single,
+    Double,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Device {
+    Cpu,
+    Opencl,
 }
 
 /// Default demod thread count: half the logical cores (8 on a 16-thread box,
@@ -188,12 +273,6 @@ impl std::io::Write for LogFileSink {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum GpuPrecision {
-    Single,
-    Double,
-}
-
 fn main() -> Result<()> {
     // With no positional arguments, show the same usage text as `--help`
     // instead of reporting missing required arguments.
@@ -205,21 +284,33 @@ fn main() -> Result<()> {
         Args::parse()
     };
 
+    let (inputs, out_arg) = resolve_io(&args)?;
+    let tbc = match (args.tbc, inputs.len()) {
+        (Some(TbcMode::Resample), n) if n > 1 => {
+            anyhow::bail!("several inputs are stacked with read-time TBC; --tbc resample takes a single input")
+        }
+        (Some(TbcMode::Resample), _) if args.rf_out.is_some() => {
+            anyhow::bail!("--rf-out writes the read-time corrected RF; it needs --tbc read")
+        }
+        (Some(m), _) => m,
+        (None, _) => TbcMode::Read,
+    };
+
     // Mirror the terminal output into `<outfile>.log` (like the reference
     // ld-decode). Opened before the tracing subscriber so every line of the
     // run lands in the file; a failure only disables file logging.
     // `-` means the picture goes to stdout: no `<outfile>.*` sidecars exist
     // then, and the console log has to go to stderr so it cannot interleave
     // with the binary picture bytes on stdout.
-    let to_stdout = args.outfile == "-";
+    let to_stdout = out_arg == "-";
     // LDX output: everything in one container (a `.ldx` file, or an LDX
     // stream on stdout) instead of the separate files.
-    let ldx_mode = args.ldx || args.outfile.to_ascii_lowercase().ends_with(".ldx");
+    let ldx_mode = args.ldx || out_arg.to_ascii_lowercase().ends_with(".ldx");
     // Base name of the outputs: `<outfile>` without its `.ldx`.
-    let outfile = if ldx_mode && !to_stdout && args.outfile.to_ascii_lowercase().ends_with(".ldx") {
-        args.outfile[..args.outfile.len() - 4].to_string()
+    let outfile = if ldx_mode && !to_stdout && out_arg.to_ascii_lowercase().ends_with(".ldx") {
+        out_arg[..out_arg.len() - 4].to_string()
     } else {
-        args.outfile.clone()
+        out_arg
     };
     if !to_stdout {
         if let Err(e) = ld_decode::logging::install(std::path::Path::new(&format!("{outfile}.log"))) {
@@ -256,9 +347,9 @@ fn main() -> Result<()> {
     // the input sample rate.
     let format = match args.format {
         Some(f) => f,
-        None => reader::infer_format(&args.infile)?,
+        None => reader::infer_format(&inputs[0])?,
     };
-    let input = reader::open_input(&args.infile, format)?;
+    let input = reader::open_input(&inputs[0], format)?;
     let inputfreq = match (args.inputfreq, input.container_rate_hz) {
         (Some(f), _) => f,
         (None, Some(hz)) => {
@@ -318,7 +409,21 @@ fn main() -> Result<()> {
         spec.output_lines()
     );
 
-    let mut reader = DecodeReader::new(input.source);
+    let source: Box<dyn reader::SampleSource> = match tbc {
+        TbcMode::Resample => input.source,
+        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak, args.rf_out.as_deref()) {
+            Ok(v) => Box::new(v),
+            // Read was the default, not asked for: a source it cannot read
+            // (stdin, a compressed format) or finds no lines in still
+            // decodes, the reference's way.
+            Err(e) if args.tbc.is_none() && inputs.len() == 1 => {
+                tracing::warn!("--tbc read: {e:#}; decoding with --tbc resample");
+                input.source
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    let mut reader = DecodeReader::new(source);
 
     // In LDX mode the container replaces every sidecar file.
     let separate = !ldx_mode;
@@ -328,13 +433,13 @@ fn main() -> Result<()> {
         } else {
             ldx::LdxWriter::create(std::path::Path::new(&format!("{outfile}.ldx")))?
         };
-        let name = if args.infile == "-" {
+        let name = if inputs[0] == "-" {
             "stdin".to_string()
         } else {
-            std::path::Path::new(&args.infile)
+            std::path::Path::new(&inputs[0])
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| args.infile.clone())
+                .unwrap_or_else(|| inputs[0].clone())
         };
         Some(ldx::LdxOutput::new(
             writer,
@@ -343,7 +448,7 @@ fn main() -> Result<()> {
                 pcm: !args.disable_analog_audio,
                 efm: !args.no_efm,
                 codec: args.ldx_codec.for_tbc()?,
-                history: ldx::history(&format!("decoded {} at {} MHz", args.infile, inputfreq)),
+                history: ldx::history(&format!("decoded {} at {} MHz", inputs.join(" + "), inputfreq)),
             },
         ))
     } else {
@@ -417,17 +522,16 @@ fn main() -> Result<()> {
     )?);
 
     let mut decoder = Decoder::new(Arc::clone(&spec), 0);
-    if args.gpu && args.gpu_fast {
-        anyhow::bail!("--gpu and --gpu-fast are different demodulators; pick one");
-    }
-    if args.gpu && args.gpu_precision.is_some() {
-        anyhow::bail!("--gpu-precision applies to --gpu-fast only (--gpu is always double)");
-    }
-    if args.gpu || args.gpu_fast {
-        let f64 = args.gpu_precision != Some(GpuPrecision::Single);
-        match decoder.enable_gpu(args.gpu, f64) {
+    if args.device == Device::Opencl {
+        // `slow` trades nothing: the reference's FFT plan and atan2 on the
+        // device, byte-identical to the CPU. `fast` takes the Stockham FFT.
+        let exact = args.preset == Preset::Slow;
+        if exact && args.gpu_precision == Some(GpuPrecision::Single) {
+            anyhow::bail!("--gpu-precision single needs --preset fast (--preset slow is always double)");
+        }
+        match decoder.enable_gpu(exact, args.gpu_precision != Some(GpuPrecision::Single)) {
             Ok(what) => tracing::info!("GPU demodulator: {what}"),
-            Err(e) => anyhow::bail!("--gpu: {e}"),
+            Err(e) => anyhow::bail!("--device opencl: {e}"),
         }
     }
     // Reference `main.py`: `ldd.blackIRE = 7.5` for NTSC unless `--NTSCJ`; the
@@ -505,6 +609,90 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The sources and output base name, from either `infile outfile` or
+/// `-i ... -o ...` (never both).
+fn resolve_io(args: &Args) -> Result<(Vec<String>, String)> {
+    if !args.inputs.is_empty() {
+        if args.infile.is_some() || args.outfile.is_some() {
+            anyhow::bail!("give the sources either positionally (infile outfile) or with -i/-o, not both");
+        }
+        let Some(o) = &args.output else {
+            anyhow::bail!("-i needs -o <output base name>");
+        };
+        return Ok((args.inputs.clone(), o.clone()));
+    }
+    if args.output.is_some() {
+        anyhow::bail!("-o goes with -i; the positional form is `ld-decode infile outfile`");
+    }
+    match (&args.infile, &args.outfile) {
+        (Some(i), Some(o)) => Ok((vec![i.clone()], o.clone())),
+        _ => anyhow::bail!("missing output: `ld-decode infile outfile`, or `-i infile -o outfile`"),
+    }
+}
+
+/// `--tbc read`: locate every input's lines (pass 0, straight from the RF,
+/// running alongside) and serve the read-time corrected, combined RF stream.
+fn read_tbc_source(
+    inputs: &[String],
+    format: Option<reader::SampleFormat>,
+    inputfreq: f64,
+    pal: bool,
+    device: Device,
+    preset: Preset,
+    stack_weight: StackWeight,
+    xtalk: bool,
+    xtal: bool,
+    leak: bool,
+    rf_out: Option<&str>,
+) -> Result<stack::VirtualSource> {
+    let fmts = inputs
+        .iter()
+        .map(|p| format.map_or_else(|| reader::infer_format(p), Ok))
+        .collect::<Result<Vec<_>>>()?;
+    let stacked = inputs.iter().zip(&fmts).map(|(p, &f)| stack::StackInput::new(p, f)).collect::<Result<Vec<_>>>()?;
+    let fs = inputfreq * 1e6;
+    // Any sample rate works, but one for every input: the stack reads them
+    // all on one time base.
+    if inputs.len() > 1 {
+        for p in inputs {
+            if let Some(hz) = capture_rate_hz(p) {
+                if hz != fs {
+                    anyhow::bail!(
+                        "{p} was captured at {} MHz (its .yaml) but the stack decodes at {inputfreq} MHz; stacked captures must share one sample rate",
+                        hz / 1e6
+                    );
+                }
+            }
+        }
+    }
+    // Line: NTSC 286 lines per 4.5 MHz, PAL 64 us.
+    let linelen = if pal { fs * 64e-6 } else { fs * 286.0 / 4.5e6 };
+    let live = stack::Live::new(inputs.to_vec(), stacked[0].len(), linelen);
+    // Pass 0, one per input running alongside the stacked decode: it locates
+    // the lines and reads the VBI codes from the RF, and the timeline is laid
+    // down as it goes, so it stops where the stacked decode stops.
+    for (i, (path, &fmt)) in inputs.iter().zip(&fmts).enumerate() {
+        let (live, path) = (Arc::clone(&live), path.clone());
+        let src = stack::StackInput::new(&path, fmt)?;
+        std::thread::Builder::new().name(format!("pass0-{i}")).spawn(move || {
+            tracing::info!("read-time TBC pass 0: locating the lines of {path}");
+            // A panic would leave the stacked decode waiting on this input.
+            let sys = if pal { rfsync::System::pal() } else { rfsync::System::ntsc() };
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rfsync::locate(&src, fs, &sys, &live, i)));
+            live.finish(i, run.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))));
+        })?;
+    }
+    let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
+    stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, xtal, leak, rf_out)
+}
+
+/// The sample rate a Domesday Duplicator capture records in the `.yaml`
+/// beside it (`x.ddd.s16` -> `x.ddd.yaml`), if there is one.
+fn capture_rate_hz(path: &str) -> Option<f64> {
+    let text = std::fs::read_to_string(std::path::Path::new(path).with_extension("yaml")).ok()?;
+    text.lines().find_map(|l| l.trim().strip_prefix("\"sample_rate_hz\":")?.trim().parse().ok())
 }
 
 /// Samples of rewind retained below the decoder's earliest need. MTF

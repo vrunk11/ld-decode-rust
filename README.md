@@ -34,7 +34,7 @@ is built under.
   slower:** the full GGV1011 PAL side 1 takes 753 s (32.0 FPS at the default
   thread count), because a PAL field carries ~20% more pixels and its
   pilot-based lineloc refinement and burst-phase field numbering add transforms
-  per field. With `--gpu` the whole demodulator runs on an OpenCL device
+  per field. With `--device opencl` the whole demodulator runs on an OpenCL device
   instead: ~62 FPS on a 400-frame window that does 46 on the CPU, and ~48 FPS
   single-threaded against 10 — see [GPU speeds](#gpu-speeds). FPS is only
   meaningful with the machine otherwise idle and the output disk not full.
@@ -79,9 +79,13 @@ the physical core count loses, and the optimum moves with the input. On an
 
 ```
 ld-decode [OPTIONS] <INFILE> <OUTFILE>
+ld-decode [OPTIONS] -i <INFILE> [-i <INFILE>...] -o <OUTFILE>
 ```
 
-Running with no arguments prints the same usage text as `--help`.
+Running with no arguments prints the same usage text as `--help`. Repeating
+`-i` stacks several captures of the same disc (see
+[Read-time TBC and stacking](#read-time-tbc-and-stacking)); the first is the
+primary.
 
 `INFILE` is a file, or `-` for stdin (stdin needs `--format`; `-s`/`-S` can only
 move forward there). `OUTFILE` is the base name for the outputs (`out` produces
@@ -107,11 +111,18 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--deemp <high,low>` | reference constants | De-emphasis time constants in microseconds. |
 | `--no-agc` | off | Disable automatic gain control. |
 | `--no-dod` | off | Disable dropout detection. |
-| `--ntsc-color-notch` | off | Notch filter on the decoded video, reduces colour wobble. |
+| `--ntsc-color-notch` | off | Notch filter on the decoded video, reduces colour wobble. With `--tbc read` the chroma leak behind it is already cancelled (see `--keep-chroma-leak`). |
 | `--lowband` | off | Lower-bandwidth (lowband) decode settings. |
-| `--gpu` | off | Run the whole FM demodulator on an OpenCL device, bit-identical to the CPU kernel. See [GPU demodulation](#gpu-demodulation). |
-| `--gpu-fast` | off | The quicker, differently-rounded GPU demodulator; not bit-exact. See below. |
-| `--gpu-precision <p>` | `double` | `single` runs the `--gpu-fast` demodulator in f32: faster on consumer cards with little f64 throughput, further from the reference. `--gpu` is always double. |
+| `-i`, `--input <file>` / `-o`, `--output <base>` | — | The sources and the output base name, instead of the positional form; repeat `-i` to stack captures. |
+| `--tbc <read\|resample>` | `read` | Time-base correction. `read` reads the RF at the corrected positions before demodulation (and cancels the audio crosstalk, the clock lines and the chroma leak); `resample` resamples the demodulated video, the reference decoder's way and **its bytes**. Where `read` cannot run on a single source (stdin, `.flac`/`.ldf`, no lines found) the decode falls back to `resample` with a warning. Several sources always use `read`. |
+| `--keep-audio-crosstalk` | off | Leave the analog audio carriers' crosstalk in the video (`read` cancels it by default). |
+| `--keep-crystal-lines` | off | Leave the clock lines in the RF (`read` subtracts them by default): the player's EFM decoder crystal, its 4fsc video clock, the capture board's clocks. |
+| `--keep-chroma-leak` | off | Leave the chroma that leaks into the RF (NTSC; `read` cancels it by default). |
+| `--stack-weight <w>` | `adaptive` | How a stack weighs its inputs: `adaptive` (per sample, by carrier amplitude, with an alignment guard) or `fixed` (one weight per input, the earlier stack). |
+| `--rf-out <file>` | off | Also write the RF the decoder reads (the stacked or time-base corrected stream, s16 at the input rate). |
+| `--device <cpu\|opencl>` | `cpu` | Where the FM demodulator and the read-time TBC / stack run. `opencl` runs them on a GPU through the driver's OpenCL runtime. See [GPU demodulation](#gpu-demodulation). |
+| `--preset <slow\|fast>` | `slow` | `slow` trades nothing for speed: the GPU demodulator uses the reference's arithmetic and the stack runs in double precision in one fixed order, so the GPU gives the CPU's bytes. `fast`: the Stockham GPU demodulator (not byte-exact) and the stack's filters in single precision. |
+| `--gpu-precision <p>` | `double` | `single` runs the `--preset fast` GPU demodulator in f32: faster on consumer cards with little f64 throughput, further from the reference. `--preset slow` is always double. |
 | `--no-efm` | off | Skip the EFM (digital audio) output. |
 | `--disable-analog-audio` | off | Skip analog audio decoding. |
 | `--ldx` | off (on for an `OUTFILE` ending in `.ldx`) | Write one [LDX container](#ldx-output) instead of the separate files; with `-`, an LDX stream on stdout. |
@@ -123,7 +134,7 @@ need `-t`).
 
 ### GPU demodulation
 
-`--gpu` runs the whole FM demodulator on an OpenCL device (the driver's OpenCL
+`--device opencl` runs the whole FM demodulator on an OpenCL device (the driver's OpenCL
 runtime, loaded at start-up; nothing to install or link), with the reference's
 arithmetic: every transform runs ducc's own 1-D plan (`decode/ducc_plan.rs`,
 encoded as OpenCL), and the discriminator runs a device port of the UCRT `atan2`.
@@ -135,7 +146,7 @@ by the CPU kernel, so a declined operand cannot change a byte.
 not bit-identical, as `n/ulp` per channel. A device failure falls back to the CPU
 for that batch.
 
-`--gpu-fast` is the quicker, differently-rounded path: a radix-8 Stockham FFT
+`--device opencl --preset fast` is the quicker, differently-rounded path: a radix-8 Stockham FFT
 instead of ducc's pass tree, and the device's `atan2` instead of the UCRT port,
 so the f64 values differ in their last bits. On a 50,722-field NTSC disc
 (24.3 GB `.tbc`) that comes to **1 byte** — one pixel, 1 LSB, at field 4326 —
@@ -145,6 +156,10 @@ kernels disagree on ~1 sample per 10⁸–10⁹ by exactly 1 ulp of f32 (20 `dem
 16-tap downscale absorbs all but ~1 in 80 of those.
 
 ### GPU speeds
+
+Measured upstream with its `--gpu` / `--gpu-fast` flags, which this branch
+spells `--device opencl` / `--device opencl --preset fast`, and with the
+reference's time-base correction (`--tbc resample`).
 
 Measured on a Ryzen 7 5800X3D with an AMD Radeon RX 9070 XT, 400-frame
 NTSC `.ldf` window (`-s 1000 -l 400`, 800 fields), two interleaved runs each:
@@ -165,6 +180,59 @@ quicker on the device, and `--gpu -t 1` still beats a ten-thread CPU run.
 `--gpu-fast` is only ~3–5% above the bit-exact mode. Both GPU modes need an
 OpenCL device with `fp64`; `--gpu-precision single` applies to `--gpu-fast`
 only and helps consumer cards with little f64 throughput.
+
+### Read-time TBC and stacking
+
+The default `--tbc read` locates every line of a capture straight from its RF
+(pass 0, running alongside the decode) and reads the RF at the corrected
+positions before demodulating, instead of resampling the demodulated video.
+On the way it takes the analog audio carriers' crosstalk out of the video:
+the part of the demodulated video that follows them is fitted on every chunk
+and turned back in the RF's video band; the audio carriers and the EFM are
+left as they are. Measured on NTSC 75 MHz captures (60 frames, wSNR / bPSNR
+from the VITS): one capture +0.48 to +0.83 dB / +0.57 to +0.68 dB over
+`--tbc resample`. On PAL `ld-1100` captures at 40 MHz it is neutral (within
+±0.03 dB): the PAL audio carriers sit far below the video.
+
+Before anything else the clocks' lines are subtracted from each capture's
+samples: narrow lines that stand at one frequency all through it, found on
+four stretches spread over the capture. The player's EFM decoder crystal
+(16.9344 MHz) leaves the multiples of its 192nd, 88.2 kHz, with its drift
+followed as it goes; its 4fsc video clock, the capture board's clocks and,
+at a low sample rate, whatever of them folds into the video band leave
+others. Each line's amplitude and phase is measured on every 2^16 samples.
+Left out: the bands where the disc's own signal makes steady lines (the
+audio carriers, the chroma leak's band, the video carrier's swing) and any
+comb spaced by the line frequency (a still picture's). Measured (wSNR):
++0.09 dB on one NTSC capture at 75 MHz, +0.14 dB at 40 MHz where more
+lines fold into the band, neutral in a stack (the inputs' lines, at
+unrelated phases, already average down) and on PAL.
+
+On NTSC the composite chroma leaks into the RF baseband around 3.58 MHz and
+beats with the video carrier into fine wavering vertical stripes in
+saturated areas ("colour wobble"; the player's own CVBS output shows them,
+so it is in the disc's or the player's signal). On every chunk the decoded
+chroma (the video band's instantaneous frequency through 3.0-4.2 MHz) is
+fitted to the RF's same band with a 13-tap filter and the predicted leak
+subtracted before demodulation, where the chroma explains at least 5% of
+that band (a disc without the leak is left byte for byte as it was). The
+stripes' 4.73-4.95 MHz bump over its neighbours goes from +5.8 dB to -0.2
+on one capture, +7.1 to -0.2 on three copies; the VITS measures do not
+move.
+
+Per 2^21-sample chunk (28 ms of signal at 75 MHz, 3 inputs) the two
+cancellations take about 10.5 ms (audio crosstalk) and 8.5 ms (chroma
+leak) on the CPU pool.
+
+Repeating `-i` stacks captures of the same disc (several passes, or several
+copies): the fields are paired by their VBI frame codes, every input is read
+at its own positions, phase-locked onto the primary's carrier and weighed per
+sample by its carrier amplitude, so a pass in a dropout gives way to the
+others. The inputs may be at any sample rate, but all at the same one (a
+Domesday Duplicator `.yaml` that says otherwise is refused). Measured on
+three copies of one disc, one capture each: 39.56 dB wSNR against 38.86 for
+three passes of one copy, 40.32 with the crosstalk cancellation. With
+`--device opencl --preset slow` the stack gives the CPU's bytes.
 
 ## Input formats
 
@@ -228,6 +296,11 @@ the top bit of the unsigned TBC samples flipped before coding, and the stand-in
 
 ## Verifying parity
 
+**Run the comparison with `--tbc resample`.** The default `--tbc read` (and the
+cancellations it carries) is a better decode than the
+reference's and therefore not its bytes; `--tbc resample` is the reference's
+time-base correction, byte-identical as below.
+
 The end-to-end gate is a **full-disc** decode: a hash comparison of all four
 decodable artifacts (`.tbc`/`.pcm`/`.efm`/`.tbc.json`) against the Python
 reference outputs for the same input. Only a full run crosses the long-run state
@@ -254,7 +327,7 @@ is in its reference configuration.
 | --- | --- |
 | `LD_FFT_ENGINE=sse2\|avx2fma\|avx2` | Pick one of the three ducc0 builds linked into the binary. **`sse2` is the default and the only parity-safe choice**: the AVX2 engines evaluate a different, differently-rounded sequence and are not bit-exact, so they are for experiments only. The engine in use is logged at startup. |
 | `LD_NO_FFMPEG=1` | Decode `.flac` and Ogg `.ldf` with claxon instead of `ffmpeg`. Bit-identical but slower (the demod pool starves on claxon's throughput), so `ffmpeg` stays the default. |
-| `LD_PF_POOL=n`, `LD_SIDE_POOL=n`, `LD_TAIL_THREADS=n` | Override the three pool sizes: prefetch demod, side work (dropout/audio), and the global pool that runs the serial tail. All three optima are measured and closed — `LD_TAIL_THREADS` exists as the instrument for re-sweeping the split (e.g. after a change like `--gpu` that moves work off the pool), not as a tuning knob: the tail floors at ~7.7 ms with 8 threads while the default 2 already yields the best FPS. |
+| `LD_PF_POOL=n`, `LD_SIDE_POOL=n`, `LD_TAIL_THREADS=n` | Override the three pool sizes: prefetch demod, side work (dropout/audio), and the global pool that runs the serial tail. All three optima are measured and closed — `LD_TAIL_THREADS` exists as the instrument for re-sweeping the split (e.g. after a change like `--device opencl` that moves work off the pool), not as a tuning knob: the tail floors at ~7.7 ms with 8 threads while the default 2 already yields the best FPS. |
 | `LD_START_SAMPLE=n` | Start at an absolute sample instead of a frame. |
 | `LD_NO_ASYNC_PREFETCH=1`, `LD_NO_DOD_PRE=1` | Disable the async demod prefetch and the dropout pre-pass. |
 | `LD_PLLSPEC=1` | Print the EFM-PLL speculation commit/fallback counters. |
