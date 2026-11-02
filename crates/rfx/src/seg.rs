@@ -16,7 +16,7 @@ fn run(n: usize, pre: &Preset, use_ref: bool, refwin: &[f32], mut step: impl FnM
     let mut pred = Pred::new(*pre, use_ref);
     let mut ys: Vec<i32> = Vec::with_capacity(n);
     for i in 0..n {
-        let p = pred.predict(&ys, i, refwin);
+        let p = pred.predict(refwin, i);
         let y = step(i, p);
         ys.push(y);
         pred.update(i, y);

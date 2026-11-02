@@ -66,6 +66,16 @@ enum Cmd {
         #[arg(long, default_value_t = 262144)]
         segment: usize,
     },
+    /// Development: single-thread speed of each stage.
+    Bench {
+        input: PathBuf,
+        #[arg(short, long, default_value_t = 3)]
+        level: u32,
+        #[arg(long, default_value_t = 16)]
+        segments: usize,
+        #[arg(long, default_value_t = 262144)]
+        segment: usize,
+    },
     /// List the sources of a .rfx file.
     Info { input: PathBuf },
 }
@@ -80,6 +90,10 @@ fn main() -> Result<()> {
         }
         Cmd::Unpack { input, outdir, only, device } => unpack(&input, &outdir, only, parse_device(&device)?)?,
         Cmd::Info { input } => info(&input)?,
+        Cmd::Bench { input, level, segments, segment } => {
+            rfx::pack::bench(&input, level, segments, segment)?;
+            rfx::pack::bench_pred(&input, level, segments, segment)?
+        }
         Cmd::GpuCheck { input, level, segments, segment } => rfx::pack::gpu_check(&input, level, segments, segment)?,
     }
     Ok(())

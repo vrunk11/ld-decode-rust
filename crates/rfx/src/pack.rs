@@ -600,3 +600,70 @@ pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize) -> Result
     }
     Ok(())
 }
+
+/// Development: single-thread cost of each stage on the first `nseg` segments.
+pub fn bench(path: &Path, level: u32, nseg: usize, segment: usize) -> Result<()> {
+    let pre = Preset::level(level).context("level 1 to 4")?;
+    let st = file_stats(path)?;
+    let f = File::open(path)?;
+    let words = st.size / 2;
+    let time = |what: &str, n: usize, t0: std::time::Instant| {
+        println!("{what:<28} {:>7.1} Msmp/s", n as f64 / t0.elapsed().as_secs_f64() / 1e6);
+    };
+    for use_ref in [false, true] {
+        let (mut tp, mut te, mut td, mut tr) = (0f64, 0f64, 0f64, 0f64);
+        let mut total = 0usize;
+        for g in 0..nseg {
+            let n = segment.min((words as usize).saturating_sub(g * segment));
+            let y: Vec<i32> = read_words(&f, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect();
+            let win: Vec<f32> = (0..refwin_len(n, &pre)).map(|i| y[(i + 5).min(n - 1)] as f32).collect();
+            let t = std::time::Instant::now();
+            let preds = seg::predict_all(&y, &pre, use_ref, &win);
+            tp += t.elapsed().as_secs_f64();
+            let res: Vec<i32> = y.iter().zip(&preds).map(|(a, b)| a - b).collect();
+            let t = std::time::Instant::now();
+            let bytes = seg::encode_residuals(&res);
+            te += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let back = seg::decode_residuals(&bytes, n).context("decode")?;
+            td += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let ys = seg::reconstruct(&back, &pre, use_ref, &win);
+            tr += t.elapsed().as_secs_f64();
+            assert_eq!(ys, y);
+            total += n;
+        }
+        println!("-- {} reference", if use_ref { "with" } else { "without" });
+        for (what, t) in [("predict (coding)", tp), ("entropy encode", te), ("entropy decode", td), ("reconstruct (decoding)", tr)] {
+            println!("{what:<28} {:>7.1} Msmp/s", total as f64 / t / 1e6);
+        }
+        let _ = time;
+    }
+    Ok(())
+}
+
+/// Development: where the predictor's time goes (single thread, with reference).
+pub fn bench_pred(path: &Path, level: u32, nseg: usize, segment: usize) -> Result<()> {
+    let pre = Preset::level(level).context("level 1 to 4")?;
+    let st = file_stats(path)?;
+    let f = File::open(path)?;
+    let words = st.size / 2;
+    let n = segment;
+    let ys: Vec<Vec<i32>> = (0..nseg)
+        .map(|g| Ok(read_words(&f, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect()))
+        .collect::<Result<_>>()?;
+    let win: Vec<f32> = (0..refwin_len(n, &pre)).map(|i| ys[0][(i + 5).min(n - 1)] as f32).collect();
+    for (name, p) in [
+        ("full", pre),
+        ("no solve", Preset { every: 1 << 30, ..pre }),
+        ("no solve, no update", Preset { every: 1 << 30, stride: 1 << 30, ..pre }),
+    ] {
+        let t = std::time::Instant::now();
+        for y in &ys {
+            std::hint::black_box(seg::predict_all(y, &p, true, &win));
+        }
+        let dt = t.elapsed().as_secs_f64();
+        println!("{name:<22} {:>7.1} Msmp/s  ({:.0} ns/sample)", (nseg * n) as f64 / dt / 1e6, dt * 1e9 / (nseg * n) as f64);
+    }
+    Ok(())
+}

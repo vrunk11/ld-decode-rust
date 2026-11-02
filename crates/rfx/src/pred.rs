@@ -46,6 +46,7 @@ impl Preset {
         Some(Self { own, taps, stride, every, lam_bits: lam.to_bits() })
     }
 
+    /// `stride` and `every` are powers of two (tested with a mask).
     pub fn dim(&self, use_ref: bool) -> usize {
         self.own + if use_ref { 2 * self.taps + 1 } else { 0 }
     }
@@ -61,13 +62,18 @@ pub struct Pred {
     use_ref: bool,
     d: usize,
     dp: usize,
+    /// Row length of the matrices (`d`).
+    ds: usize,
     lam: f32,
     a: Vec<f32>,
     b: Vec<f32>,
+    /// Weights and regressors: the part past `d` stays 0, which makes the
+    /// padded leaves of the dot product 0 without a test.
     w: Vec<f32>,
     r: Vec<f32>,
-    t: Vec<f32>,
-    m: Vec<f32>,
+    lc: Vec<f32>,
+    mr: Vec<f32>,
+
     s: Vec<f32>,
 }
 
@@ -76,118 +82,160 @@ impl Pred {
         let d = pre.dim(use_ref);
         let dp = pre.leaves(use_ref);
         assert!(d <= 64, "at most 64 regressors");
+        let ds = d;
         Self {
             pre,
             use_ref,
             d,
             dp,
+            ds,
             lam: f32::from_bits(pre.lam_bits),
-            a: vec![0.0; d * d],
+            a: vec![0.0; ds * ds],
             b: vec![0.0; d],
-            w: vec![0.0; d],
-            r: vec![0.0; d],
-            t: vec![0.0; dp],
-            m: vec![0.0; d * d],
-            s: vec![0.0; d],
+            w: vec![0.0; dp.max(ds)],
+            r: vec![0.0; dp.max(ds)],
+            lc: vec![0.0; ds * ds],
+            mr: vec![0.0; ds * ds],
+
+            s: vec![0.0; ds],
         }
     }
 
-    /// Prediction of `ys[i]` from `ys[..i]` and `refwin[i..i + 2*taps + 1]`.
-    pub fn predict(&mut self, ys: &[i32], i: usize, refwin: &[f32]) -> i32 {
+    /// Prediction of sample `i` from the samples learnt so far (`update`) and
+    /// `refwin[i..i + 2*taps + 1]`.
+    pub fn predict(&mut self, refwin: &[f32], i: usize) -> i32 {
         let own = self.pre.own;
-        for p in 0..own {
-            self.r[p] = if i > p { ys[i - 1 - p] as f32 } else { 0.0 };
-        }
         if self.use_ref {
             let n = 2 * self.pre.taps + 1;
             self.r[own..own + n].copy_from_slice(&refwin[i..i + n]);
         }
-        for q in 0..self.dp {
-            self.t[q] = if q < self.d { self.r[q] * self.w[q] } else { 0.0 };
-        }
-        let mut stride = self.dp / 2;
-        while stride >= 1 {
-            for q in 0..stride {
-                let v = self.t[q + stride];
-                self.t[q] += v;
-            }
-            stride /= 2;
-        }
-        let p = (self.t[0] + 0.5).floor();
+        let dot = match self.dp {
+            2 => tree::<1>(&self.r, &self.w),
+            4 => tree::<2>(&self.r, &self.w),
+            8 => tree::<4>(&self.r, &self.w),
+            16 => tree::<8>(&self.r, &self.w),
+            32 => tree::<16>(&self.r, &self.w),
+            _ => tree::<32>(&self.r, &self.w),
+        };
+        let p = (dot + 0.5).floor();
         p.clamp(-4_194_304.0, 4_194_304.0) as i32
     }
 
     /// Learn sample `i` (value `y`) against the regressors of the last `predict`.
     pub fn update(&mut self, i: usize, y: i32) {
-        let d = self.d;
+        let (d, ds) = (self.d, self.ds);
         let yf = y as f32;
-        if i % self.pre.stride == 0 {
+        if i & (self.pre.stride - 1) == 0 {
             let lam = self.lam;
             for p in 0..d {
                 let rp = self.r[p];
                 let t = rp * yf;
-                self.b[p] = lam * self.b[p] + t;
-                let row = &mut self.a[p * d..p * d + p + 1];
-                for (v, &rq) in row.iter_mut().zip(&self.r[..=p]) {
-                    let t = rp * rq;
-                    *v = lam * *v + t;
-                }
+                let lb = lam * self.b[p];
+                self.b[p] = lb + t;
+let row = &mut self.a[p * ds..p * ds + p + 1];                for (v, &rq) in row.iter_mut().zip(&self.r[..=p]) {                    let t = rp * rq;                    let la = lam * *v;                    *v = la + t;                }
             }
         }
-        if i % self.pre.every == self.pre.every - 1 && i > 4 * d {
-            self.m.copy_from_slice(&self.a);
-            self.s.copy_from_slice(&self.b);
-            if solve(&mut self.m, &mut self.s, d) {
-                self.w.copy_from_slice(&self.s);
+        if i & (self.pre.every - 1) == self.pre.every - 1 && i > 4 * d {
+            self.s[..d].copy_from_slice(&self.b);
+            if solve(&self.a, &mut self.lc, &mut self.mr, &mut self.s, d) {
+                self.w[..d].copy_from_slice(&self.s[..d]);
             }
         }
+        // The newest sample becomes the first of the own history.
+        let own = self.pre.own;
+        self.r.copy_within(0..own - 1, 1);
+        self.r[0] = yf;
     }
 }
 
-/// Solve `m x = s` for symmetric positive definite `m` (d x d, row major, the
-/// lower triangle is read); `s` receives `x`. False if `m` is not positive
-/// definite.
-fn solve(m: &mut [f32], s: &mut [f32], d: usize) -> bool {
+/// Solve `(a + ridge I) x = s` for the symmetric positive definite `a`
+/// (d x d, row major, the lower triangle is read); `s` receives `x`. False if
+/// the matrix is not positive definite.
+///
+/// The factor is kept by column in `lc` (`lc[k * d + i]` is row `i` of column
+/// `k`) so that the work below a pivot runs along contiguous memory, and by
+/// row in `mr` for the backward substitution. Each element still sees the
+/// same operations in the same order as the textbook row loops, so the bits
+/// are the reference's.
+fn solve(a: &[f32], lc: &mut [f32], mr: &mut [f32], s: &mut [f32], d: usize) -> bool {
     let mut tr = 0f32;
     for i in 0..d {
-        tr += m[i * d + i];
+        tr += a[i * d + i];
     }
     let ridge = tr / d as f32 * 1e-6f32 + 1e-6f32;
-    for i in 0..d {
-        m[i * d + i] += ridge;
+    for p in 0..d {
+        for q in 0..=p {
+            lc[q * d + p] = a[p * d + q];
+        }
+        lc[p * d + p] += ridge;
     }
     for j in 0..d {
-        let mut v = m[j * d + j];
+        let (head, tail) = lc.split_at_mut(j * d);
+        let mut v = tail[j];
         for k in 0..j {
-            let p = m[j * d + k] * m[j * d + k];
+            let p = head[k * d + j] * head[k * d + j];
             v -= p;
         }
         if v <= 0.0 {
             return false;
         }
-        m[j * d + j] = v.sqrt();
-        for i in j + 1..d {
-            let mut v = m[i * d + j];
-            for k in 0..j {
-                let p = m[i * d + k] * m[j * d + k];
-                v -= p;
+        let dj = v.sqrt();
+        tail[j] = dj;
+        let col = &mut tail[j + 1..d];
+        for k in 0..j {
+            let ljk = head[k * d + j];
+            for (x, &c) in col.iter_mut().zip(&head[k * d + j + 1..k * d + d]) {
+                let p = c * ljk;
+                *x -= p;
             }
-            m[i * d + j] = v / m[j * d + j];
+        }
+        for x in col.iter_mut() {
+            *x /= dj;
+        }
+        mr[j * d + j] = dj;
+        for (i, &x) in col.iter().enumerate() {
+            mr[(j + 1 + i) * d + j] = x;
         }
     }
     for i in 0..d {
-        s[i] /= m[i * d + i];
-        for r in i + 1..d {
-            let p = m[r * d + i] * s[i];
-            s[r] -= p;
+        s[i] /= lc[i * d + i];
+        let si = s[i];
+        for (x, &c) in s[i + 1..d].iter_mut().zip(&lc[i * d + i + 1..i * d + d]) {
+            let p = c * si;
+            *x -= p;
         }
     }
     for i in (0..d).rev() {
-        s[i] /= m[i * d + i];
-        for r in 0..i {
-            let p = m[i * d + r] * s[i];
-            s[r] -= p;
+        s[i] /= mr[i * d + i];
+        let si = s[i];
+        for (x, &c) in s[..i].iter_mut().zip(&mr[i * d..i * d + i]) {
+            let p = c * si;
+            *x -= p;
         }
     }
     true
+}
+
+/// Dot product of `r` and `w` (2 * H leaves) as the specified binary tree:
+/// leaf `q` plus leaf `q + H`, then the halves of the result, down to one.
+/// The sizes are constants so the partial sums stay in registers.
+#[inline(always)]
+fn tree<const H: usize>(r: &[f32], w: &[f32]) -> f32 {
+    let (r0, r1) = r[..2 * H].split_at(H);
+    let (w0, w1) = w[..2 * H].split_at(H);
+    let mut t = [0f32; H];
+    for q in 0..H {
+        let x = r0[q] * w0[q];
+        let y = r1[q] * w1[q];
+        t[q] = x + y;
+    }
+    let mut n = H / 2;
+    while n >= 1 {
+        for q in 0..n {
+            let v = t[q + n];
+            t[q] += v;
+        }
+        n /= 2;
+    }
+    t[0]
 }
