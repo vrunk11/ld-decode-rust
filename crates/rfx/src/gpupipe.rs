@@ -1,14 +1,19 @@
-//! The GPU path of `pack` and `unpack` as a pipeline of three stages that run
-//! at once on successive chunks of segments, so the device is not left idle
-//! while the CPU reads, windows and entropy-codes:
+//! The GPU path of `pack` and `unpack` as a pipeline whose stages run at once
+//! on successive chunks of segments, so neither the device nor the CPU waits
+//! on the other:
 //!
-//! - packing: read samples and reference windows (CPU, parallel) -> predict
-//!   (GPU) -> residuals, range coding, self-check and writing (CPU);
+//! - packing: read samples and reference windows (CPU, parallel) -> upload ->
+//!   predict -> download -> residuals, range coding, self-check and writing
+//!   (CPU);
 //! - unpacking: read blocks, parse residuals and build windows (CPU) ->
-//!   reconstruct (GPU) -> write the words (CPU).
+//!   upload -> reconstruct -> download -> write the words (CPU).
+//!
+//! Upload, kernel and download each have a command queue and a thread, so a
+//! chunk can be going up while another runs and a third comes back; the
+//! device buffers of a chunk travel with it and return to a small pool.
 use crate::ebml;
-use crate::gpu::GpuSeg;
-use crate::io::{read_exact_at, read_words, write_all_at};
+use crate::gpu::{self, Dev, GpuSeg};
+use crate::io::{read_exact_at, write_all_at};
 use crate::pack::{Refs, SrcMeta};
 use crate::pred::Preset;
 use crate::seg;
@@ -17,10 +22,52 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
+use std::time::Instant;
 
-/// What the first stage hands on: `segs.len()` segments of `s` values
-/// (padded), their reference windows and real lengths.
+/// Segments per chunk.
+const CHUNK: usize = 384;
+/// Sets of device buffers: one uploading, one running, one coming back.
+const DEV_SETS: usize = 3;
+
+/// Busy time of the CPU stages, in microseconds (printed with RFX_TIMING).
+static BUSY: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Adds the time it lives to a stage's busy total.
+struct Busy(usize, Instant);
+
+impl Busy {
+    fn new(stage: usize) -> Self {
+        Self(stage, Instant::now())
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY[self.0].fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+fn report(what: &str, wall: Instant) {
+    if std::env::var_os("RFX_TIMING").is_some() {
+        let b: Vec<f64> = BUSY.iter().map(|x| x.swap(0, Ordering::Relaxed) as f64 / 1e6).collect();
+        let g = GpuSeg::times();
+        GpuSeg::reset_times();
+        eprintln!(
+            "  {what}: wall {:.2} s, read+window {:.2} s, upload {:.2}, kernel {:.2}, download {:.2}, code+write {:.2} s",
+            wall.elapsed().as_secs_f64(),
+            b[0],
+            g[0],
+            g[1],
+            g[2],
+            b[1]
+        );
+    }
+}
+
+/// The host side of a chunk: its segments, real lengths, padded samples (or
+/// residuals) and reference windows.
 struct Chunk {
     segs: Vec<usize>,
     lens: Vec<i32>,
@@ -28,36 +75,88 @@ struct Chunk {
     refw: Vec<f32>,
 }
 
-fn lens_of(segs: &[usize], s: usize, words: u64) -> Vec<i32> {
-    segs.iter().map(|&q| s.min(words as usize - q * s) as i32).collect()
-}
-
-/// Run `fill(i, segment_input, segment_window)` over the chunk in parallel.
+/// Run `fill(q, segment_input, segment_window)` over the segments in parallel.
 fn build_chunk(
     segs: Vec<usize>,
     s: usize,
     rw: usize,
     use_ref: bool,
     words: u64,
-    fill: impl Fn(usize, usize, &mut [i32], &mut [f32]) -> Result<()> + Sync,
+    fill: impl Fn(usize, &mut [i32], &mut [f32]) -> Result<()> + Sync,
 ) -> Result<Chunk> {
-    let lens = lens_of(&segs, s, words);
+    let lens: Vec<i32> = segs.iter().map(|&q| s.min(words as usize - q * s) as i32).collect();
     let mut input = vec![0i32; segs.len() * s];
     let mut refw = if use_ref { vec![0f32; segs.len() * rw] } else { Vec::new() };
     if use_ref {
-        input
-            .par_chunks_mut(s)
-            .zip(refw.par_chunks_mut(rw))
-            .enumerate()
-            .try_for_each(|(i, (inp, win))| fill(i, segs[i], inp, win))?;
+        input.par_chunks_mut(s).zip(refw.par_chunks_mut(rw)).enumerate().try_for_each(|(i, (inp, win))| fill(segs[i], inp, win))?;
     } else {
-        input.par_chunks_mut(s).enumerate().try_for_each(|(i, inp)| fill(i, segs[i], inp, &mut []))?;
+        input.par_chunks_mut(s).enumerate().try_for_each(|(i, inp)| fill(segs[i], inp, &mut []))?;
     }
     Ok(Chunk { segs, lens, input, refw })
 }
 
-fn chunks_of(nseg: usize, chunk: usize) -> Vec<Vec<usize>> {
-    (0..nseg).step_by(chunk).map(|f| (f..(f + chunk).min(nseg)).collect()).collect()
+fn chunks_of(nseg: usize) -> Vec<Vec<usize>> {
+    (0..nseg).step_by(CHUNK).map(|f| (f..(f + CHUNK).min(nseg)).collect()).collect()
+}
+
+/// Channels and threads of the three device stages; `mode` is the kernel's.
+/// Returns the receiver of the downloaded chunks.
+#[allow(clippy::too_many_arguments)]
+fn device_stages<'s, 'e>(
+    sc: &'s std::thread::Scope<'s, 'e>,
+    mode: i32,
+    pre: &Preset,
+    use_ref: bool,
+    s: usize,
+    first: std::sync::mpsc::Receiver<Result<Chunk>>,
+) -> Result<std::sync::mpsc::Receiver<Result<(Chunk, Vec<i32>)>>> {
+    let (up, mut run, down) = gpu::open(pre, use_ref, s)?;
+    let (free_tx, free_rx) = sync_channel::<Dev>(DEV_SETS);
+    for _ in 0..DEV_SETS {
+        free_tx.send(up.dev()?).ok();
+    }
+    let (tx2, rx2) = sync_channel::<Result<(Chunk, Dev)>>(1);
+    let (tx3, rx3) = sync_channel::<Result<(Chunk, Dev)>>(1);
+    let (tx4, rx4) = sync_channel::<Result<(Chunk, Vec<i32>)>>(1);
+    sc.spawn(move || {
+        for c in first {
+            let r = c.and_then(|c| {
+                let mut dev = free_rx.recv().context("device buffers are gone")?;
+                up.upload(&mut dev, &c.input, &c.refw, &c.lens)?;
+                Ok((c, dev))
+            });
+            let stop = r.is_err();
+            if tx2.send(r).is_err() || stop {
+                return;
+            }
+        }
+    });
+    sc.spawn(move || {
+        for r in rx2 {
+            let r = r.and_then(|(c, dev)| {
+                run.run(&dev, mode)?;
+                Ok((c, dev))
+            });
+            let stop = r.is_err();
+            if tx3.send(r).is_err() || stop {
+                return;
+            }
+        }
+    });
+    sc.spawn(move || {
+        for r in rx3 {
+            let r = r.and_then(|(c, dev)| {
+                let out = down.download(&dev)?;
+                free_tx.send(dev).ok();
+                Ok((c, out))
+            });
+            let stop = r.is_err();
+            if tx4.send(r).is_err() || stop {
+                return;
+            }
+        }
+    });
+    Ok(rx4)
 }
 
 /// Pack source `k`; returns the bytes written.
@@ -67,7 +166,6 @@ pub(crate) fn pack_source(
     sm: &SrcMeta,
     pre: &Preset,
     s: usize,
-    chunk: usize,
     verify: bool,
     files: &[File],
     refs: &Refs,
@@ -75,49 +173,37 @@ pub(crate) fn pack_source(
 ) -> Result<u64> {
     let use_ref = !sm.refs.is_empty();
     let nseg = (sm.words as usize).div_ceil(s);
-    let mut predictor = GpuSeg::new(pre, use_ref, s)?;
     let mut verifier = if verify { Some(GpuSeg::new(pre, use_ref, s)?) } else { None };
-    let rw = predictor.window_len();
+    let rw = s + 2 * pre.taps;
     let (tx1, rx1) = sync_channel::<Result<Chunk>>(1);
-    let (tx2, rx2) = sync_channel::<Result<(Chunk, Vec<i32>)>>(1);
     let mut packed = 0u64;
-    std::thread::scope(|sc| -> Result<()> {
+    let wall = Instant::now();
+    let res = std::thread::scope(|sc| -> Result<()> {
+        let rx = device_stages(sc, 0, pre, use_ref, s, rx1)?;
         sc.spawn(move || {
-            for segs in chunks_of(nseg, chunk) {
-                let c = build_chunk(segs, s, rw, use_ref, sm.words, |_, q, inp, win| {
+            for segs in chunks_of(nseg) {
+                let g1 = Busy::new(0);
+                let c = build_chunk(segs, s, rw, use_ref, sm.words, |q, inp, win| {
                     let s0 = q * s;
                     let n = s.min(sm.words as usize - s0);
-                    let y = read_words(&files[k], sm.words, s0 as i64, n, sm.shift)?;
-                    for (o, v) in inp.iter_mut().zip(y) {
-                        *o = v - sm.mean;
-                    }
+crate::io::read_words_into(&files[k], sm.words, s0 as i64, &mut inp[..n], sm.shift, sm.mean)?;
                     if use_ref {
-                        let wv = refs.window(k, s0 as i64, n)?;
-                        win[..wv.len()].copy_from_slice(&wv);
+refs.window_into(k, s0 as i64, n, win)?;
                     }
                     Ok(())
                 });
+                drop(g1);
                 let stop = c.is_err();
                 if tx1.send(c).is_err() || stop {
                     return;
                 }
             }
         });
-        sc.spawn(move || {
-            for c in rx1 {
-                let r = c.and_then(|c| {
-                    let preds = predictor.run(0, &c.input, &c.refw, &c.lens)?;
-                    Ok((c, preds))
-                });
-                let stop = r.is_err();
-                if tx2.send(r).is_err() || stop {
-                    return;
-                }
-            }
-        });
-        for r in rx2 {
+        for r in rx {
             let (c, preds) = r?;
-            let coded: Vec<(Vec<u8>, Vec<i32>)> = (0..c.segs.len())
+            let _g = Busy::new(1);
+            let b = c.segs.len();
+            let coded: Vec<(Vec<u8>, Vec<i32>)> = (0..b)
                 .into_par_iter()
                 .map(|i| {
                     let n = c.lens[i] as usize;
@@ -127,7 +213,7 @@ pub(crate) fn pack_source(
                 })
                 .collect();
             if let Some(v) = verifier.as_mut() {
-                let mut flat = vec![0i32; c.segs.len() * s];
+                let mut flat = vec![0i32; b * s];
                 flat.par_chunks_mut(s).zip(coded.par_iter()).enumerate().try_for_each(|(i, (dst, (bytes, res)))| {
                     match seg::decode_residuals(bytes, c.lens[i] as usize) {
                         Some(d) if d == *res => {
@@ -138,7 +224,7 @@ pub(crate) fn pack_source(
                     }
                 })?;
                 let back = v.run(1, &flat, &c.refw, &c.lens)?;
-                let bad = (0..c.segs.len()).into_par_iter().find_any(|&i| {
+                let bad = (0..b).into_par_iter().find_any(|&i| {
                     let n = c.lens[i] as usize;
                     back[i * s..i * s + n] != c.input[i * s..i * s + n]
                 });
@@ -152,7 +238,9 @@ pub(crate) fn pack_source(
             }
         }
         Ok(())
-    })?;
+    });
+    report("pack", wall);
+    res?;
     Ok(packed)
 }
 
@@ -164,7 +252,6 @@ pub(crate) fn unpack_source(
     sm: &SrcMeta,
     pre: &Preset,
     s: usize,
-    chunk: usize,
     blocks: &HashMap<u64, (u64, u64)>,
     archive: &File,
     refs: &Refs,
@@ -172,14 +259,15 @@ pub(crate) fn unpack_source(
 ) -> Result<()> {
     let use_ref = !sm.refs.is_empty();
     let nseg = (sm.words as usize).div_ceil(s);
-    let mut gpu = GpuSeg::new(pre, use_ref, s)?;
-    let rw = gpu.window_len();
+    let rw = s + 2 * pre.taps;
     let (tx1, rx1) = sync_channel::<Result<Chunk>>(1);
-    let (tx2, rx2) = sync_channel::<Result<(Chunk, Vec<i32>)>>(1);
-    std::thread::scope(|sc| -> Result<()> {
+    let wall = Instant::now();
+    let res = std::thread::scope(|sc| -> Result<()> {
+        let rx = device_stages(sc, 1, pre, use_ref, s, rx1)?;
         sc.spawn(move || {
-            for segs in chunks_of(nseg, chunk) {
-                let c = build_chunk(segs, s, rw, use_ref, sm.words, |_, q, inp, win| {
+            for segs in chunks_of(nseg) {
+                let g1 = Busy::new(0);
+                let c = build_chunk(segs, s, rw, use_ref, sm.words, |q, inp, win| {
                     let s0 = q * s;
                     let n = s.min(sm.words as usize - s0);
                     let &(off, len) = blocks.get(&(q as u64)).with_context(|| format!("{}: segment {q} is missing", sm.name))?;
@@ -188,31 +276,20 @@ pub(crate) fn unpack_source(
                     let res = seg::decode_residuals(&bytes, n).with_context(|| format!("{}: segment {q} is corrupt", sm.name))?;
                     inp[..n].copy_from_slice(&res);
                     if use_ref {
-                        let wv = refs.window(k, s0 as i64, n)?;
-                        win[..wv.len()].copy_from_slice(&wv);
+refs.window_into(k, s0 as i64, n, win)?;
                     }
                     Ok(())
                 });
+                drop(g1);
                 let stop = c.is_err();
                 if tx1.send(c).is_err() || stop {
                     return;
                 }
             }
         });
-        sc.spawn(move || {
-            for c in rx1 {
-                let r = c.and_then(|c| {
-                    let ys = gpu.run(1, &c.input, &c.refw, &c.lens)?;
-                    Ok((c, ys))
-                });
-                let stop = r.is_err();
-                if tx2.send(r).is_err() || stop {
-                    return;
-                }
-            }
-        });
-        for r in rx2 {
+        for r in rx {
             let (c, ys) = r?;
+            let _g = Busy::new(1);
             c.segs.par_iter().enumerate().try_for_each(|(i, &q)| -> Result<()> {
                 let n = c.lens[i] as usize;
                 let mut raw = Vec::with_capacity(n * 2);
@@ -224,5 +301,7 @@ pub(crate) fn unpack_source(
             })?;
         }
         Ok(())
-    })
+    });
+    report("unpack", wall);
+    res
 }

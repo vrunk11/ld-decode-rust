@@ -73,8 +73,6 @@ pub enum Device {
     Gpu,
 }
 
-/// Segments sent to the GPU at once.
-const GPU_CHUNK: usize = 384;
 
 pub struct PackOpts {
     pub device: Device,
@@ -151,10 +149,19 @@ fn runs(t: &LagTable, p0: i64, p1: i64) -> Vec<(i64, i64, i64)> {
 impl Refs<'_> {
     /// Mean of the reference sources over positions `[s0 - taps, s0 + n + taps)`.
     pub(crate) fn window(&self, k: usize, s0: i64, n: usize) -> Result<Vec<f32>> {
+        let mut out = vec![0f32; refwin_len(n, &self.meta.sources[k].preset())];
+        self.window_into(k, s0, n, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Refs::window`] into the first `refwin_len` values of `out`. The sums
+    /// of the sources are whole numbers, exact in f32.
+    pub(crate) fn window_into(&self, k: usize, s0: i64, n: usize, out: &mut [f32]) -> Result<()> {
         let sm = &self.meta.sources[k];
         let len = refwin_len(n, &sm.preset());
         let p0 = s0 - sm.taps as i64;
-        let mut acc = vec![0i32; len];
+        let out = &mut out[..len];
+        out.fill(0.0);
         for &j in &sm.refs {
             let rj = &self.meta.sources[j];
             let t = &self.tables[&(k, j)];
@@ -164,15 +171,15 @@ impl Refs<'_> {
                 if hi <= lo {
                     continue;
                 }
-                let v = read_words(&self.files[j], rj.words, lo, (hi - lo) as usize, rj.shift)?;
                 let base = (lo - lag - p0) as usize;
-                for (o, x) in acc[base..].iter_mut().zip(v) {
-                    *o += x - rj.mean;
-                }
+                crate::io::add_words(&self.files[j], lo, hi, rj.shift, rj.mean, &mut out[base..base + (hi - lo) as usize])?;
             }
         }
         let inv = if sm.refs.is_empty() { 0.0 } else { 1.0f32 / sm.refs.len() as f32 };
-        Ok(acc.into_iter().map(|a| a as f32 * inv).collect())
+        for o in out.iter_mut() {
+            *o *= inv;
+        }
+        Ok(())
     }
 }
 
@@ -287,7 +294,7 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
         let t0 = std::time::Instant::now();
         let mut packed = 0u64;
         if o.device == Device::Gpu {
-            packed = crate::gpupipe::pack_source(k, sm, &pre, s, GPU_CHUNK, o.verify, &files, &refs, &mut w)?;
+            packed = crate::gpupipe::pack_source(k, sm, &pre, s, o.verify, &files, &refs, &mut w)?;
         }
         let chunk = rayon::current_num_threads() * 4;
         let nseg_cpu = if o.device == Device::Gpu { 0 } else { nseg };
@@ -422,7 +429,7 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -
         let nseg = (sm.words as usize).div_ceil(s);
         let t0 = std::time::Instant::now();
         if device == Device::Gpu {
-            crate::gpupipe::unpack_source(k, sm, &pre, s, GPU_CHUNK, &o.blocks[k], &o.file, &refs, &outs[k])?;
+            crate::gpupipe::unpack_source(k, sm, &pre, s, &o.blocks[k], &o.file, &refs, &outs[k])?;
         }
         let chunk = rayon::current_num_threads() * 4;
         let nseg_cpu = if device == Device::Gpu { 0 } else { nseg };
@@ -502,18 +509,11 @@ pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize, with_ref:
     }
     let mut gpu = GpuSeg::new(&pre, with_ref, segment)?;
     let _ = gpu.run(0, &input, &refw, &lens)?;
-    gpu.t_upload = 0.0;
-    gpu.t_kernel = 0.0;
-    gpu.t_download = 0.0;
+    GpuSeg::reset_times();
     let out = gpu.run(0, &input, &refw, &lens)?;
     let total = lens.iter().sum::<i32>() as f64;
-    eprintln!(
-        "GPU: kernel {:.1} Msmp/s ({:.3} s), upload {:.3} s, download {:.3} s",
-        total / gpu.t_kernel / 1e6,
-        gpu.t_kernel,
-        gpu.t_upload,
-        gpu.t_download
-    );
+    let t = GpuSeg::times();
+    eprintln!("GPU: kernel {:.1} Msmp/s ({:.3} s), upload {:.3} s, download {:.3} s", total / t[1] / 1e6, t[1], t[0], t[2]);
     for g in 0..nseg {
         let n = lens[g] as usize;
         let diff = (0..n).filter(|&i| cpu[g][i] != out[g * segment + i]).collect::<Vec<_>>();

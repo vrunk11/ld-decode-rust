@@ -59,3 +59,44 @@ pub fn read_words(f: &File, words: u64, start: i64, n: usize, shift: u32) -> io:
     }
     Ok(out)
 }
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Like [`read_words`] into `out` (zeros outside the file), with `sub`
+/// subtracted from each word read.
+pub fn read_words_into(f: &File, words: u64, start: i64, out: &mut [i32], shift: u32, sub: i32) -> io::Result<()> {
+    out.fill(0);
+    let lo = start.max(0);
+    let hi = (start + out.len() as i64).min(words as i64);
+    if hi <= lo {
+        return Ok(());
+    }
+    SCRATCH.with(|s| {
+        let mut buf = s.borrow_mut();
+        buf.resize((hi - lo) as usize * 2, 0);
+        read_exact_at(f, &mut buf, lo as u64 * 2)?;
+        let base = (lo - start) as usize;
+        for (o, w) in out[base..].iter_mut().zip(buf.chunks_exact(2)) {
+            *o = (i16::from_le_bytes([w[0], w[1]]) >> shift) as i32 - sub;
+        }
+        Ok(())
+    })
+}
+
+/// Add the words `[lo, hi)` of the file, shifted right by `shift` and minus
+/// `sub`, to `dst` (`dst[0]` for word `lo`).
+pub fn add_words(f: &File, lo: i64, hi: i64, shift: u32, sub: i32, dst: &mut [f32]) -> io::Result<()> {
+    debug_assert!(lo >= 0 && hi - lo == dst.len() as i64);
+    SCRATCH.with(|s| {
+        let mut buf = s.borrow_mut();
+        buf.resize(dst.len() * 2, 0);
+        read_exact_at(f, &mut buf, lo as u64 * 2)?;
+        for (o, w) in dst.iter_mut().zip(buf.chunks_exact(2)) {
+            let v = (i16::from_le_bytes([w[0], w[1]]) >> shift) as i32 - sub;
+            *o += v as f32;
+        }
+        Ok(())
+    })
+}

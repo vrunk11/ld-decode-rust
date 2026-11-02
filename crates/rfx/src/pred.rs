@@ -18,7 +18,8 @@
 //! - the covariance is `a = lam * a + r_p * r_q` (lower triangle), the right
 //!   hand side `b = lam * b + r_p * y`;
 //! - the weights come from a Cholesky factorisation of `a + ridge * I`
-//!   (`ridge = trace / d * 1e-6 + 1e-6`), column by column, with forward and
+//!   (`ridge = trace / d * 1e-6 + 1e-6`), column by column (the pivot is
+//!   inverted once and the column and the substitutions multiply by it), with forward and
 //!   backward substitution that update the remaining unknowns one column at
 //!   a time. A matrix that is not positive definite keeps the old weights.
 
@@ -73,6 +74,7 @@ pub struct Pred {
     r: Vec<f32>,
     lc: Vec<f32>,
     mr: Vec<f32>,
+    rdiag: Vec<f32>,
 
     s: Vec<f32>,
 }
@@ -96,7 +98,7 @@ impl Pred {
             r: vec![0.0; dp.max(ds)],
             lc: vec![0.0; ds * ds],
             mr: vec![0.0; ds * ds],
-
+            rdiag: vec![0.0; d],
             s: vec![0.0; ds],
         }
     }
@@ -137,7 +139,7 @@ let row = &mut self.a[p * ds..p * ds + p + 1];                for (v, &rq) in ro
         }
         if i & (self.pre.every - 1) == self.pre.every - 1 && i > 4 * d {
             self.s[..d].copy_from_slice(&self.b);
-            if solve(&self.a, &mut self.lc, &mut self.mr, &mut self.s, d) {
+            if solve(&self.a, &mut self.lc, &mut self.mr, &mut self.rdiag, &mut self.s, d) {
                 self.w[..d].copy_from_slice(&self.s[..d]);
             }
         }
@@ -157,7 +159,7 @@ let row = &mut self.a[p * ds..p * ds + p + 1];                for (v, &rq) in ro
 /// row in `mr` for the backward substitution. Each element still sees the
 /// same operations in the same order as the textbook row loops, so the bits
 /// are the reference's.
-fn solve(a: &[f32], lc: &mut [f32], mr: &mut [f32], s: &mut [f32], d: usize) -> bool {
+fn solve(a: &[f32], lc: &mut [f32], mr: &mut [f32], rdiag: &mut [f32], s: &mut [f32], d: usize) -> bool {
     let mut tr = 0f32;
     for i in 0..d {
         tr += a[i * d + i];
@@ -180,7 +182,9 @@ fn solve(a: &[f32], lc: &mut [f32], mr: &mut [f32], s: &mut [f32], d: usize) -> 
             return false;
         }
         let dj = v.sqrt();
+        let rd = 1.0f32 / dj;
         tail[j] = dj;
+        rdiag[j] = rd;
         let col = &mut tail[j + 1..d];
         for k in 0..j {
             let ljk = head[k * d + j];
@@ -190,7 +194,7 @@ fn solve(a: &[f32], lc: &mut [f32], mr: &mut [f32], s: &mut [f32], d: usize) -> 
             }
         }
         for x in col.iter_mut() {
-            *x /= dj;
+            *x *= rd;
         }
         mr[j * d + j] = dj;
         for (i, &x) in col.iter().enumerate() {
@@ -198,7 +202,7 @@ fn solve(a: &[f32], lc: &mut [f32], mr: &mut [f32], s: &mut [f32], d: usize) -> 
         }
     }
     for i in 0..d {
-        s[i] /= lc[i * d + i];
+        s[i] *= rdiag[i];
         let si = s[i];
         for (x, &c) in s[i + 1..d].iter_mut().zip(&lc[i * d + i + 1..i * d + d]) {
             let p = c * si;
@@ -206,7 +210,7 @@ fn solve(a: &[f32], lc: &mut [f32], mr: &mut [f32], s: &mut [f32], d: usize) -> 
         }
     }
     for i in (0..d).rev() {
-        s[i] /= mr[i * d + i];
+        s[i] *= rdiag[i];
         let si = s[i];
         for (x, &c) in s[..i].iter_mut().zip(&mr[i * d..i * d + i]) {
             let p = c * si;
