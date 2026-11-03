@@ -123,6 +123,10 @@ pub struct Index {
     /// Codec id of each track number.
     pub codecs: Vec<(u64, String)>,
     pub blocks: Vec<BlockRef>,
+    /// CodecPrivate of each track number (when it has one).
+    pub private: Vec<(u64, Vec<u8>)>,
+    /// Attached files: name, offset and length of the data.
+    pub attachments: Vec<(String, u64, u64)>,
 }
 
 struct Header {
@@ -208,6 +212,13 @@ fn children(buf: &[u8]) -> Result<Vec<(u32, std::ops::Range<usize>)>> {
 /// Walk the file once, reading element headers only (no payload but Tracks
 /// and the first bytes of each block).
 pub fn scan(f: &File) -> Result<Index> {
+    scan_with(f, Some(b"rfx"))
+}
+
+/// [`scan`] for a Matroska file of any document type (or just `doctype`), as
+/// a tool like ffmpeg writes it: SimpleBlocks or BlockGroups in the Clusters,
+/// CodecPrivate in the track entries, Attachments.
+pub fn scan_with(f: &File, doctype: Option<&[u8]>) -> Result<Index> {
     let file_len = f.metadata()?.len();
     let mut idx = Index::default();
     let h = read_header(f, 0, file_len)?;
@@ -216,7 +227,7 @@ pub fn scan(f: &File) -> Result<Index> {
     }
     let head = read_payload(f, h.len, h.size.unwrap_or(0))?;
     let doc = children(&head)?.into_iter().find(|(id, _)| *id == 0x4282).map(|(_, r)| head[r].to_vec());
-    if doc.as_deref() != Some(b"rfx") {
+    if doctype.is_some() && doc.as_deref() != doctype {
         bail!("not an rfx file (DocType is not rfx)");
     }
     let mut pos = h.len + h.size.unwrap_or(0);
@@ -243,16 +254,20 @@ pub fn scan(f: &File) -> Result<Index> {
                     if id != ID_TRACK_ENTRY {
                         continue;
                     }
-                    let (mut number, mut codec) = (0, String::new());
+                    let (mut number, mut codec, mut private) = (0, String::new(), Vec::new());
                     for (cid, cr) in children(&buf[r.clone()])? {
                         let data = &buf[r.start + cr.start..r.start + cr.end];
                         match cid {
                             ID_TRACK_NUMBER => number = parse_uint(data),
                             ID_CODEC_ID => codec = String::from_utf8_lossy(data).into_owned(),
+                            0x63A2 => private = data.to_vec(),
                             _ => {}
                         }
                     }
                     idx.codecs.push((number, codec));
+                    if !private.is_empty() {
+                        idx.private.push((number, private));
+                    }
                 }
             }
             ID_CLUSTER => {
@@ -262,21 +277,32 @@ pub fn scan(f: &File) -> Result<Index> {
                     let csize = c.size.unwrap_or(0);
                     match c.id {
                         ID_TIMESTAMP => ts = parse_uint(&read_payload(f, p + c.len, csize)?),
-                        ID_SIMPLE_BLOCK => {
-                            let mut head = [0u8; 12];
-                            let n = csize.min(12) as usize;
-                            read_exact_at(f, &mut head[..n], p + c.len)?;
-                            let tl = head[0].leading_zeros() as usize + 1;
-                            let mut track = u64::from(head[0]) & ((1u64 << (8 - tl)) - 1);
-                            for &b in &head[1..tl] {
-                                track = (track << 8) | u64::from(b);
-                            }
-                            let skip = (tl + 3) as u64;
-                            idx.blocks.push(BlockRef { track, ts, off: p + c.len + skip, len: csize - skip });
-                        }
+ID_SIMPLE_BLOCK => idx.blocks.push(block_ref(f, p + c.len, csize, ts)?),                        // A BlockGroup: its Block (a tool like ffmpeg writes a group for                        // the last packet of a track, or one with a duration).                        0xA0 => {                            let mut q = p + c.len;                            while q < p + c.len + csize {                                let g = read_header(f, q, file_len)?;                                let gs = g.size.unwrap_or(0);                                if g.id == 0xA1 {                                    idx.blocks.push(block_ref(f, q + g.len, gs, ts)?);                                }                                q += g.len + gs;                            }                        }
                         _ => {}
                     }
                     p += c.len + csize;
+                }
+            }
+            // Attachments: AttachedFile (0x61A7) holding FileName (0x466E) and FileData (0x465C).
+            0x1941_A469 => {
+                if size > 1 << 28 {
+                    bail!("the attachments are too large");
+                }
+                let buf = read_payload(f, body, size)?;
+                for (id, r) in children(&buf)? {
+                    if id != 0x61A7 {
+                        continue;
+                    }
+                    let (mut name, mut data) = (String::new(), (0u64, 0u64));
+                    for (cid, cr) in children(&buf[r.clone()])? {
+                        let (a, b) = (r.start + cr.start, r.start + cr.end);
+                        match cid {
+                            0x466E => name = String::from_utf8_lossy(&buf[a..b]).into_owned(),
+                            0x465C => data = (body + a as u64, (b - a) as u64),
+                            _ => {}
+                        }
+                    }
+                    idx.attachments.push((name, data.0, data.1));
                 }
             }
             _ => {}
@@ -320,4 +346,19 @@ mod tests {
         read_exact_at(&f, &mut b, idx.blocks[0].off).unwrap();
         assert_eq!(&b, b"hello");
     }
+}
+
+/// The block whose element data (track number, timestamp offset, flags, then
+/// the payload) is `len` bytes at `at`.
+fn block_ref(f: &File, at: u64, len: u64, ts: u64) -> Result<BlockRef> {
+    let mut head = [0u8; 12];
+    let n = len.min(12) as usize;
+    read_exact_at(f, &mut head[..n], at)?;
+    let tl = head[0].leading_zeros() as usize + 1;
+    let mut track = u64::from(head[0]) & ((1u64 << (8 - tl)) - 1);
+    for &b in &head[1..tl] {
+        track = (track << 8) | u64::from(b);
+    }
+    let skip = (tl + 3) as u64;
+    Ok(BlockRef { track, ts, off: at + skip, len: len - skip })
 }

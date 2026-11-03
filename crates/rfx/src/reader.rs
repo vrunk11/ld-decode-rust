@@ -58,37 +58,32 @@ struct Svc {
 }
 
 /// An opened archive whose tracks can be read by sample index.
-pub struct Archive {
+struct Pred {
     inner: Opened,
     cache: Mutex<Cache>,
     svc: Vec<Arc<Svc>>,
-    me: Weak<Archive>,
+    me: Weak<Pred>,
 }
 
-impl Archive {
-    /// The archive at `path`. One that is open already (a reader per track
-    /// opens the same file) is shared, with its cache: a track predicted from
-    /// others is decoded from their segments already there.
-    pub fn open(path: &Path) -> Result<Arc<Archive>> {
-        static OPEN: Mutex<Vec<(std::path::PathBuf, Weak<Archive>)>> = Mutex::new(Vec::new());
-        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let mut open_now = OPEN.lock().map_err(|_| anyhow!("archive list poisoned"))?;
-        open_now.retain(|(_, w)| w.strong_count() > 0);
-        if let Some(a) = open_now.iter().find(|(p, _)| *p == key).and_then(|(_, w)| w.upgrade()) {
-            return Ok(a);
-        }
+impl Pred {
+    /// A new reader of the predictor archive at `path`, its services started.
+    fn open_pred(path: &Path) -> Result<Arc<Pred>> {
         let a = Self::open_new(path)?;
-        open_now.push((key, Arc::downgrade(&a)));
         for k in 0..a.tracks() {
             a.start(k);
         }
         Ok(a)
     }
 
-    fn open_new(path: &Path) -> Result<Arc<Archive>> {
+    fn open_new(path: &Path) -> Result<Arc<Pred>> {
         let inner = open(path)?;
         let svc = (0..inner.meta.sources.len()).map(|_| Arc::new(Svc { queue: Mutex::default(), cv: Condvar::new(), started: AtomicBool::new(false) })).collect();
-        Ok(Arc::new_cyclic(|me| Archive { inner, cache: Mutex::new(Cache::default()), svc, me: me.clone() }))
+        Ok(Arc::new_cyclic(|me| Pred { inner, cache: Mutex::new(Cache::default()), svc, me: me.clone() }))
+    }
+
+    /// Sample rate of track `k` in Hz (0: not known).
+    pub fn rate_hz(&self, k: usize) -> f64 {
+        self.inner.meta.sources[k].rate_hz
     }
 
     pub fn tracks(&self) -> usize {
@@ -362,7 +357,7 @@ impl Archive {
 }
 
 /// The service of track `k`: decodes what is queued until the archive is gone.
-fn serve(me: Weak<Archive>, svc: Arc<Svc>, k: usize) {
+fn serve(me: Weak<Pred>, svc: Arc<Svc>, k: usize) {
     let mut gpu: Option<Option<GpuSeg>> = me.upgrade().map(|a| a.open_gpu(k));
     let mut pool: Option<rayon::ThreadPool> = None;
     loop {
@@ -397,13 +392,13 @@ fn serve(me: Weak<Archive>, svc: Arc<Svc>, k: usize) {
     }
 }
 
-impl Store for Archive {
+impl Store for Pred {
     fn load(&self, j: usize, lo: u64, out: &mut [i32]) -> Result<()> {
         self.read(j, lo as i64, out)
     }
 }
 
-impl Drop for Archive {
+impl Drop for Pred {
     fn drop(&mut self) {
         if std::env::var_os("RFX_READER_STATS").is_some() {
             eprintln!("reader: {} segments decoded on the GPU, {} on the CPU", STAT[1].load(Ordering::Relaxed), STAT[0].load(Ordering::Relaxed));
@@ -447,7 +442,7 @@ mod tests {
     }
 }
 
-impl Archive {
+impl Pred {
     /// Start the service of track `k` if it is not running: it builds the
     /// GPU kernel at once, while the reader is still setting up.
     fn start(&self, k: usize) {
@@ -478,4 +473,86 @@ fn limits() -> (usize, usize, usize) {
         let ahead = (cache / 6).clamp(4, PREFETCH_MAX);
         (cache, ahead, (ahead / 2).clamp(2, BATCH_MAX))
     })
+}
+
+/// An opened archive whose tracks can be read by sample index: one packed
+/// with the predictor (decoded by a service per track) or with `--flac`.
+pub struct Archive {
+    kind: Kind,
+}
+
+enum Kind {
+    Pred(Arc<Pred>),
+    Flac(crate::flacmode::FlacArchive),
+}
+
+impl Archive {
+    /// The archive at `path`. One that is open already (a reader per track
+    /// opens the same file) is shared, with its cache: a track predicted from
+    /// others is decoded from their segments already there.
+    pub fn open(path: &Path) -> Result<Arc<Archive>> {
+        static OPEN: Mutex<Vec<(std::path::PathBuf, Weak<Archive>)>> = Mutex::new(Vec::new());
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut open_now = OPEN.lock().map_err(|_| anyhow!("archive list poisoned"))?;
+        open_now.retain(|(_, w)| w.strong_count() > 0);
+        if let Some(a) = open_now.iter().find(|(p, _)| *p == key).and_then(|(_, w)| w.upgrade()) {
+            return Ok(a);
+        }
+        let kind = if crate::flacmode::is_flac_archive(path) { Kind::Flac(crate::flacmode::FlacArchive::open(path)?) } else { Kind::Pred(Pred::open_pred(path)?) };
+        let a = Arc::new(Archive { kind });
+        open_now.push((key, Arc::downgrade(&a)));
+        Ok(a)
+    }
+
+    pub fn tracks(&self) -> usize {
+        match &self.kind {
+            Kind::Pred(p) => p.tracks(),
+            Kind::Flac(f) => f.tracks(),
+        }
+    }
+
+    /// Name of the track as it was packed.
+    pub fn name(&self, k: usize) -> &str {
+        match &self.kind {
+            Kind::Pred(p) => p.name(k),
+            Kind::Flac(f) => f.name(k),
+        }
+    }
+
+    /// Samples in track `k`.
+    pub fn len(&self, k: usize) -> u64 {
+        match &self.kind {
+            Kind::Pred(p) => p.len(k),
+            Kind::Flac(f) => f.len(k),
+        }
+    }
+
+    pub fn is_empty(&self, k: usize) -> bool {
+        self.len(k) == 0
+    }
+
+    /// Format the track came in (its samples are on that format's scale).
+    pub fn fmt(&self, k: usize) -> Fmt {
+        match &self.kind {
+            Kind::Pred(p) => p.fmt(k),
+            Kind::Flac(f) => f.fmt(k),
+        }
+    }
+
+    /// Sample rate of track `k` in Hz (0: not known).
+    pub fn rate_hz(&self, k: usize) -> f64 {
+        match &self.kind {
+            Kind::Pred(p) => p.rate_hz(k),
+            Kind::Flac(f) => f.rate_hz(k),
+        }
+    }
+
+    /// Samples `[start, start + out.len())` of track `k` on the scale of the
+    /// original file; zero outside the track.
+    pub fn read(&self, k: usize, start: i64, out: &mut [i32]) -> Result<()> {
+        match &self.kind {
+            Kind::Pred(p) => p.read(k, start, out),
+            Kind::Flac(f) => f.read(k, start, out),
+        }
+    }
 }

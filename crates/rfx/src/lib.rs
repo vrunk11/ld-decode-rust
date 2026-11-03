@@ -2,6 +2,7 @@
 pub mod align;
 pub mod ebml;
 pub mod edit;
+pub mod flacmode;
 pub mod fmt;
 pub mod gpu;
 mod gpupipe;
@@ -12,6 +13,7 @@ pub mod labresid;
 pub mod labspec;
 pub mod labtables;
 pub mod labtones;
+pub mod mflac;
 pub mod model;
 pub mod order;
 pub mod pack;

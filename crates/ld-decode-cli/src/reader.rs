@@ -95,7 +95,10 @@ pub fn open_input(path: &str, format: SampleFormat) -> Result<Input> {
         return open_stdin(format);
     }
     if format == SampleFormat::Rfx {
-        return Ok(Input { source: Box::new(RfxSource::open(path)?), container_rate_hz: None });
+        let src = RfxSource::open(path)?;
+        // The rate the archive recorded (Hz), as the container rate in kHz like a FLAC.
+        let container_rate_hz = src.rate_hz().map(|hz| (hz / 1000.0).round() as u32);
+        return Ok(Input { source: Box::new(src), container_rate_hz });
     }
     let mut file = File::open(path).with_context(|| format!("opening {path}"))?;
     let container_rate_hz = if matches!(format, SampleFormat::Ldf | SampleFormat::Flac) {
@@ -1463,6 +1466,11 @@ struct RfxSource {
 }
 
 impl RfxSource {
+    /// Sample rate (Hz) the archive recorded for the track, if it did.
+    fn rate_hz(&self) -> Option<f64> {
+        Some(self.archive.rate_hz(self.track)).filter(|r| *r > 0.0)
+    }
+
     fn open(path: &str) -> Result<Self> {
         let (file, track) = rfx_split(path);
         let track = track.with_context(|| format!("{path}: name a track, as in {file}#0"))?;

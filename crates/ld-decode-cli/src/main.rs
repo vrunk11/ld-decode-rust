@@ -356,7 +356,7 @@ fn main() -> Result<()> {
         (None, Some(hz)) => {
             // The container rate is the RF rate in kHz (`-ar 40k` = 40 MHz).
             let f = f64::from(hz) / 1000.0;
-            tracing::info!("Input sample rate {f} MHz (from the FLAC metadata, {hz} Hz)");
+            tracing::info!("Input sample rate {f} MHz (from the input file's metadata, {hz} Hz)");
             f
         }
         (None, None) => 40.0,

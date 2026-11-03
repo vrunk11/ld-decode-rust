@@ -44,6 +44,11 @@ enum Cmd {
         /// Order of coding: `auto` puts the cleanest capture of each programme first, `given` keeps the command line order.
         #[arg(long, default_value = "auto")]
         order: String,
+        /// Code the tracks as FLAC instead of with the predictor: the file is then an ordinary
+        /// Matroska audio file (a FLAC track per capture) that audio programs open, several
+        /// times larger; unpack gives the captures back all the same.
+        #[arg(long)]
+        flac: bool,
         /// Raw 16-bit captures.
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
@@ -59,10 +64,14 @@ enum Cmd {
         /// Extract only this track (0 is the primary).
         #[arg(long)]
         only: Option<usize>,
-        /// Write the captures in another format (s16, r16, s8, r8, lds, flac or ldf) instead of the
+        /// Write the captures in another format (s16, r16, s8, r8, lds, flac, ldf, or mflac: the tracks as the channels of FLAC files, 8 a file, to open in an audio program) instead of the
         /// one they came in; the samples are checked by hash.
         #[arg(long = "as")]
         as_format: Option<String>,
+        /// Write only the metadata (each track's .yaml as it was, and <archive>.yaml with all of it);
+        /// no sample is decoded.
+        #[arg(long)]
+        meta: bool,
     },
     /// Development: compare the CPU and GPU predictors on one file.
     GpuCheck {
@@ -174,23 +183,57 @@ enum Cmd {
         #[arg(required = true)]
         captures: Vec<PathBuf>,
     },
-    /// List the tracks of a .rfx file.
-    Info { input: PathBuf },
+    /// List the tracks of a .rfx file (nothing is decoded).
+    Info {
+        input: PathBuf,
+        /// Print the whole metadata as YAML instead of the summary.
+        #[arg(long)]
+        yaml: bool,
+    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Pack { output, level, segment, no_verify, pass0, ld_decode, rate_mhz, format, device, order, inputs } => {
+        Cmd::Pack { output, level, segment, no_verify, pass0, ld_decode, rate_mhz, format, device, order, flac, inputs } => {
             let opts = PackOpts { order: parse_order(&order)?, device: parse_device(&device)?, level, segment, verify: !no_verify, pass0_dir: pass0, ld_decode, rate_mhz, format };
+            if flac {
+                return rfx::flacmode::pack(&inputs, &output, &opts);
+            }
             let rep = pack(&inputs, &output, &opts)?;
             let (a, b): (u64, u64) = rep.iter().fold((0, 0), |s, r| (s.0 + r.size, s.1 + r.packed));
             eprintln!("total: {a} -> {b} bytes ({:.1}%)", 100.0 * b as f64 / a.max(1) as f64);
         }
-        Cmd::Unpack { input, outdir, only, device, as_format } => {
+        Cmd::Unpack { input, outdir, only, device, as_format, meta } => {
+            if rfx::flacmode::is_flac_archive(&input) {
+                if meta {
+                    return rfx::flacmode::unpack_meta(&input, &outdir, only);
+                }
+                let target = as_format.map(|f| rfx::pack::OutFmt::parse(&f).ok_or_else(|| anyhow::anyhow!("--as: unknown format {f} for a FLAC-mode archive"))).transpose()?;
+                return rfx::flacmode::unpack(&input, &outdir, only, target);
+            }
+            if meta {
+                return rfx::pack::unpack_meta(&input, &outdir, only);
+            }
+            if as_format.as_deref() == Some("mflac") {
+                return rfx::mflac::export(&input, &outdir, only);
+            }
             let target = as_format.map(|f| rfx::pack::OutFmt::parse(&f).ok_or_else(|| anyhow::anyhow!("--as: unknown format {f}"))).transpose()?;
             unpack(&input, &outdir, only, parse_device(&device)?, target)?
         }
-        Cmd::Info { input } => info(&input)?,
+        Cmd::Info { input, yaml } => {
+            if rfx::flacmode::is_flac_archive(&input) {
+                if yaml {
+                    print!("{}", rfx::flacmode::meta_yaml(&input)?);
+                    return Ok(());
+                }
+                return rfx::flacmode::info(&input);
+            }
+            if yaml {
+                print!("{}", rfx::pack::meta_yaml(&input)?);
+            } else {
+                info(&input)?
+            }
+        }
         Cmd::Merge { output, recode, work, inputs } => {
             let picks = rfx::edit::pick_all(&inputs)?;
             rfx::edit::assemble(&inputs, &picks, &output, &work_opts(&work)?, recode.then_some(1))?

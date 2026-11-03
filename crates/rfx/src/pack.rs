@@ -86,6 +86,10 @@ pub struct SrcMeta {
     /// decoded to raw samples: only the samples are kept.
     #[serde(default)]
     pub origin: Option<String>,
+    /// Sample rate of the capture in Hz (from its `.yaml`, else the one given
+    /// when it was packed); 0 when unknown.
+    #[serde(default)]
+    pub rate_hz: f64,
 }
 
 /// A small file stored whole in the metadata and given back by `unpack`.
@@ -101,7 +105,7 @@ const SIDECAR_MAX: u64 = 1 << 20;
 
 /// The `.yaml` the Domesday Duplicator writes beside a capture
 /// (`x.ddd.s16` -> `x.ddd.yaml`), if there is one.
-fn find_sidecars(capture: &Path) -> Vec<Sidecar> {
+pub(crate) fn find_sidecars(capture: &Path) -> Vec<Sidecar> {
     let p = capture.with_extension("yaml");
     match (std::fs::metadata(&p), p.file_name()) {
         (Ok(m), Some(name)) if m.is_file() && m.len() <= SIDECAR_MAX => match std::fs::read(&p) {
@@ -175,17 +179,17 @@ pub struct PackOpts {
     pub format: String,
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[derive(Clone)]
-struct Stats {
-    size: u64,
-    sha: String,
-    shift: u32,
-    mean: i32,
-    sample_sha: String,
+pub(crate) struct Stats {
+    pub(crate) size: u64,
+    pub(crate) sha: String,
+    pub(crate) shift: u32,
+    pub(crate) mean: i32,
+    pub(crate) sample_sha: String,
 }
 
 /// Hash of samples as little-endian i32.
@@ -204,7 +208,7 @@ pub(crate) fn hash_samples(f: &File, fmt: Fmt, count: u64) -> Result<String> {
     Ok(hex(&h.finalize()))
 }
 
-fn file_stats(path: &Path, fmt: Fmt) -> Result<Stats> {
+pub(crate) fn file_stats(path: &Path, fmt: Fmt) -> Result<Stats> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let size = f.metadata()?.len();
     let words = fmt.samples(size);
@@ -496,7 +500,7 @@ pub(crate) fn prepare_with(given: &[PathBuf], specs: &[Spec], known: &HashMap<(u
                 if fmts.iter().any(|f| *f != fmts[0]) {
                     bail!("the captures are not all in one format: the pass 0 of ld-decode takes one");
                 }
-                run_pass0(&o.ld_decode, inputs, o.rate_mhz, fmts[0].name(), &d)?;
+                run_pass0(&o.ld_decode, inputs, specs[0].carry.as_ref().map(|c| c.rate_hz).filter(|r| *r > 0.0).or_else(|| sidecar_rate_hz(&find_sidecars(&given[0]))).map_or(o.rate_mhz, |hz| hz / 1e6), fmts[0].name(), &d)?;
                 d
             }
         };
@@ -567,6 +571,11 @@ pub(crate) fn prepare_with(given: &[PathBuf], specs: &[Spec], known: &HashMap<(u
                 read_exact_at(&File::open(p)?, &mut tail, covered)?;
             }
             let c = specs[k].carry.as_ref();
+            let sidecars = match c {
+                Some(c) => c.sidecars.clone(),
+                None => find_sidecars(&origs[k]),
+            };
+            let rate_hz = c.map(|c| c.rate_hz).filter(|r| *r > 0.0).or_else(|| sidecar_rate_hz(&sidecars)).unwrap_or(o.rate_mhz * 1e6);
             Ok(SrcMeta {
                 name: names[k].clone(),
                 size: st.size,
@@ -589,10 +598,8 @@ pub(crate) fn prepare_with(given: &[PathBuf], specs: &[Spec], known: &HashMap<(u
                 weights: Vec::new(),
                 position: if edit { k } else { ord[k] },
                 noise: noise[k],
-                sidecars: match c {
-                    Some(c) => c.sidecars.clone(),
-                    None => find_sidecars(&origs[k]),
-                },
+                sidecars,
+                rate_hz,
                 origin: match c {
                     Some(c) => c.origin.clone(),
                     None => (origs[k] != *p).then(|| origs[k].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
@@ -781,6 +788,9 @@ pub(crate) struct Opened {
 }
 
 pub(crate) fn open(path: &Path) -> Result<Opened> {
+    if crate::flacmode::is_flac_archive(path) {
+        bail!("{} holds FLAC tracks (packed with --flac): it is a Matroska audio file, and rfx reads it only to unpack, info, or extract the metadata", path.display());
+    }
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let idx = ebml::scan(&file)?;
     let track_of = |codec: &str| idx.codecs.iter().find(|(_, c)| c == codec).map(|(n, _)| *n);
@@ -964,7 +974,7 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device, a
 
 /// Write the samples of `src` (in the format of `sm`) as a `target` file in
 /// `outdir`, named with the extension of the new format; remove `src`.
-fn convert_file(src: &Path, sm: &SrcMeta, target: Fmt, outdir: &Path) -> Result<()> {
+pub(crate) fn convert_file(src: &Path, sm: &SrcMeta, target: Fmt, outdir: &Path) -> Result<()> {
     let name = Path::new(&sm.name).with_extension(target.name());
     let dst_path = outdir.join(name.file_name().context("bad name")?);
     let from = File::open(src)?;
@@ -1224,7 +1234,7 @@ fn trial_cost(refs: &Refs, k: usize) -> Result<f64> {
 }
 
 /// The format of an input: `format` (`auto` guesses from the extension).
-fn input_fmt(path: &Path, format: &str) -> Result<Fmt> {
+pub(crate) fn input_fmt(path: &Path, format: &str) -> Result<Fmt> {
     if matches!(format, "ldf" | "flac") {
         return Ok(Fmt::S16);
     }
@@ -1244,7 +1254,7 @@ fn is_compressed(path: &Path, format: &str) -> bool {
 /// Decode the FLAC and Ogg-FLAC inputs with ffmpeg into raw 16-bit files in a
 /// work directory beside `out`; the other inputs go through as they are.
 /// Returns the list to pack and the work directory, if one was made.
-fn decode_compressed(given: &[PathBuf], out: &Path, o: &PackOpts) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+pub(crate) fn decode_compressed(given: &[PathBuf], out: &Path, o: &PackOpts) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
     if !given.iter().any(|p| is_compressed(p, &o.format)) {
         return Ok((given.to_vec(), None));
     }
@@ -1279,7 +1289,7 @@ fn decode_compressed(given: &[PathBuf], out: &Path, o: &PackOpts) -> Result<(Vec
 /// Write the capture `src` as FLAC (or Ogg-FLAC, `.ldf`) with ffmpeg, the way
 /// ld-decode's tools do (mono, 16 bits, the rate field `40k`), and check that
 /// decoding it gives back the samples; remove `src`.
-fn encode_flac(src: &Path, sm: &SrcMeta, ogg: bool, outdir: &Path) -> Result<()> {
+pub(crate) fn encode_flac(src: &Path, sm: &SrcMeta, ogg: bool, outdir: &Path) -> Result<()> {
     let ffmpeg = std::env::var("FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
     // ffmpeg reads 16-bit samples: an .lds capture goes through a raw copy.
     let raw = if sm.fmt() == Fmt::S16 {
@@ -1301,7 +1311,9 @@ fn encode_flac(src: &Path, sm: &SrcMeta, ogg: bool, outdir: &Path) -> Result<()>
     let stem = Path::new(&sm.name).with_extension("");
     let dst_path = outdir.join(format!("{}.{}", stem.to_string_lossy(), if ogg { "ldf" } else { "flac" }));
     let mut cmd = std::process::Command::new(&ffmpeg);
-    cmd.args(["-v", "error", "-y", "-f", "s16le", "-ar", "40k", "-ac", "1", "-i"]).arg(&raw).args(["-c:a", "flac"]);
+    // The container rate is the RF rate in kHz (75 MHz -> 75000 Hz), as ld-decode reads it.
+    let rate = if sm.rate_hz > 0.0 { format!("{}", (sm.rate_hz / 1000.0).round() as u64) } else { "40k".to_string() };
+    cmd.args(["-v", "error", "-y", "-f", "s16le", "-ar", &rate, "-ac", "1", "-i"]).arg(&raw).args(["-c:a", "flac"]);
     if ogg {
         cmd.args(["-f", "ogg"]);
     }
@@ -1322,5 +1334,136 @@ fn encode_flac(src: &Path, sm: &SrcMeta, ogg: bool, outdir: &Path) -> Result<()>
     }
     std::fs::remove_file(src)?;
     eprintln!("{} -> {}: samples identical", sm.name, dst_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    Ok(())
+}
+
+/// The sample rate (Hz) a capture's `.yaml` gives, if one of the sidecars does.
+pub(crate) fn sidecar_rate_hz(sidecars: &[Sidecar]) -> Option<f64> {
+    sidecars.iter().find_map(|s| {
+        std::str::from_utf8(&s.data).ok()?.lines().find_map(|l| l.trim().strip_prefix("\"sample_rate_hz\":")?.trim().trim_end_matches(',').parse().ok())
+    })
+}
+
+/// The whole metadata of an archive as YAML: the archive's own fields, every
+/// track's (its predictor, references and weights, format, hashes, the rate,
+/// the bytes past the last whole sample as hex), the `.yaml` sidecars as text
+/// and the size each track takes in the archive.
+pub fn meta_yaml(path: &Path) -> Result<String> {
+    let o = open(path)?;
+    let mut tracks = Vec::new();
+    for (k, sm) in o.meta.sources.iter().enumerate() {
+        let mut v = serde_json::to_value(sm)?;
+        let packed: u64 = o.blocks[k].values().map(|b| b.1).sum();
+        if let Some(m) = v.as_object_mut() {
+            m.insert("track".into(), k.into());
+            m.insert("packed_bytes".into(), packed.into());
+            m.insert("bits_per_sample".into(), (packed as f64 * 8.0 / sm.words.max(1) as f64).into());
+            m.insert("tail".into(), hex(&sm.tail).into());
+            let side: Vec<serde_json::Value> = sm
+                .sidecars
+                .iter()
+                .map(|s| {
+                    let mut e = serde_json::json!({ "name": s.name, "sha256": s.sha256, "bytes": s.data.len() });
+                    if let Ok(t) = std::str::from_utf8(&s.data) {
+                        e["text"] = t.into();
+                    }
+                    e
+                })
+                .collect();
+            m.insert("sidecars".into(), side.into());
+            let tables: Vec<serde_json::Value> = sm
+                .refs
+                .iter()
+                .filter_map(|&j| o.tables.get(&(k, j)).map(|t| serde_json::json!({ "reference": j, "steps": t.pos.len() })))
+                .collect();
+            m.insert("lag_tables".into(), tables.into());
+        }
+        tracks.push(v);
+    }
+    let doc = serde_json::json!({
+        "format": o.meta.format,
+        "version": o.meta.version,
+        "segment": o.meta.segment,
+        "tracks": tracks,
+    });
+    let mut out = String::new();
+    yaml_value(&doc, 0, &mut out);
+    Ok(out)
+}
+
+/// `value` as block-style YAML at `indent` (strings in JSON quoting, which
+/// YAML reads; multi-line text as a literal block).
+pub(crate) fn yaml_value(v: &serde_json::Value, indent: usize, out: &mut String) {
+    use serde_json::Value;
+    let pad = " ".repeat(indent);
+    match v {
+        Value::Object(m) => {
+            for (key, val) in m {
+                match val {
+                    Value::Object(o) if !o.is_empty() => {
+                        out.push_str(&format!("{pad}{key}:\n"));
+                        yaml_value(val, indent + 2, out);
+                    }
+                    Value::Array(a) if !a.is_empty() && a.iter().any(|e| e.is_object() || e.is_array()) => {
+                        out.push_str(&format!("{pad}{key}:\n"));
+                        yaml_value(val, indent + 2, out);
+                    }
+                    Value::String(s) if s.contains('\n') => {
+                        out.push_str(&format!("{pad}{key}: |\n"));
+                        for line in s.lines() {
+                            out.push_str(&format!("{pad}  {line}\n"));
+                        }
+                    }
+                    _ => out.push_str(&format!("{pad}{key}: {}\n", scalar(val))),
+                }
+            }
+        }
+        Value::Array(a) => {
+            for e in a {
+                let mut inner = String::new();
+                yaml_value(e, indent + 2, &mut inner);
+                if e.is_object() && !inner.is_empty() {
+                    // "- " takes the place of the first line's indent.
+                    out.push_str(&format!("{pad}- {}", &inner[indent + 2..]));
+                } else {
+                    out.push_str(&format!("{pad}- {}\n", scalar(e)));
+                }
+            }
+        }
+        _ => out.push_str(&format!("{pad}{}\n", scalar(v))),
+    }
+}
+
+fn scalar(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Array(a) => format!("[{}]", a.iter().map(scalar).collect::<Vec<_>>().join(", ")),
+        serde_json::Value::Object(_) => "{}".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Write what the archive keeps besides the samples, without decoding any:
+/// each track's `.yaml` sidecars, as they were (checked by hash), and
+/// `<archive>.yaml`, the whole metadata.
+pub fn unpack_meta(path: &Path, outdir: &Path, only: Option<usize>) -> Result<()> {
+    let o = open(path)?;
+    std::fs::create_dir_all(outdir)?;
+    for (k, sm) in o.meta.sources.iter().enumerate() {
+        if only.is_some_and(|t| t != k) {
+            continue;
+        }
+        for sc in &sm.sidecars {
+            let name = Path::new(&sc.name).file_name().context("bad sidecar name in the archive")?;
+            if hex(&Sha256::digest(&sc.data)) != sc.sha256 {
+                bail!("{}: the stored {} does not match its hash", sm.name, sc.name);
+            }
+            std::fs::write(outdir.join(name), &sc.data)?;
+            println!("{}", outdir.join(name).display());
+        }
+    }
+    let stem = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "archive.rfx".into());
+    let y = outdir.join(format!("{stem}.yaml"));
+    std::fs::write(&y, meta_yaml(path)?)?;
+    println!("{}", y.display());
     Ok(())
 }
