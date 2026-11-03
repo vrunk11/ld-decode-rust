@@ -1,6 +1,8 @@
 //! `rfx`: several RF captures of one disc in a single lossless file.
 pub mod align;
 pub mod ebml;
+pub mod edit;
+pub mod fmt;
 pub mod gpu;
 mod gpupipe;
 pub mod io;

@@ -25,7 +25,7 @@ pub fn precision(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Res
         .map(|&q| -> Result<Vec<i32>> {
             let s0 = q * s;
             let n = s.min(sm.words as usize - s0);
-            Ok(read_words(&p.files[k], sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect())
+            Ok(read_words(&p.files[k], sm.fmt(), sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect())
         })
         .collect::<Result<_>>()?;
     let n: f64 = ys.iter().map(|y| y.len() as f64).sum();

@@ -4,6 +4,7 @@
 //! frames (VBI codes, from pass 0) that every capture has, so the content
 //! cancels out of the comparison.
 use crate::align::Field;
+use crate::fmt::Fmt;
 use crate::io::read_words;
 use crate::pred::Preset;
 use crate::seg;
@@ -40,7 +41,7 @@ fn first_by_key(f: &[Field]) -> HashMap<Key, usize> {
 
 /// Cost of the first `nwin` windows of `win` samples at frames all captures
 /// share (taken evenly between 20% and 80% of the first capture's frames).
-pub fn scores(inputs: &[PathBuf], fields: &[&[Field]], nwin: usize, win: usize) -> Result<Vec<Score>> {
+pub fn scores(inputs: &[PathBuf], fmts: &[Fmt], fields: &[&[Field]], nwin: usize, win: usize) -> Result<Vec<Score>> {
     let maps: Vec<HashMap<Key, usize>> = fields.iter().map(|f| first_by_key(f)).collect();
     let mut common: Vec<(f64, Key)> = maps[0]
         .iter()
@@ -60,13 +61,13 @@ pub fn scores(inputs: &[PathBuf], fields: &[&[Field]], nwin: usize, win: usize) 
         .par_iter()
         .map(|&(i, w)| {
             let size = files[i].metadata().ok()?.len();
-            let words = size / 2;
+            let words = fmts[i].samples(size);
             let f = &fields[i][maps[i][picks[w]]];
             let start = *f.lines.first()? as i64;
             if start < 0 || (start as u64) + win as u64 > words {
                 return None;
             }
-            let probe = read_words(&files[i], words, start, win, 0).ok()?;
+            let probe = read_words(&files[i], fmts[i], words, start, win, 0).ok()?;
             let shift = probe.iter().fold(0i32, |a, &v| a | v).trailing_zeros().min(15);
             let y: Vec<i32> = probe.iter().map(|&v| v >> shift).collect();
             let mean = (y.iter().map(|&v| i64::from(v)).sum::<i64>() as f64 / win as f64).round() as i32;
@@ -114,7 +115,7 @@ const MIN_SHARED: usize = 50;
 /// first. A group whose noise cannot be compared (too few frames in common
 /// to all its captures) keeps the order given. Returns the permutation (the
 /// original index of each place) and the scores by original index.
-pub fn plan(inputs: &[PathBuf], fields: &[Vec<Field>]) -> (Vec<usize>, Vec<Option<f64>>) {
+pub fn plan(inputs: &[PathBuf], fmts: &[Fmt], fields: &[Vec<Field>]) -> (Vec<usize>, Vec<Option<f64>>) {
     let n = inputs.len();
     let maps: Vec<HashMap<Key, usize>> = fields.iter().map(|f| first_by_key(f)).collect();
     let mut group: Vec<usize> = (0..n).collect();
@@ -149,7 +150,8 @@ pub fn plan(inputs: &[PathBuf], fields: &[Vec<Field>]) -> (Vec<usize>, Vec<Optio
         if m.len() > 1 {
             let sub_inputs: Vec<PathBuf> = m.iter().map(|&i| inputs[i].clone()).collect();
             let sub_fields: Vec<&[Field]> = m.iter().map(|&i| fields[i].as_slice()).collect();
-            match scores(&sub_inputs, &sub_fields, 8, 262144) {
+            let sub_fmts: Vec<Fmt> = m.iter().map(|&i| fmts[i]).collect();
+            match scores(&sub_inputs, &sub_fmts, &sub_fields, 8, 262144) {
                 Ok(sc) => {
                     let mut ranked: Vec<(usize, f64)> = m.iter().zip(&sc).map(|(&i, s)| (i, s.cost())).collect();
                     for &(i, c) in &ranked {

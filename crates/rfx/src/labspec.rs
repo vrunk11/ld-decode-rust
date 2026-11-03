@@ -111,7 +111,7 @@ pub fn spectrum(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Resu
         .map(|&q| -> Result<(Vec<f64>, Vec<f64>)> {
             let s0 = q * s;
             let n = s.min(sm.words as usize - s0);
-            let y: Vec<i32> = read_words(&p.files[k], sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let y: Vec<i32> = read_words(&p.files[k], sm.fmt(), sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
             let win = if use_ref { refs.window(k, s0 as i64, n)? } else { Vec::new() };
             let preds = seg::predict_all(&y, &pre, use_ref, &win);
             Ok((y.iter().map(|&v| f64::from(v)).collect(), y.iter().zip(&preds).map(|(a, b)| f64::from(a - b)).collect()))
@@ -209,7 +209,7 @@ pub fn cascade(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Resul
         .map(|&q| -> Result<Vec<f64>> {
             let s0 = q * s;
             let n = s.min(sm.words as usize - s0);
-            let y: Vec<i32> = read_words(&p.files[k], sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let y: Vec<i32> = read_words(&p.files[k], sm.fmt(), sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
             let win = if use_ref { refs.window(k, s0 as i64, n)? } else { Vec::new() };
             let preds = seg::predict_all(&y, &pre, use_ref, &win);
             let e: Vec<i32> = y.iter().zip(&preds).map(|(a, b)| a - b).collect();

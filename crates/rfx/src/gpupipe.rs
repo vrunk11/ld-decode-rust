@@ -12,8 +12,9 @@
 //! chunk can be going up while another runs and a third comes back; the
 //! device buffers of a chunk travel with it and return to a small pool.
 use crate::ebml;
+use crate::fmt::Fmt;
 use crate::gpu::{self, Dev, GpuSeg};
-use crate::io::{read_exact_at, write_all_at};
+use crate::io::read_exact_at;
 use crate::pack::{Refs, SrcMeta};
 use crate::pred::Preset;
 use crate::seg;
@@ -187,7 +188,7 @@ pub(crate) fn pack_source(
                 let c = build_chunk(segs, s, rw, use_ref, sm.words, |q, inp, win| {
                     let s0 = q * s;
                     let n = s.min(sm.words as usize - s0);
-crate::io::read_words_into(&files[k], sm.words, s0 as i64, &mut inp[..n], sm.shift, sm.mean)?;
+crate::io::read_words_into(&files[k], sm.fmt(), sm.words, s0 as i64, &mut inp[..n], sm.shift, sm.mean)?;
                     if use_ref {
                         refs.window_into(k, s0 as i64, n, l, win)?;
                     }
@@ -257,6 +258,7 @@ pub(crate) fn unpack_source(
     archive: &File,
     refs: &Refs,
     out: &File,
+    out_fmt: Fmt,
 ) -> Result<()> {
     let use_ref = !sm.refs.is_empty();
     let nseg = (sm.words as usize).div_ceil(s);
@@ -294,11 +296,8 @@ pub(crate) fn unpack_source(
             let _g = Busy::new(1);
             c.segs.par_iter().enumerate().try_for_each(|(i, &q)| -> Result<()> {
                 let n = c.lens[i] as usize;
-                let mut raw = Vec::with_capacity(n * 2);
-                for &v in &ys[i * s..i * s + n] {
-                    raw.extend_from_slice(&(((v + sm.mean) << sm.shift) as i16).to_le_bytes());
-                }
-                write_all_at(out, &raw, (q * s) as u64 * 2)?;
+                let vals: Vec<i32> = ys[i * s..i * s + n].iter().map(|&v| (v + sm.mean) << sm.shift).collect();
+                out_fmt.store(out, (q * s) as u64, &vals)?;
                 Ok(())
             })?;
         }

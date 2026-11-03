@@ -16,6 +16,7 @@
 use crate::align::{build_table, parse_pass0, run_pass0, LagTable, HYST_COARSE, HYST_FINE};
 use crate::ebml;
 use crate::gpu::GpuSeg;
+use crate::fmt::Fmt;
 use crate::io::{read_exact_at, read_words, write_all_at};
 use crate::pred::Preset;
 use crate::seg::{self, refwin_len};
@@ -37,9 +38,17 @@ pub struct SrcMeta {
     pub name: String,
     pub size: u64,
     pub sha256: String,
-    /// 16-bit words of the file; an odd last byte is in `tail`.
+    /// Samples of the file (what `fmt` makes of its bytes); the bytes past the
+    /// last whole group are in `tail`.
     pub words: u64,
     pub tail: Vec<u8>,
+    /// Format of the original file (`s16`, `r16`, `s8`, `r8`, `lds`).
+    #[serde(default = "default_fmt")]
+    pub fmt: String,
+    /// SHA-256 of the samples (as little-endian i32 on the 16-bit scale), to
+    /// check a file extracted in another format.
+    #[serde(default)]
+    pub sample_sha256: String,
     /// Low bits that are zero in every word (the Duplicator's 10 bits in 16).
     pub shift: u32,
     pub mean: i32,
@@ -73,6 +82,10 @@ pub struct SrcMeta {
     /// Files that sit beside the capture (its `.yaml`), kept as they were.
     #[serde(default)]
     pub sidecars: Vec<Sidecar>,
+    /// The compressed file the capture came from (`.ldf`, `.flac`), when it was
+    /// decoded to raw samples: only the samples are kept.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// A small file stored whole in the metadata and given back by `unpack`.
@@ -99,7 +112,15 @@ fn find_sidecars(capture: &Path) -> Vec<Sidecar> {
     }
 }
 
+fn default_fmt() -> String {
+    "s16".into()
+}
+
 impl SrcMeta {
+    pub(crate) fn fmt(&self) -> Fmt {
+        Fmt::parse(&self.fmt).unwrap_or(Fmt::S16)
+    }
+
     pub(crate) fn preset(&self) -> Preset {
         let solo = if self.solo == 0 { self.own } else { self.solo };
         Preset { own: self.own, solo, plain: self.own, taps: self.taps, ntop: self.ntop, ttaps: self.ttaps, stride: self.stride, every: self.every, lam_bits: self.lam_bits }
@@ -164,30 +185,54 @@ struct Stats {
     sha: String,
     shift: u32,
     mean: i32,
+    sample_sha: String,
 }
 
-fn file_stats(path: &Path) -> Result<Stats> {
+/// Hash of samples as little-endian i32.
+pub(crate) fn hash_samples(f: &File, fmt: Fmt, count: u64) -> Result<String> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0i32; 1 << 22];
+    let mut at = 0u64;
+    while at < count {
+        let n = ((count - at) as usize).min(buf.len());
+        fmt.load(f, count, at as i64, &mut buf[..n])?;
+        for v in &buf[..n] {
+            h.update(v.to_le_bytes());
+        }
+        at += n as u64;
+    }
+    Ok(hex(&h.finalize()))
+}
+
+fn file_stats(path: &Path, fmt: Fmt) -> Result<Stats> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let size = f.metadata()?.len();
-    let words = size / 2;
+    let words = fmt.samples(size);
     let mut hasher = Sha256::new();
-    let (mut or, mut sum) = (0u16, 0i64);
     let mut buf = vec![0u8; 1 << 24];
     let mut off = 0u64;
     while off < size {
         let n = ((size - off) as usize).min(buf.len());
         read_exact_at(&f, &mut buf[..n], off)?;
         hasher.update(&buf[..n]);
-        for w in buf[..n / 2 * 2].chunks_exact(2) {
-            let v = i16::from_le_bytes([w[0], w[1]]);
-            or |= v as u16;
+        off += n as u64;
+    }
+    let (mut or, mut sum) = (0u32, 0i64);
+    let mut vals = vec![0i32; 1 << 22];
+    let mut at = 0u64;
+    while at < words {
+        let n = ((words - at) as usize).min(vals.len());
+        fmt.load(&f, words, at as i64, &mut vals[..n])?;
+        for &v in &vals[..n] {
+            or |= v as u32;
             sum += i64::from(v);
         }
-        off += n as u64;
+        at += n as u64;
     }
     let shift = if or == 0 { 0 } else { or.trailing_zeros() };
     let mean = if words == 0 { 0 } else { ((sum >> shift) as f64 / words as f64).round() as i32 };
-    Ok(Stats { size, sha: hex(&hasher.finalize()), shift, mean })
+    let sample_sha = hash_samples(&f, fmt, words)?;
+    Ok(Stats { size, sha: hex(&hasher.finalize()), shift, mean, sample_sha })
 }
 
 /// Source `j`'s files, as the predictor of a later source reads them.
@@ -248,7 +293,7 @@ impl Refs<'_> {
                     continue;
                 }
                 let base = (lo - lag - p0) as usize;
-                crate::io::add_words_scaled(&self.files[j], lo, hi, rj.shift, rj.mean, w, &mut dst[base..base + (hi - lo) as usize])?;
+                crate::io::add_words_scaled(&self.files[j], rj.fmt(), rj.words, lo, hi, rj.shift, rj.mean, w, &mut dst[base..base + (hi - lo) as usize])?;
             }
             Ok(())
         };
@@ -290,7 +335,7 @@ fn choose_refs(refs: &Refs, k: usize) -> Result<(Vec<usize>, Vec<f32>)> {
     let costs: Vec<f64> = work
         .par_iter()
         .map(|&(r, s0)| -> Result<f64> {
-            let y: Vec<i32> = read_words(&refs.files[k], sm.words, s0 as i64, win, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let y: Vec<i32> = read_words(&refs.files[k], sm.fmt(), sm.words, s0 as i64, win, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
             let w = refs.window_with(k, s0 as i64, win, &[(sm.refs[r], 1.0)])?;
             let preds = seg::predict_all(&y, &pre, true, &w);
             let res: Vec<i32> = y.iter().zip(&preds).map(|(a, b)| a - b).collect();
@@ -320,43 +365,102 @@ pub(crate) struct Prepared {
     pub(crate) meta: Meta,
     pub(crate) tables: HashMap<(usize, usize), LagTable>,
     pub(crate) files: Vec<File>,
+    /// Raw files made from compressed captures, removed with this.
+    pub(crate) work: Option<PathBuf>,
 }
 
-pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Prepared> {
-    if inputs.is_empty() {
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if let Some(w) = &self.work {
+            let _ = std::fs::remove_dir_all(w);
+        }
+    }
+}
+
+/// How an input stands when an archive is edited: carried over from another
+/// archive (`carry`: its metadata there), and whether its coding can be
+/// copied as it is (`frozen`: every reference it was coded with is still
+/// there, before it).
+#[derive(Clone, Default)]
+pub(crate) struct Spec {
+    pub(crate) carry: Option<SrcMeta>,
+    pub(crate) frozen: bool,
+}
+
+pub(crate) fn prepare(given: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Prepared> {
+    prepare_with(given, &vec![Spec::default(); given.len()], &HashMap::new(), out, o)
+}
+
+/// [`prepare`] for a list of captures some of which come from other archives:
+/// the frozen ones keep their metadata and lag tables (`known`, by their
+/// places in `given`), the others are worked out as usual against everything
+/// before them.
+pub(crate) fn prepare_with(given: &[PathBuf], specs: &[Spec], known: &HashMap<(usize, usize), LagTable>, out: &Path, o: &PackOpts) -> Result<Prepared> {
+    if given.is_empty() {
         bail!("no input");
     }
+    let edit = specs.iter().any(|s| s.carry.is_some());
+    // Compressed captures (FLAC, Ogg-FLAC) are decoded to raw 16-bit files first:
+    // the references are read at arbitrary positions.
+    let (converted, work) = decode_compressed(given, out, o)?;
+    let inputs: &[PathBuf] = &converted;
+    let origs: Vec<PathBuf> = given.to_vec();
     let preset = Preset::level(o.level).with_context(|| format!("level {} is not 1 to 4", o.level))?;
     let mut names = Vec::new();
-    for p in inputs {
-        let n = p.file_name().context("input has no file name")?.to_string_lossy().into_owned();
+    for (p, sp) in inputs.iter().zip(specs) {
+        let n = match &sp.carry {
+            Some(c) => c.name.clone(),
+            None => p.file_name().context("input has no file name")?.to_string_lossy().into_owned(),
+        };
         if names.contains(&n) {
-            bail!("two inputs are named {n}: the archive keeps file names only");
+            bail!("two captures are named {n}: the archive keeps file names only");
         }
         names.push(n);
     }
-    eprintln!("hashing and scanning {} files", inputs.len());
-    let stats: Vec<Stats> = inputs.par_iter().map(|p| file_stats(p)).collect::<Result<_>>()?;
+    let fmts: Vec<Fmt> = inputs
+        .iter()
+        .zip(specs)
+        .map(|(p, sp)| match &sp.carry {
+            Some(c) => Ok(c.fmt()),
+            None => input_fmt(p, &o.format),
+        })
+        .collect::<Result<_>>()?;
+    if specs.iter().any(|s| s.carry.is_none()) {
+        eprintln!("hashing and scanning {} files", specs.iter().filter(|s| s.carry.is_none()).count());
+    }
+    let stats: Vec<Stats> = inputs
+        .par_iter()
+        .zip(&fmts)
+        .zip(specs)
+        .map(|((p, f), sp)| match &sp.carry {
+            Some(c) => Ok(Stats { size: c.size, sha: c.sha256.clone(), shift: c.shift, mean: c.mean, sample_sha: c.sample_sha256.clone() }),
+            None => file_stats(p, *f),
+        })
+        .collect::<Result<_>>()?;
 
     // Where the lines of every capture are, from ld-decode's pass 0 (in the
     // order given), then the order to code them in.
+    let need_tables = specs.iter().enumerate().any(|(k, s)| !s.frozen && k >= 1);
     let mut fields: Vec<Vec<crate::align::Field>> = Vec::new();
-    if inputs.len() > 1 {
+    if inputs.len() > 1 && need_tables {
         let dir = match &o.pass0_dir {
             Some(d) => d.clone(),
             None => {
                 let d = out.with_extension("pass0");
                 eprintln!("locating the lines of every capture (ld-decode pass 0)");
-                run_pass0(&o.ld_decode, inputs, o.rate_mhz, &o.format, &d)?;
+                if fmts.iter().any(|f| *f != fmts[0]) {
+                    bail!("the captures are not all in one format: the pass 0 of ld-decode takes one");
+                }
+                run_pass0(&o.ld_decode, inputs, o.rate_mhz, fmts[0].name(), &d)?;
                 d
             }
         };
         fields = (0..inputs.len()).map(|i| parse_pass0(&dir.join(format!("pass0_{i}.txt")))).collect::<Result<_>>()?;
     }
-    let mut noise: Vec<Option<f64>> = vec![None; inputs.len()];
+    let mut noise: Vec<Option<f64>> = specs.iter().map(|s| s.carry.as_ref().and_then(|c| c.noise)).collect();
     let mut ord: Vec<usize> = (0..inputs.len()).collect();
-    if inputs.len() > 1 && o.order == OrderMode::Auto {
-        let (order, scores) = crate::order::plan(inputs, &fields);
+    if inputs.len() > 1 && o.order == OrderMode::Auto && !edit {
+        let (order, scores) = crate::order::plan(inputs, &fmts, &fields);
         ord = order;
         noise = scores;
         if ord.iter().enumerate().any(|(k, &i)| k != i) {
@@ -372,9 +476,12 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
     // From here on, everything is in coding order; `ord[k]` is the place on
     // the command line.
     let inputs: Vec<PathBuf> = ord.iter().map(|&i| inputs[i].clone()).collect();
+    let origs: Vec<PathBuf> = ord.iter().map(|&i| origs[i].clone()).collect();
     let names: Vec<String> = ord.iter().map(|&i| names[i].clone()).collect();
     let stats: Vec<Stats> = ord.iter().map(|&i| stats[i].clone()).collect();
+    let fmts: Vec<Fmt> = ord.iter().map(|&i| fmts[i]).collect();
     let noise: Vec<Option<f64>> = ord.iter().map(|&i| noise[i]).collect();
+    let specs: Vec<Spec> = ord.iter().map(|&i| specs[i].clone()).collect();
     let mut tables: HashMap<(usize, usize), LagTable> = HashMap::new();
     let fields: Vec<Vec<crate::align::Field>> = {
         let mut slots: Vec<Option<Vec<crate::align::Field>>> = fields.into_iter().map(Some).collect();
@@ -384,15 +491,19 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
             ord.iter().map(|&i| slots[i].take().expect("each once")).collect()
         }
     };
-    if inputs.len() > 1 {
-        for k in 1..inputs.len() {
-            for j in 0..k {
-                match build_table(&fields[k], &fields[j], stats[k].size / 2, HYST_FINE) {
-                    Some(t) => {
-                        tables.insert((k, j), t);
-                    }
-                    None => eprintln!("{} and {} share no frame: not used as a reference", names[k], names[j]),
+    for k in 1..inputs.len() {
+        for j in 0..k {
+            if specs[k].frozen {
+                if let Some(t) = known.get(&(k, j)) {
+                    tables.insert((k, j), t.clone());
                 }
+                continue;
+            }
+            match build_table(&fields[k], &fields[j], fmts[k].samples(stats[k].size), HYST_FINE) {
+                Some(t) => {
+                    tables.insert((k, j), t);
+                }
+                None => eprintln!("{} and {} share no frame: not used as a reference", names[k], names[j]),
             }
         }
     }
@@ -401,21 +512,24 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
         .iter()
         .enumerate()
         .map(|(k, p)| {
+            if let (true, Some(c)) = (specs[k].frozen, &specs[k].carry) {
+                return Ok(SrcMeta { position: k, ..c.clone() });
+            }
             let st = &stats[k];
-            let tail = if st.size % 2 == 1 {
-                let f = File::open(p)?;
-                let mut b = [0u8; 1];
-                read_exact_at(&f, &mut b, st.size - 1)?;
-                b.to_vec()
-            } else {
-                Vec::new()
-            };
+            let covered = fmts[k].covered(st.size);
+            let mut tail = vec![0u8; (st.size - covered) as usize];
+            if !tail.is_empty() {
+                read_exact_at(&File::open(p)?, &mut tail, covered)?;
+            }
+            let c = specs[k].carry.as_ref();
             Ok(SrcMeta {
                 name: names[k].clone(),
                 size: st.size,
                 sha256: st.sha.clone(),
-                words: st.size / 2,
+                words: fmts[k].samples(st.size),
                 tail,
+                fmt: fmts[k].name().to_string(),
+                sample_sha256: st.sample_sha.clone(),
                 shift: st.shift,
                 mean: st.mean,
                 own: preset.own,
@@ -428,9 +542,16 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
                 lam_bits: preset.lam_bits,
                 refs: (0..k).filter(|j| tables.contains_key(&(k, *j))).collect(),
                 weights: Vec::new(),
-                position: ord[k],
+                position: if edit { k } else { ord[k] },
                 noise: noise[k],
-                sidecars: find_sidecars(p),
+                sidecars: match c {
+                    Some(c) => c.sidecars.clone(),
+                    None => find_sidecars(&origs[k]),
+                },
+                origin: match c {
+                    Some(c) => c.origin.clone(),
+                    None => (origs[k] != *p).then(|| origs[k].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+                },
             })
         })
         .collect::<Result<_>>()?;
@@ -439,11 +560,12 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
     // Weigh the references of each capture by how well each predicts it.
     let mut meta = meta;
     if inputs.len() > 1 {
-        let choice: Vec<(Vec<usize>, Vec<f32>)> = {
+        let choice: Vec<Option<(Vec<usize>, Vec<f32>)>> = {
             let refs = Refs { files: &files, meta: &meta, tables: &tables };
-            (0..inputs.len()).map(|k| choose_refs(&refs, k)).collect::<Result<_>>()?
+            (0..inputs.len()).map(|k| if specs[k].frozen { Ok(None) } else { choose_refs(&refs, k).map(Some) }).collect::<Result<_>>()?
         };
-        for (k, (r, w)) in choice.into_iter().enumerate() {
+        for (k, ch) in choice.into_iter().enumerate() {
+            let Some((r, w)) = ch else { continue };
             for j in meta.sources[k].refs.clone() {
                 if !r.contains(&j) {
                     tables.remove(&(k, j));
@@ -460,6 +582,9 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
         // their own (and a shorter own history) against the plain mean, and keep
         // what costs less on a few windows.
         for k in 0..inputs.len() {
+            if specs[k].frozen {
+                continue;
+            }
             let nr = meta.sources[k].refs.len();
             meta.sources[k].own = preset.plain;
             meta.sources[k].ntop = 0;
@@ -489,23 +614,19 @@ pub(crate) fn prepare(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Pr
             }
         }
     }
-    Ok(Prepared { inputs, names, meta, tables, files })
+    Ok(Prepared { inputs, names, meta, tables, files, work })
 }
 
-pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceReport>> {
-    let p = prepare(inputs, out, o)?;
-    let Prepared { inputs, names, meta, tables, files } = &p;
-    let refs = Refs { files, meta, tables };
-
-    let n_src = inputs.len() as u64;
-    let mut w = std::io::BufWriter::new(File::create(out).with_context(|| format!("creating {}", out.display()))?);
+/// The head of an archive: tracks, metadata and lag tables.
+pub(crate) fn write_head(w: &mut impl Write, meta: &Meta, tables: &HashMap<(usize, usize), LagTable>) -> Result<()> {
+    let n_src = meta.sources.len() as u64;
     w.write_all(&ebml::file_head())?;
     w.write_all(&ebml::info())?;
-    let mut entries: Vec<Vec<u8>> = names.iter().enumerate().map(|(k, n)| ebml::track_entry(k as u64 + 1, CODEC_PRED, n)).collect();
+    let mut entries: Vec<Vec<u8>> = meta.sources.iter().enumerate().map(|(k, s)| ebml::track_entry(k as u64 + 1, CODEC_PRED, &s.name)).collect();
     entries.push(ebml::track_entry(n_src + 1, CODEC_META, "meta"));
     entries.push(ebml::track_entry(n_src + 2, CODEC_MAP, "map"));
     w.write_all(&ebml::tracks(&entries))?;
-    w.write_all(&ebml::cluster(0, n_src + 1, &serde_json::to_vec(&meta)?))?;
+    w.write_all(&ebml::cluster(0, n_src + 1, &serde_json::to_vec(meta)?))?;
     let mut pairs: Vec<_> = tables.keys().copied().collect();
     pairs.sort_unstable();
     for (i, (k, j)) in pairs.iter().enumerate() {
@@ -515,11 +636,46 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
         b.extend(tables[&(*k, *j)].encode());
         w.write_all(&ebml::cluster(i as u64, n_src + 2, &b))?;
     }
+    Ok(())
+}
+
+/// Copy the coded blocks of source `src` of `arch` as track `k` of `w`.
+pub(crate) fn copy_blocks(w: &mut impl Write, arch: &Opened, src: usize, k: usize) -> Result<u64> {
+    let mut order: Vec<(&u64, &(u64, u64))> = arch.blocks[src].iter().collect();
+    order.sort();
+    let mut total = 0;
+    for (ts, (off, len)) in order {
+        let mut bytes = vec![0u8; *len as usize];
+        read_exact_at(&arch.file, &mut bytes, *off)?;
+        total += len;
+        w.write_all(&ebml::cluster(*ts, k as u64 + 1, &bytes))?;
+    }
+    Ok(total)
+}
+
+pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceReport>> {
+    let p = prepare(inputs, out, o)?;
+    pack_prepared(&p, out, o, &vec![None; p.inputs.len()])
+}
+
+/// Write the archive for `p`; the sources with a place in `copy` take their
+/// coded blocks from there instead of being coded again.
+pub(crate) fn pack_prepared(p: &Prepared, out: &Path, o: &PackOpts, copy: &[Option<(&Opened, usize)>]) -> Result<Vec<SourceReport>> {
+    let Prepared { inputs, names: _, meta, tables, files, .. } = p;
+    let refs = Refs { files, meta, tables };
+    let mut w = std::io::BufWriter::new(File::create(out).with_context(|| format!("creating {}", out.display()))?);
+    write_head(&mut w, meta, tables)?;
 
     let mut report = Vec::new();
     let s = o.segment;
     for k in 0..inputs.len() {
         let sm = &meta.sources[k];
+        if let Some((arch, src)) = copy[k] {
+            let packed = copy_blocks(&mut w, arch, src, k)?;
+            eprintln!("{}: {} -> {} bytes copied", sm.name, sm.size, packed);
+            report.push(SourceReport { name: sm.name.clone(), size: sm.size, packed, refs: sm.refs.len() });
+            continue;
+        }
         let pre = sm.preset();
         let use_ref = !sm.refs.is_empty();
         let nseg = (sm.words as usize).div_ceil(s);
@@ -537,7 +693,7 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
                 .map(|&g| {
                     let s0 = g * s;
                     let n = s.min(sm.words as usize - s0);
-                    let y: Vec<i32> = read_words(&files[k], sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+                    let y: Vec<i32> = read_words(&files[k], sm.fmt(), sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
                     let win = if use_ref { refs.window(k, s0 as i64, n)? } else { Vec::new() };
                     let bytes = seg::encode(&y, &pre, use_ref, &win);
                     if o.verify {
@@ -572,14 +728,14 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
     Ok(report)
 }
 
-struct Opened {
-    meta: Meta,
-    tables: HashMap<(usize, usize), LagTable>,
-    blocks: Vec<HashMap<u64, (u64, u64)>>,
-    file: File,
+pub(crate) struct Opened {
+    pub(crate) meta: Meta,
+    pub(crate) tables: HashMap<(usize, usize), LagTable>,
+    pub(crate) blocks: Vec<HashMap<u64, (u64, u64)>>,
+    pub(crate) file: File,
 }
 
-fn open(path: &Path) -> Result<Opened> {
+pub(crate) fn open(path: &Path) -> Result<Opened> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let idx = ebml::scan(&file)?;
     let track_of = |codec: &str| idx.codecs.iter().find(|(_, c)| c == codec).map(|(n, _)| *n);
@@ -640,7 +796,26 @@ pub fn info(path: &Path) -> Result<()> {
 /// Rebuild the original files in `outdir`, each checked against its SHA-256.
 /// With `only`, just that source (the earlier ones are decoded too, as its
 /// references, and removed).
-pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -> Result<()> {
+/// What `unpack` writes when it is not the capture as it came.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutFmt {
+    Raw(Fmt),
+    /// FLAC (`.flac`) or Ogg-FLAC (`.ldf`), made by ffmpeg like ld-decode's own.
+    Flac,
+    Ldf,
+}
+
+impl OutFmt {
+    pub fn parse(s: &str) -> Option<OutFmt> {
+        match s {
+            "flac" => Some(OutFmt::Flac),
+            "ldf" => Some(OutFmt::Ldf),
+            other => Fmt::parse(other).map(OutFmt::Raw),
+        }
+    }
+}
+
+pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device, as_fmt: Option<OutFmt>) -> Result<()> {
     let o = open(path)?;
     let meta = &o.meta;
     std::fs::create_dir_all(outdir)?;
@@ -664,7 +839,7 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -
         let nseg = (sm.words as usize).div_ceil(s);
         let t0 = std::time::Instant::now();
         if device == Device::Gpu {
-            crate::gpupipe::unpack_source(k, sm, &pre, s, &o.blocks[k], &o.file, &refs, &outs[k])?;
+            crate::gpupipe::unpack_source(k, sm, &pre, s, &o.blocks[k], &o.file, &refs, &outs[k], sm.fmt())?;
         }
         let chunk = rayon::current_num_threads() * 4;
         let nseg_cpu = if device == Device::Gpu { 0 } else { nseg };
@@ -678,16 +853,13 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -
                 read_exact_at(&o.file, &mut bytes, off)?;
                 let win = if use_ref { refs.window(k, s0 as i64, n)? } else { Vec::new() };
                 let y = seg::decode(&bytes, n, &pre, use_ref, &win).with_context(|| format!("{}: segment {g} is corrupt", sm.name))?;
-                let mut raw = Vec::with_capacity(n * 2);
-                for v in y {
-                    raw.extend_from_slice(&(((v + sm.mean) << sm.shift) as i16).to_le_bytes());
-                }
-                write_all_at(&outs[k], &raw, s0 as u64 * 2)?;
+                let vals: Vec<i32> = y.iter().map(|&v| (v + sm.mean) << sm.shift).collect();
+                sm.fmt().store(&outs[k], s0 as u64, &vals)?;
                 Ok(())
             })?;
         }
         if !sm.tail.is_empty() {
-            write_all_at(&outs[k], &sm.tail, sm.words * 2)?;
+            write_all_at(&outs[k], &sm.tail, sm.fmt().covered(sm.size))?;
         }
         let secs = t0.elapsed().as_secs_f64();
         let got = {
@@ -725,7 +897,48 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -
                 let _ = std::fs::remove_file(outdir.join(&sm.name));
             }
         }
+    } else {
+        drop(outs);
     }
+    // Another format asked for: the files above are the captures as they were
+    // given; each is converted sample by sample and checked by the hash of its
+    // samples.
+    if let Some(target) = as_fmt {
+        for (k, sm) in meta.sources[..=last].iter().enumerate() {
+            if only.is_some_and(|keep| keep != k) || target == OutFmt::Raw(sm.fmt()) {
+                continue;
+            }
+            match target {
+                OutFmt::Raw(t) => convert_file(&outdir.join(&sm.name), sm, t, outdir)?,
+                OutFmt::Flac | OutFmt::Ldf => encode_flac(&outdir.join(&sm.name), sm, target == OutFmt::Ldf, outdir)?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write the samples of `src` (in the format of `sm`) as a `target` file in
+/// `outdir`, named with the extension of the new format; remove `src`.
+fn convert_file(src: &Path, sm: &SrcMeta, target: Fmt, outdir: &Path) -> Result<()> {
+    let name = Path::new(&sm.name).with_extension(target.name());
+    let dst_path = outdir.join(name.file_name().context("bad name")?);
+    let from = File::open(src)?;
+    let dst = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&dst_path)?;
+    let mut buf = vec![0i32; 1 << 22];
+    let mut at = 0u64;
+    while at < sm.words {
+        let n = ((sm.words - at) as usize).min(buf.len());
+        sm.fmt().load(&from, sm.words, at as i64, &mut buf[..n])?;
+        target.store(&dst, at, &buf[..n]).with_context(|| format!("{}: converting to {}", sm.name, target.name()))?;
+        at += n as u64;
+    }
+    drop(from);
+    let got = hash_samples(&dst, target, sm.words)?;
+    if got != sm.sample_sha256 {
+        bail!("{}: the samples differ after conversion to {}", sm.name, target.name());
+    }
+    std::fs::remove_file(src)?;
+    eprintln!("{} -> {}: samples identical", sm.name, dst_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
     Ok(())
 }
 
@@ -733,7 +946,7 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device) -
 /// CPU against GPU, and the first sample where they differ.
 pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize, with_ref: bool) -> Result<()> {
     let pre = Preset::level(level).context("level 1 to 4")?;
-    let st = file_stats(path)?;
+    let st = file_stats(path, Fmt::S16)?;
     let f = File::open(path)?;
     let words = st.size / 2;
     let mut input = vec![0i32; nseg * segment];
@@ -744,7 +957,7 @@ pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize, with_ref:
     let mut refw = if with_ref { vec![0f32; nseg * rw] } else { Vec::new() };
     for g in 0..nseg {
         let n = segment.min((words as usize).saturating_sub(g * segment));
-        let y: Vec<i32> = read_words(&f, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect();
+        let y: Vec<i32> = read_words(&f, Fmt::S16, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect();
         input[g * segment..g * segment + n].copy_from_slice(&y);
         lens.push(n as i32);
         let ln = n + 2 * pre.taps;
@@ -786,7 +999,7 @@ pub fn gpu_check(path: &Path, level: u32, nseg: usize, segment: usize, with_ref:
 /// Development: single-thread cost of each stage on the first `nseg` segments.
 pub fn bench(path: &Path, level: u32, nseg: usize, segment: usize) -> Result<()> {
     let pre = Preset::level(level).context("level 1 to 4")?;
-    let st = file_stats(path)?;
+    let st = file_stats(path, Fmt::S16)?;
     let f = File::open(path)?;
     let words = st.size / 2;
     let time = |what: &str, n: usize, t0: std::time::Instant| {
@@ -797,7 +1010,7 @@ pub fn bench(path: &Path, level: u32, nseg: usize, segment: usize) -> Result<()>
         let mut total = 0usize;
         for g in 0..nseg {
             let n = segment.min((words as usize).saturating_sub(g * segment));
-            let y: Vec<i32> = read_words(&f, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect();
+            let y: Vec<i32> = read_words(&f, Fmt::S16, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect();
             let win: Vec<f32> = (0..refwin_len(n, &pre)).map(|i| y[(i + 5).min(n - 1)] as f32).collect();
             let t = std::time::Instant::now();
             let preds = seg::predict_all(&y, &pre, use_ref, &win);
@@ -827,12 +1040,12 @@ pub fn bench(path: &Path, level: u32, nseg: usize, segment: usize) -> Result<()>
 /// Development: where the predictor's time goes (single thread, with reference).
 pub fn bench_pred(path: &Path, level: u32, nseg: usize, segment: usize) -> Result<()> {
     let pre = Preset::level(level).context("level 1 to 4")?;
-    let st = file_stats(path)?;
+    let st = file_stats(path, Fmt::S16)?;
     let f = File::open(path)?;
     let words = st.size / 2;
     let n = segment;
     let ys: Vec<Vec<i32>> = (0..nseg)
-        .map(|g| Ok(read_words(&f, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect()))
+        .map(|g| Ok(read_words(&f, Fmt::S16, words, (g * segment) as i64, n, st.shift)?.into_iter().map(|v| v - st.mean).collect()))
         .collect::<Result<_>>()?;
     let win: Vec<f32> = (0..refwin_len(n, &pre)).map(|i| ys[0][(i + 5).min(n - 1)] as f32).collect();
     for (name, p) in [
@@ -868,7 +1081,7 @@ impl Refs<'_> {
                     continue;
                 }
                 let base = (lo - lag - p0) as usize;
-                crate::io::add_words_scaled(&self.files[j], lo, hi, rj.shift, rj.mean, w, &mut out[base..base + (hi - lo) as usize])?;
+                crate::io::add_words_scaled(&self.files[j], rj.fmt(), rj.words, lo, hi, rj.shift, rj.mean, w, &mut out[base..base + (hi - lo) as usize])?;
             }
         }
         Ok(out)
@@ -903,7 +1116,7 @@ pub fn refsel(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Result
         .map(|&q| -> Result<(Vec<f64>, Vec<f64>)> {
             let s0 = q * s;
             let n = s.min(sm.words as usize - s0);
-            let y: Vec<i32> = read_words(&files[k], sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let y: Vec<i32> = read_words(&files[k], sm.fmt(), sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
             let nr = sm.refs.len();
             let all = refs.window_with(k, s0 as i64, n, &sm.refs.iter().map(|&j| (j, 1.0 / nr as f32)).collect::<Vec<_>>())?;
             let mut costs = vec![cost(&y, &all)];
@@ -955,7 +1168,7 @@ fn trial_cost(refs: &Refs, k: usize) -> Result<f64> {
     let costs: Vec<f64> = starts
         .par_iter()
         .map(|&s0| -> Result<f64> {
-            let y: Vec<i32> = read_words(&refs.files[k], sm.words, s0 as i64, win, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let y: Vec<i32> = read_words(&refs.files[k], sm.fmt(), sm.words, s0 as i64, win, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
             let w = refs.window(k, s0 as i64, win)?;
             let preds = seg::predict_all(&y, &pre, true, &w);
             let res: Vec<i32> = y.iter().zip(&preds).map(|(a, b)| a - b).collect();
@@ -963,4 +1176,106 @@ fn trial_cost(refs: &Refs, k: usize) -> Result<f64> {
         })
         .collect::<Result<_>>()?;
     Ok(costs.iter().sum::<f64>() / costs.len() as f64)
+}
+
+/// The format of an input: `format` (`auto` guesses from the extension).
+fn input_fmt(path: &Path, format: &str) -> Result<Fmt> {
+    if matches!(format, "ldf" | "flac") {
+        return Ok(Fmt::S16);
+    }
+    if format == "auto" {
+        Fmt::from_path(path).with_context(|| format!("cannot tell the format of {} from its extension: use --format", path.display()))
+    } else {
+        Fmt::parse(format).with_context(|| format!("unknown format {format}"))
+    }
+}
+
+/// Whether `path` is a compressed capture to decode first.
+fn is_compressed(path: &Path, format: &str) -> bool {
+    matches!(format, "ldf" | "flac")
+        || (format == "auto" && path.extension().is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "ldf" | "flac")))
+}
+
+/// Decode the FLAC and Ogg-FLAC inputs with ffmpeg into raw 16-bit files in a
+/// work directory beside `out`; the other inputs go through as they are.
+/// Returns the list to pack and the work directory, if one was made.
+fn decode_compressed(given: &[PathBuf], out: &Path, o: &PackOpts) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    if !given.iter().any(|p| is_compressed(p, &o.format)) {
+        return Ok((given.to_vec(), None));
+    }
+    let work = out.with_extension("work");
+    std::fs::create_dir_all(&work)?;
+    let ffmpeg = std::env::var("FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let mut list = Vec::new();
+    for p in given {
+        if !is_compressed(p, &o.format) {
+            list.push(p.clone());
+            continue;
+        }
+        let stem = p.file_stem().context("input has no file name")?;
+        let dst = work.join(format!("{}.s16", stem.to_string_lossy()));
+        eprintln!("decoding {} to raw 16-bit samples", p.display());
+        let status = std::process::Command::new(&ffmpeg)
+            .args(["-v", "error", "-y", "-i"])
+            .arg(p)
+            .args(["-f", "s16le", "-acodec", "pcm_s16le"])
+            .arg(&dst)
+            .status()
+            .with_context(|| format!("starting {ffmpeg} (needed for FLAC and .ldf inputs)"))?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&work);
+            bail!("ffmpeg could not decode {}", p.display());
+        }
+        list.push(dst);
+    }
+    Ok((list, Some(work)))
+}
+
+/// Write the capture `src` as FLAC (or Ogg-FLAC, `.ldf`) with ffmpeg, the way
+/// ld-decode's tools do (mono, 16 bits, the rate field `40k`), and check that
+/// decoding it gives back the samples; remove `src`.
+fn encode_flac(src: &Path, sm: &SrcMeta, ogg: bool, outdir: &Path) -> Result<()> {
+    let ffmpeg = std::env::var("FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    // ffmpeg reads 16-bit samples: an .lds capture goes through a raw copy.
+    let raw = if sm.fmt() == Fmt::S16 {
+        src.to_path_buf()
+    } else {
+        let tmp = outdir.join(format!("{}.rfx-tmp.s16", sm.name));
+        let from = File::open(src)?;
+        let dst = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tmp)?;
+        let mut buf = vec![0i32; 1 << 22];
+        let mut at = 0u64;
+        while at < sm.words {
+            let n = ((sm.words - at) as usize).min(buf.len());
+            sm.fmt().load(&from, sm.words, at as i64, &mut buf[..n])?;
+            Fmt::S16.store(&dst, at, &buf[..n]).with_context(|| format!("{}: samples do not fit 16 bits", sm.name))?;
+            at += n as u64;
+        }
+        tmp
+    };
+    let stem = Path::new(&sm.name).with_extension("");
+    let dst_path = outdir.join(format!("{}.{}", stem.to_string_lossy(), if ogg { "ldf" } else { "flac" }));
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.args(["-v", "error", "-y", "-f", "s16le", "-ar", "40k", "-ac", "1", "-i"]).arg(&raw).args(["-c:a", "flac"]);
+    if ogg {
+        cmd.args(["-f", "ogg"]);
+    }
+    let status = cmd.arg(&dst_path).status().with_context(|| format!("starting {ffmpeg}"))?;
+    if !status.success() {
+        bail!("ffmpeg could not encode {}", sm.name);
+    }
+    // Decode it back and compare.
+    let back = outdir.join(format!("{}.rfx-check.s16", sm.name));
+    let status = std::process::Command::new(&ffmpeg).args(["-v", "error", "-y", "-i"]).arg(&dst_path).args(["-f", "s16le", "-acodec", "pcm_s16le"]).arg(&back).status()?;
+    let ok = status.success() && hash_samples(&File::open(&back)?, Fmt::S16, sm.words)? == sm.sample_sha256;
+    let _ = std::fs::remove_file(&back);
+    if raw != src {
+        let _ = std::fs::remove_file(&raw);
+    }
+    if !ok {
+        bail!("{}: the samples differ after encoding with ffmpeg", sm.name);
+    }
+    std::fs::remove_file(src)?;
+    eprintln!("{} -> {}: samples identical", sm.name, dst_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    Ok(())
 }

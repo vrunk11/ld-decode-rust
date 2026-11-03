@@ -1,5 +1,6 @@
 //! Positioned file access: the samples of a source are read and written by
 //! index from many threads at once, so no handle has a cursor of its own.
+use crate::fmt::Fmt;
 use std::fs::File;
 use std::io;
 
@@ -42,74 +43,56 @@ pub fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// `n` 16-bit little-endian words from word index `start` (zero outside the
-/// file's `words` words), each shifted right by `shift`.
-pub fn read_words(f: &File, words: u64, start: i64, n: usize, shift: u32) -> io::Result<Vec<i32>> {
+/// `n` samples from sample index `start` (zero outside the file's `words`
+/// samples), each shifted right by `shift`.
+pub fn read_words(f: &File, fmt: Fmt, words: u64, start: i64, n: usize, shift: u32) -> io::Result<Vec<i32>> {
     let mut out = vec![0i32; n];
-    let lo = start.max(0);
-    let hi = (start + n as i64).min(words as i64);
-    if hi <= lo {
-        return Ok(out);
-    }
-    let mut buf = vec![0u8; (hi - lo) as usize * 2];
-    read_exact_at(f, &mut buf, lo as u64 * 2)?;
-    let base = (lo - start) as usize;
-    for (o, w) in out[base..].iter_mut().zip(buf.chunks_exact(2)) {
-        *o = (i16::from_le_bytes([w[0], w[1]]) >> shift) as i32;
+    fmt.load(f, words, start, &mut out)?;
+    if shift > 0 {
+        out.iter_mut().for_each(|v| *v >>= shift);
     }
     Ok(out)
 }
 
 thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SCRATCH: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Like [`read_words`] into `out` (zeros outside the file), with `sub`
-/// subtracted from each word read.
-pub fn read_words_into(f: &File, words: u64, start: i64, out: &mut [i32], shift: u32, sub: i32) -> io::Result<()> {
+/// subtracted from each sample read.
+pub fn read_words_into(f: &File, fmt: Fmt, words: u64, start: i64, out: &mut [i32], shift: u32, sub: i32) -> io::Result<()> {
     out.fill(0);
     let lo = start.max(0);
     let hi = (start + out.len() as i64).min(words as i64);
     if hi <= lo {
         return Ok(());
     }
-    SCRATCH.with(|s| {
-        let mut buf = s.borrow_mut();
-        buf.resize((hi - lo) as usize * 2, 0);
-        read_exact_at(f, &mut buf, lo as u64 * 2)?;
-        let base = (lo - start) as usize;
-        for (o, w) in out[base..].iter_mut().zip(buf.chunks_exact(2)) {
-            *o = (i16::from_le_bytes([w[0], w[1]]) >> shift) as i32 - sub;
-        }
-        Ok(())
-    })
+    let base = (lo - start) as usize;
+    let n = (hi - lo) as usize;
+    fmt.load(f, words, lo, &mut out[base..base + n])?;
+    for v in &mut out[base..base + n] {
+        *v = (*v >> shift) - sub;
+    }
+    Ok(())
 }
 
-/// Add the words `[lo, hi)` of the file, shifted right by `shift` and minus
-/// `sub`, to `dst` (`dst[0]` for word `lo`).
-pub fn add_words(f: &File, lo: i64, hi: i64, shift: u32, sub: i32, dst: &mut [f32]) -> io::Result<()> {
+/// Add the samples `[lo, hi)` of the file, shifted right by `shift` and minus
+/// `sub`, to `dst` (`dst[0]` for sample `lo`).
+pub fn add_words(f: &File, fmt: Fmt, words: u64, lo: i64, hi: i64, shift: u32, sub: i32, dst: &mut [f32]) -> io::Result<()> {
+    add_words_scaled(f, fmt, words, lo, hi, shift, sub, 1.0, dst)
+}
+
+/// Like [`add_words`] with each term multiplied by `scale` (a product rounded,
+/// then added: no fused multiply-add).
+#[allow(clippy::too_many_arguments)]
+pub fn add_words_scaled(f: &File, fmt: Fmt, words: u64, lo: i64, hi: i64, shift: u32, sub: i32, scale: f32, dst: &mut [f32]) -> io::Result<()> {
     debug_assert!(lo >= 0 && hi - lo == dst.len() as i64);
     SCRATCH.with(|s| {
         let mut buf = s.borrow_mut();
-        buf.resize(dst.len() * 2, 0);
-        read_exact_at(f, &mut buf, lo as u64 * 2)?;
-        for (o, w) in dst.iter_mut().zip(buf.chunks_exact(2)) {
-            let v = (i16::from_le_bytes([w[0], w[1]]) >> shift) as i32 - sub;
-            *o += v as f32;
-        }
-        Ok(())
-    })
-}
-
-/// Like [`add_words`] with each term multiplied by `scale`.
-pub fn add_words_scaled(f: &File, lo: i64, hi: i64, shift: u32, sub: i32, scale: f32, dst: &mut [f32]) -> io::Result<()> {
-    debug_assert!(lo >= 0 && hi - lo == dst.len() as i64);
-    SCRATCH.with(|s| {
-        let mut buf = s.borrow_mut();
-        buf.resize(dst.len() * 2, 0);
-        read_exact_at(f, &mut buf, lo as u64 * 2)?;
-        for (o, w) in dst.iter_mut().zip(buf.chunks_exact(2)) {
-            let v = (i16::from_le_bytes([w[0], w[1]]) >> shift) as i32 - sub;
+        buf.resize(dst.len(), 0);
+        fmt.load(f, words, lo, &mut buf)?;
+        for (o, &w) in dst.iter_mut().zip(buf.iter()) {
+            let v = (w >> shift) - sub;
             *o += scale * v as f32;
         }
         Ok(())

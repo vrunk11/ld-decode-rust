@@ -61,7 +61,7 @@ pub fn residual(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Resu
         .map(|&q| -> Result<Vec<i32>> {
             let s0 = q * s;
             let n = s.min(sm.words as usize - s0);
-            let y: Vec<i32> = read_words(&p.files[k], sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
+            let y: Vec<i32> = read_words(&p.files[k], sm.fmt(), sm.words, s0 as i64, n, sm.shift)?.into_iter().map(|v| v - sm.mean).collect();
             let win = if use_ref { refs.window(k, s0 as i64, n)? } else { Vec::new() };
             let preds = seg::predict_all(&y, &pre, use_ref, &win);
             Ok(y.iter().zip(&preds).map(|(a, b)| a - b).collect())

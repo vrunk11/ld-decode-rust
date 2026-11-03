@@ -34,8 +34,9 @@ enum Cmd {
         /// Capture sample rate in MHz, for pass 0.
         #[arg(long, default_value_t = 75.0)]
         rate_mhz: f64,
-        /// Capture format, for pass 0.
-        #[arg(long, default_value = "s16")]
+        /// Capture format: auto (from the extension), s16, r16, s8, r8, lds, or flac / ldf (decoded
+        /// with ffmpeg to raw 16-bit samples first). Also the format given to pass 0.
+        #[arg(long, default_value = "auto")]
         format: String,
         /// Where the predictor runs: cpu or gpu (OpenCL, same bits).
         #[arg(long, default_value = "cpu")]
@@ -58,6 +59,10 @@ enum Cmd {
         /// Extract only this source (0 is the primary).
         #[arg(long)]
         only: Option<usize>,
+        /// Write the captures in another format (s16, r16, s8, r8, lds, flac or ldf) instead of the
+        /// one they came in; the samples are checked by hash.
+        #[arg(long = "as")]
+        as_format: Option<String>,
     },
     /// Development: compare the CPU and GPU predictors on one file.
     GpuCheck {
@@ -122,6 +127,53 @@ enum Cmd {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
     },
+    /// Merge .rfx files into one (the sources of each after the ones of the
+    /// previous; no source is coded again unless `--recode` is given).
+    Merge {
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Code the sources of the later files again against everything before
+        /// them, so that captures of one disc in different files predict each other.
+        #[arg(long)]
+        recode: bool,
+        #[command(flatten)]
+        work: WorkOpts,
+        #[arg(required = true, num_args = 2..)]
+        inputs: Vec<PathBuf>,
+    },
+    /// Write some of the sources of a .rfx file as a .rfx file of their own.
+    Extract {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Sources to keep (0 is the primary), e.g. 0,3,5.
+        #[arg(long, required = true, value_delimiter = ',')]
+        only: Vec<usize>,
+        #[command(flatten)]
+        work: WorkOpts,
+    },
+    /// Write a .rfx file without some of the sources of another.
+    Remove {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Sources to remove (0 is the primary), e.g. 2,4.
+        #[arg(long, required = true, value_delimiter = ',')]
+        track: Vec<usize>,
+        #[command(flatten)]
+        work: WorkOpts,
+    },
+    /// Write a .rfx file with more captures than another.
+    Add {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[command(flatten)]
+        work: WorkOpts,
+        /// Captures to add, in any format `pack` takes.
+        #[arg(required = true)]
+        captures: Vec<PathBuf>,
+    },
     /// List the sources of a .rfx file.
     Info { input: PathBuf },
 }
@@ -134,10 +186,30 @@ fn main() -> Result<()> {
             let (a, b): (u64, u64) = rep.iter().fold((0, 0), |s, r| (s.0 + r.size, s.1 + r.packed));
             eprintln!("total: {a} -> {b} bytes ({:.1}%)", 100.0 * b as f64 / a.max(1) as f64);
         }
-        Cmd::Unpack { input, outdir, only, device } => unpack(&input, &outdir, only, parse_device(&device)?)?,
+        Cmd::Unpack { input, outdir, only, device, as_format } => {
+            let target = as_format.map(|f| rfx::pack::OutFmt::parse(&f).ok_or_else(|| anyhow::anyhow!("--as: unknown format {f}"))).transpose()?;
+            unpack(&input, &outdir, only, parse_device(&device)?, target)?
+        }
         Cmd::Info { input } => info(&input)?,
+        Cmd::Merge { output, recode, work, inputs } => {
+            let picks = rfx::edit::pick_all(&inputs)?;
+            rfx::edit::assemble(&inputs, &picks, &output, &work_opts(&work)?, recode.then_some(1))?
+        }
+        Cmd::Extract { input, output, only, work } => {
+            let picks = rfx::edit::pick_some(&input, &only)?;
+            rfx::edit::assemble(&[input], &picks, &output, &work_opts(&work)?, None)?
+        }
+        Cmd::Remove { input, output, track, work } => {
+            let picks = rfx::edit::pick_without(&input, &track)?;
+            rfx::edit::assemble(&[input], &picks, &output, &work_opts(&work)?, None)?
+        }
+        Cmd::Add { input, output, captures, work } => {
+            let mut picks = rfx::edit::pick_all(std::slice::from_ref(&input))?;
+            picks.extend(captures.into_iter().map(rfx::edit::Pick::New));
+            rfx::edit::assemble(&[input], &picks, &output, &work_opts(&work)?, None)?
+        }
         Cmd::Lab { what, target, segments, pass0, tones, inputs } => {
-            let opts = PackOpts { order: OrderMode::Given, device: Device::Cpu, level: 3, segment: 262144, verify: false, pass0_dir: Some(pass0), ld_decode: PathBuf::from("ld-decode"), rate_mhz: 75.0, format: "s16".into() };
+            let opts = PackOpts { order: OrderMode::Given, device: Device::Cpu, level: 3, segment: 262144, verify: false, pass0_dir: Some(pass0), ld_decode: PathBuf::from("ld-decode"), rate_mhz: 75.0, format: "auto".into() };
             match what.as_str() {
                 "model" => rfx::labmodel::model(&inputs, &opts, target, segments)?,
                 "tables" => rfx::labtables::tables(&inputs, &opts)?,
@@ -150,13 +222,14 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Refsel { target, segments, pass0, inputs } => {
-            let opts = PackOpts { order: OrderMode::Given, device: Device::Cpu, level: 3, segment: 262144, verify: false, pass0_dir: Some(pass0), ld_decode: PathBuf::from("ld-decode"), rate_mhz: 75.0, format: "s16".into() };
+            let opts = PackOpts { order: OrderMode::Given, device: Device::Cpu, level: 3, segment: 262144, verify: false, pass0_dir: Some(pass0), ld_decode: PathBuf::from("ld-decode"), rate_mhz: 75.0, format: "auto".into() };
             rfx::pack::refsel(&inputs, &opts, target, segments)?
         }
         Cmd::Noise { pass0, windows, window, inputs } => {
             let fields: Vec<_> = (0..inputs.len()).map(|i| rfx::align::parse_pass0(&pass0.join(format!("pass0_{i}.txt")))).collect::<Result<_>>()?;
             let refs: Vec<&[rfx::align::Field]> = fields.iter().map(|f| f.as_slice()).collect();
-            let sc = rfx::order::scores(&inputs, &refs, windows, window)?;
+            let fmts: Vec<rfx::fmt::Fmt> = inputs.iter().map(|p| rfx::fmt::Fmt::from_path(p).unwrap_or(rfx::fmt::Fmt::S16)).collect();
+            let sc = rfx::order::scores(&inputs, &fmts, &refs, windows, window)?;
             println!("{:<34} {:>9} {:>8} {:>8} {:>7} {:>4}", "capture", "bits/smp", "min", "max", "rms", "win");
             for (p, s) in inputs.iter().zip(&sc) {
                 println!("{:<34} {:>9.3} {:>8.3} {:>8.3} {:>7.1} {:>4}", p.file_name().unwrap().to_string_lossy().trim_end_matches(".ddd.s16"), s.bits, s.min, s.max, s.rms, s.windows);
@@ -185,4 +258,31 @@ fn parse_order(s: &str) -> Result<OrderMode> {
         "given" => Ok(OrderMode::Given),
         _ => anyhow::bail!("--order is auto or given"),
     }
+}
+
+/// What the editing commands need to code or decode a source again.
+#[derive(clap::Args, Clone, Debug)]
+struct WorkOpts {
+    /// Predictor strength for sources coded again or added: 1 fastest to 4 strongest.
+    #[arg(short, long, default_value_t = 3)]
+    level: u32,
+    /// Skip the check that each coded segment decodes back to itself.
+    #[arg(long)]
+    no_verify: bool,
+    /// Pass 0 dumps already made (pass0_<i>.txt, in the order of the sources written).
+    #[arg(long)]
+    pass0: Option<PathBuf>,
+    /// ld-decode, to locate the lines of the captures (pass 0).
+    #[arg(long, default_value = "ld-decode")]
+    ld_decode: PathBuf,
+    /// Capture sample rate in MHz, for pass 0.
+    #[arg(long, default_value_t = 75.0)]
+    rate_mhz: f64,
+    /// Where the predictor runs: cpu or gpu (OpenCL, same bits).
+    #[arg(long, default_value = "cpu")]
+    device: String,
+}
+
+fn work_opts(w: &WorkOpts) -> Result<PackOpts> {
+    Ok(PackOpts { order: OrderMode::Given, device: parse_device(&w.device)?, level: w.level, segment: 262144, verify: !w.no_verify, pass0_dir: w.pass0.clone(), ld_decode: w.ld_decode.clone(), rate_mhz: w.rate_mhz, format: "auto".into() })
 }
