@@ -288,6 +288,24 @@ impl Refs<'_> {
         Ok(())
     }
 
+    /// The samples `[lo, hi)` of each reference track that the window of
+    /// `[s0, s0 + n)` of track `k` reads.
+    pub(crate) fn spans(&self, k: usize, s0: i64, n: usize) -> Vec<(usize, i64, i64)> {
+        let sm = &self.meta.sources[k];
+        let p0 = s0 - sm.taps as i64;
+        let mut out = Vec::new();
+        for &j in &sm.refs {
+            let Some(t) = self.tables.get(&(k, j)) else { continue };
+            for (a, b, lag) in runs(t, p0, p0 + (n + 2 * sm.taps) as i64) {
+                let (lo, hi) = ((a + lag).max(0), (b + lag).min(self.meta.sources[j].words as i64));
+                if hi > lo {
+                    out.push((j, lo, hi));
+                }
+            }
+        }
+        out
+    }
+
     /// The reference window over positions `[s0 - taps, s0 + n + taps)`, the
     /// channels one after the other.
     pub(crate) fn window(&self, k: usize, s0: i64, n: usize) -> Result<Vec<f32>> {

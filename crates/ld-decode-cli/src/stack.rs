@@ -1697,16 +1697,19 @@ impl CrystalLines {
         let win: Vec<f64> = (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos()).collect();
         let total = file.len as i64;
         let room = (total - start - n as i64).max(0);
-        let mut segs: Vec<Vec<f64>> = Vec::new();
-        let mut raw = vec![0f32; n];
-        for seg in 0..XTAL_SEGMENTS {
-            let at = start + room * seg as i64 / (XTAL_SEGMENTS as i64 - 1).max(1);
-            file.read_at(at, &mut raw)?;
-            let mean = raw.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
-            let mut x: Vec<Complex64> = raw.iter().zip(&win).map(|(&v, w)| Complex64::new((f64::from(v) - mean) * w, 0.0)).collect();
-            fft.process(&mut x);
-            segs.push(x[..n / 2].iter().map(|v| v.norm_sqr()).collect());
-        }
+        // In parallel: from an archive each stretch is a segment decoded.
+        let segs: Vec<Vec<f64>> = (0..XTAL_SEGMENTS)
+            .into_par_iter()
+            .map(|seg| -> Result<Vec<f64>> {
+                let mut raw = vec![0f32; n];
+                let at = start + room * seg as i64 / (XTAL_SEGMENTS as i64 - 1).max(1);
+                file.read_at(at, &mut raw)?;
+                let mean = raw.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+                let mut x: Vec<Complex64> = raw.iter().zip(&win).map(|(&v, w)| Complex64::new((f64::from(v) - mean) * w, 0.0)).collect();
+                fft.process(&mut x);
+                Ok(x[..n / 2].iter().map(|v| v.norm_sqr()).collect())
+            })
+            .collect::<Result<_>>()?;
         let power: Vec<f64> = (0..n / 2).map(|b| segs.iter().map(|s| s[b]).sum()).collect();
         let bin = fs / n as f64;
         // The spectrum's floor: the median within XTAL_FLOOR_HZ, taken every
