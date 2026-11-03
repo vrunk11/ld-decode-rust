@@ -49,7 +49,7 @@ fn ideal_bits(e: &[i32], rate: f64, cdf: impl Fn(f64, f64) -> f64) -> f64 {
 
 pub fn residual(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Result<()> {
     let p = prepare(inputs, Path::new("lab.rfx"), o)?;
-    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables };
+    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables, store: None };
     let sm = &p.meta.sources[k];
     let pre = sm.preset();
     let s = p.meta.segment;

@@ -1,18 +1,18 @@
 //! `pack`, `unpack` and `info`.
 //!
 //! Layout of a `.rfx` file (Matroska, DocType `rfx`):
-//! - track `k + 1` (`D_RFX/PRED`): source `k`, one block per segment of
+//! - track `k + 1` (`D_RFX/PRED`): track `k`, one block per segment of
 //!   `segment` samples, each block the range-coded residuals of
 //!   [`crate::seg`];
 //! - track `N + 1` (`D_RFX/META`): one block of JSON ([`Meta`]): names,
 //!   sizes, SHA-256, predictor settings;
-//! - track `N + 2` (`D_RFX/MAP`): one block per (source, earlier source)
+//! - track `N + 2` (`D_RFX/MAP`): one block per (track, earlier track)
 //!   pair with the integer lag table ([`LagTable`]).
 //!
-//! Source `k` is predicted from its own past and from the mean of the
-//! sources of its `refs` (all earlier), read at the lag tables' positions in
+//! Track `k` is predicted from its own past and from the mean of the
+//! tracks of its `refs` (all earlier), read at the lag tables' positions in
 //! the files themselves, so a segment needs nothing but its own block and
-//! the earlier sources: segments are coded and decoded in parallel.
+//! the earlier tracks: segments are coded and decoded in parallel.
 use crate::align::{build_table, parse_pass0, run_pass0, LagTable, HYST_COARSE, HYST_FINE};
 use crate::ebml;
 use crate::gpu::GpuSeg;
@@ -53,7 +53,7 @@ pub struct SrcMeta {
     pub shift: u32,
     pub mean: i32,
     pub own: usize,
-    /// Own past samples when the source has no reference (0: same as `own`).
+    /// Own past samples when the track has no reference (0: same as `own`).
     #[serde(default)]
     pub solo: usize,
     pub taps: usize,
@@ -66,7 +66,7 @@ pub struct SrcMeta {
     pub stride: usize,
     pub every: usize,
     pub lam_bits: u32,
-    /// Earlier sources this one is predicted from (those it shares frames with).
+    /// Earlier tracks this one is predicted from (those it shares frames with).
     pub refs: Vec<usize>,
     /// Weight of each reference in the mean they make (they add up to 1); empty
     /// means equal weights.
@@ -235,11 +235,21 @@ fn file_stats(path: &Path, fmt: Fmt) -> Result<Stats> {
     Ok(Stats { size, sha: hex(&hasher.finalize()), shift, mean, sample_sha })
 }
 
-/// Source `j`'s files, as the predictor of a later source reads them.
+/// Track `j`'s files, as the predictor of a later track reads them.
+/// Samples of a track by index, for reading references that are not files
+/// (the tracks of an archive decoded as they are needed).
+pub(crate) trait Store: Sync {
+    /// Samples `[lo, lo + out.len())` of track `j`, on the scale of the original
+    /// file (inside the track).
+    fn load(&self, j: usize, lo: u64, out: &mut [i32]) -> Result<()>;
+}
+
 pub(crate) struct Refs<'a> {
     pub(crate) files: &'a [File],
     pub(crate) meta: &'a Meta,
     pub(crate) tables: &'a HashMap<(usize, usize), LagTable>,
+    /// Where the reference tracks are read from when they are not in `files`.
+    pub(crate) store: Option<&'a dyn Store>,
 }
 
 /// Runs `(from, to, lag)` of constant lag covering positions `[p0, p1)`.
@@ -261,6 +271,23 @@ fn runs(t: &LagTable, p0: i64, p1: i64) -> Vec<(i64, i64, i64)> {
 }
 
 impl Refs<'_> {
+    /// Add `w` times the samples `[lo, hi)` of track `j` (shifted, minus its mean) to `dst`.
+    fn add_range(&self, j: usize, lo: i64, hi: i64, w: f32, dst: &mut [f32]) -> Result<()> {
+        let rj = &self.meta.sources[j];
+        match self.store {
+            None => crate::io::add_words_scaled(&self.files[j], rj.fmt(), rj.words, lo, hi, rj.shift, rj.mean, w, dst)?,
+            Some(st) => {
+                let mut buf = vec![0i32; dst.len()];
+                st.load(j, lo as u64, &mut buf)?;
+                for (o, &v) in dst.iter_mut().zip(&buf) {
+                    let x = (v >> rj.shift) - rj.mean;
+                    *o += w * x as f32;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The reference window over positions `[s0 - taps, s0 + n + taps)`, the
     /// channels one after the other.
     pub(crate) fn window(&self, k: usize, s0: i64, n: usize) -> Result<Vec<f32>> {
@@ -293,7 +320,7 @@ impl Refs<'_> {
                     continue;
                 }
                 let base = (lo - lag - p0) as usize;
-                crate::io::add_words_scaled(&self.files[j], rj.fmt(), rj.words, lo, hi, rj.shift, rj.mean, w, &mut dst[base..base + (hi - lo) as usize])?;
+                self.add_range(j, lo, hi, w, &mut dst[base..base + (hi - lo) as usize])?;
             }
             Ok(())
         };
@@ -561,7 +588,7 @@ pub(crate) fn prepare_with(given: &[PathBuf], specs: &[Spec], known: &HashMap<(u
     let mut meta = meta;
     if inputs.len() > 1 {
         let choice: Vec<Option<(Vec<usize>, Vec<f32>)>> = {
-            let refs = Refs { files: &files, meta: &meta, tables: &tables };
+            let refs = Refs { files: &files, meta: &meta, tables: &tables, store: None };
             (0..inputs.len()).map(|k| if specs[k].frozen { Ok(None) } else { choose_refs(&refs, k).map(Some) }).collect::<Result<_>>()?
         };
         for (k, ch) in choice.into_iter().enumerate() {
@@ -591,7 +618,7 @@ pub(crate) fn prepare_with(given: &[PathBuf], specs: &[Spec], known: &HashMap<(u
             if nr < 3 {
                 continue;
             }
-            let plain = trial_cost(&Refs { files: &files, meta: &meta, tables: &tables }, k)?;
+            let plain = trial_cost(&Refs { files: &files, meta: &meta, tables: &tables, store: None }, k)?;
             // The channels take up the misalignment: try them with coarse tables.
             let fine: Vec<(usize, LagTable)> = meta.sources[k].refs.iter().filter_map(|&j| tables.get(&(k, j)).map(|t| (j, t.clone()))).collect();
             for &(j, _) in &fine {
@@ -601,7 +628,7 @@ pub(crate) fn prepare_with(given: &[PathBuf], specs: &[Spec], known: &HashMap<(u
             }
             meta.sources[k].own = preset.own;
             meta.sources[k].ntop = preset.ntop.min(nr);
-            let split = trial_cost(&Refs { files: &files, meta: &meta, tables: &tables }, k)?;
+            let split = trial_cost(&Refs { files: &files, meta: &meta, tables: &tables, store: None }, k)?;
             if std::env::var_os("RFX_TIMING").is_some() {
                 eprintln!("  {k:>2} {}: plain mean {plain:.4}, with channels {split:.4} bits/sample", names[k]);
             }
@@ -639,7 +666,7 @@ pub(crate) fn write_head(w: &mut impl Write, meta: &Meta, tables: &HashMap<(usiz
     Ok(())
 }
 
-/// Copy the coded blocks of source `src` of `arch` as track `k` of `w`.
+/// Copy the coded blocks of track `src` of `arch` as track `k` of `w`.
 pub(crate) fn copy_blocks(w: &mut impl Write, arch: &Opened, src: usize, k: usize) -> Result<u64> {
     let mut order: Vec<(&u64, &(u64, u64))> = arch.blocks[src].iter().collect();
     order.sort();
@@ -658,11 +685,11 @@ pub fn pack(inputs: &[PathBuf], out: &Path, o: &PackOpts) -> Result<Vec<SourceRe
     pack_prepared(&p, out, o, &vec![None; p.inputs.len()])
 }
 
-/// Write the archive for `p`; the sources with a place in `copy` take their
+/// Write the archive for `p`; the tracks with a place in `copy` take their
 /// coded blocks from there instead of being coded again.
 pub(crate) fn pack_prepared(p: &Prepared, out: &Path, o: &PackOpts, copy: &[Option<(&Opened, usize)>]) -> Result<Vec<SourceReport>> {
     let Prepared { inputs, names: _, meta, tables, files, .. } = p;
-    let refs = Refs { files, meta, tables };
+    let refs = Refs { files, meta, tables, store: None };
     let mut w = std::io::BufWriter::new(File::create(out).with_context(|| format!("creating {}", out.display()))?);
     write_head(&mut w, meta, tables)?;
 
@@ -768,7 +795,7 @@ pub(crate) fn open(path: &Path) -> Result<Opened> {
 
 pub fn info(path: &Path) -> Result<()> {
     let o = open(path)?;
-    println!("{}: {} sources, segments of {} samples", path.display(), o.meta.sources.len(), o.meta.segment);
+    println!("{}: {} tracks, segments of {} samples", path.display(), o.meta.sources.len(), o.meta.segment);
     for (k, sm) in o.meta.sources.iter().enumerate() {
         let packed: u64 = o.blocks[k].values().map(|b| b.1).sum();
         println!(
@@ -794,7 +821,7 @@ pub fn info(path: &Path) -> Result<()> {
 }
 
 /// Rebuild the original files in `outdir`, each checked against its SHA-256.
-/// With `only`, just that source (the earlier ones are decoded too, as its
+/// With `only`, just that track (the earlier ones are decoded too, as its
 /// references, and removed).
 /// What `unpack` writes when it is not the capture as it came.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -821,7 +848,7 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device, a
     std::fs::create_dir_all(outdir)?;
     let last = only.unwrap_or(meta.sources.len() - 1);
     if last >= meta.sources.len() {
-        bail!("the archive has {} sources", meta.sources.len());
+        bail!("the archive has {} tracks", meta.sources.len());
     }
     let mut outs: Vec<File> = Vec::new();
     for sm in &meta.sources[..=last] {
@@ -830,7 +857,7 @@ pub fn unpack(path: &Path, outdir: &Path, only: Option<usize>, device: Device, a
         f.set_len(sm.size)?;
         outs.push(f);
     }
-    let refs = Refs { files: &outs, meta, tables: &o.tables };
+    let refs = Refs { files: &outs, meta, tables: &o.tables, store: None };
     let s = meta.segment;
     for k in 0..=last {
         let sm = &meta.sources[k];
@@ -1081,7 +1108,7 @@ impl Refs<'_> {
                     continue;
                 }
                 let base = (lo - lag - p0) as usize;
-                crate::io::add_words_scaled(&self.files[j], rj.fmt(), rj.words, lo, hi, rj.shift, rj.mean, w, &mut out[base..base + (hi - lo) as usize])?;
+                self.add_range(j, lo, hi, w, &mut out[base..base + (hi - lo) as usize])?;
             }
         }
         Ok(out)
@@ -1095,7 +1122,7 @@ impl Refs<'_> {
 pub fn refsel(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Result<()> {
     let p = prepare(inputs, Path::new("refsel.rfx"), o)?;
     let Prepared { names, meta, tables, files, .. } = &p;
-    let refs = Refs { files, meta, tables };
+    let refs = Refs { files, meta, tables, store: None };
     let sm = &meta.sources[k];
     let pre = Preset { ntop: 0, ..sm.preset() };
     let s = meta.segment;

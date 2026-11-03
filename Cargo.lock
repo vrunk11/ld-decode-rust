@@ -456,6 +456,7 @@ dependencies = [
  "mimalloc",
  "ogg",
  "rayon",
+ "rfx",
  "rusqlite",
  "rustfft",
  "serde",

@@ -108,7 +108,7 @@ fn model_bits(res: &[i32], sizes: &[usize], limit: f32, lr: f64, mut ctx_of: imp
 /// Residual model variants on the residuals of the production predictor.
 pub fn model(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Result<()> {
     let p = prepare(inputs, Path::new("lab.rfx"), o)?;
-    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables };
+    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables, store: None };
     let sm = &p.meta.sources[k];
     let pre = sm.preset();
     let (s, maxt) = (p.meta.segment, pre.taps);

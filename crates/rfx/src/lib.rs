@@ -16,5 +16,6 @@ pub mod model;
 pub mod order;
 pub mod pack;
 pub mod pred;
+pub mod reader;
 pub mod rc;
 pub mod seg;

@@ -151,7 +151,7 @@ fn fit(x: &[f64], lines: &[f64]) -> Vec<i32> {
 
 pub fn tones(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize, ntones: usize) -> Result<()> {
     let p = prepare(inputs, Path::new("lab.rfx"), o)?;
-    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables };
+    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables, store: None };
     let sm = &p.meta.sources[k];
     let pre = sm.preset();
     let s = p.meta.segment;

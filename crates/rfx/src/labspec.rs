@@ -99,7 +99,7 @@ fn report(what: &str, x: &[f64], rate_mhz: f64) {
 
 pub fn spectrum(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Result<()> {
     let p = prepare(inputs, Path::new("lab.rfx"), o)?;
-    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables };
+    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables, store: None };
     let sm = &p.meta.sources[k];
     let pre = sm.preset();
     let s = p.meta.segment;
@@ -196,7 +196,7 @@ fn chol(a: &[f64], b: &[f64], d: usize) -> Option<Vec<f64>> {
 /// A second predictor on the residual of the first (a cascade): what it saves.
 pub fn cascade(inputs: &[PathBuf], o: &PackOpts, k: usize, nseg: usize) -> Result<()> {
     let p = prepare(inputs, Path::new("lab.rfx"), o)?;
-    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables };
+    let refs = Refs { files: &p.files, meta: &p.meta, tables: &p.tables, store: None };
     let sm = &p.meta.sources[k];
     let pre = sm.preset();
     let s = p.meta.segment;

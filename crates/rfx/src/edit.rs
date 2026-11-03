@@ -1,10 +1,10 @@
-//! Editing archives: merge several into one, extract some of the sources into
-//! another, remove sources, add captures. The output is always a new file.
+//! Editing archives: merge several into one, extract some of the tracks into
+//! another, remove tracks, add captures. The output is always a new file.
 //!
-//! A source is coded against the sources before it, so its coded blocks stay
-//! valid exactly when every source it was coded against is still there, before
+//! A track is coded against the tracks before it, so its coded blocks stay
+//! valid exactly when every track it was coded against is still there, before
 //! it. Those are copied as they are, which costs no more than the copy (a
-//! merge, or the removal of the last sources, never decodes anything). The
+//! merge, or the removal of the last tracks, never decodes anything). The
 //! others, and the new captures, are coded again against what is left: the
 //! archives involved are decoded to a work directory for that, and the usual
 //! `prepare` finds the alignment and the references.
@@ -14,10 +14,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-/// One source of the archive to write.
+/// One track of the archive to write.
 #[derive(Clone, Debug)]
 pub enum Pick {
-    /// Source `src` of the archive number `arch` in the list given.
+    /// Track `src` of the archive number `arch` in the list given.
     Old { arch: usize, src: usize },
     /// A capture file.
     New(PathBuf),
@@ -28,7 +28,7 @@ pub enum Pick {
 /// captures of one disc in different archives predict each other.
 pub fn assemble(archives: &[PathBuf], picks: &[Pick], out: &Path, o: &PackOpts, recode_from: Option<usize>) -> Result<()> {
     if picks.is_empty() {
-        bail!("nothing to write: no source selected");
+        bail!("nothing to write: no track selected");
     }
     let opened: Vec<Opened> = archives.iter().map(|p| open(p)).collect::<Result<_>>()?;
     if let Some(a) = opened.first() {
@@ -44,10 +44,10 @@ pub fn assemble(archives: &[PathBuf], picks: &[Pick], out: &Path, o: &PackOpts, 
     for (k, p) in picks.iter().enumerate() {
         if let Pick::Old { arch, src } = p {
             if *arch >= opened.len() || *src >= opened[*arch].meta.sources.len() {
-                bail!("no source {src} in archive {arch}");
+                bail!("no track {src} in archive {arch}");
             }
             if place.insert((*arch, *src), k).is_some() {
-                bail!("a source is selected twice");
+                bail!("a track is selected twice");
             }
         }
     }
@@ -71,7 +71,7 @@ pub fn assemble(archives: &[PathBuf], picks: &[Pick], out: &Path, o: &PackOpts, 
                         let mut m = sm.clone();
                         m.refs = refs.clone();
                         for (j_old, j_new) in sm.refs.iter().zip(&refs) {
-                            let t = a.tables.get(&(*src, *j_old)).with_context(|| format!("{}: lag table against source {j_old} is missing", sm.name))?;
+                            let t = a.tables.get(&(*src, *j_old)).with_context(|| format!("{}: lag table against track {j_old} is missing", sm.name))?;
                             known.insert((k, *j_new), t.clone());
                         }
                         specs.push(Spec { carry: Some(m), frozen: true });
@@ -86,7 +86,7 @@ pub fn assemble(archives: &[PathBuf], picks: &[Pick], out: &Path, o: &PackOpts, 
         }
     }
     let kept = copy.iter().filter(|c| c.is_some()).count();
-    eprintln!("{} source(s) to write: {} copied as they are, {} to code", picks.len(), kept, picks.len() - kept);
+    eprintln!("{} track(s) to write: {} copied as they are, {} to code", picks.len(), kept, picks.len() - kept);
 
     let tmp = out.with_extension("rfx-tmp");
     let result = (|| -> Result<()> {
@@ -95,7 +95,7 @@ pub fn assemble(archives: &[PathBuf], picks: &[Pick], out: &Path, o: &PackOpts, 
             let metas: Vec<_> = specs.iter().enumerate().map(|(k, s)| pack::SrcMeta { position: k, ..s.carry.clone().expect("old source") }).collect();
             let mut names = HashSet::new();
             if let Some(n) = metas.iter().find(|m| !names.insert(m.name.clone())) {
-                bail!("two sources are named {}: the archive keeps file names only", n.name);
+                bail!("two tracks are named {}: the archive keeps file names only", n.name);
             }
             let meta = Meta { format: "rfx".into(), version: 1, segment, sources: metas };
             let mut w = std::io::BufWriter::new(File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?);
@@ -162,28 +162,28 @@ fn scopeguard(p: PathBuf) -> RemoveDir {
     RemoveDir(p)
 }
 
-/// The sources of `archive` listed in `which` (indices, `0` is the primary),
+/// The tracks of `archive` listed in `which` (indices, `0` is the primary),
 /// as picks in their original order.
 pub fn pick_some(archive: &Path, which: &[usize]) -> Result<Vec<Pick>> {
     let n = open(archive)?.meta.sources.len();
     if let Some(bad) = which.iter().find(|&&i| i >= n) {
-        bail!("{} has {} sources: no source {bad}", archive.display(), n);
+        bail!("{} has {} tracks: no track {bad}", archive.display(), n);
     }
     let set: HashSet<usize> = which.iter().copied().collect();
     Ok((0..n).filter(|i| set.contains(i)).map(|src| Pick::Old { arch: 0, src }).collect())
 }
 
-/// All the sources of `archive` except `which`.
+/// All the tracks of `archive` except `which`.
 pub fn pick_without(archive: &Path, which: &[usize]) -> Result<Vec<Pick>> {
     let n = open(archive)?.meta.sources.len();
     if let Some(bad) = which.iter().find(|&&i| i >= n) {
-        bail!("{} has {} sources: no source {bad}", archive.display(), n);
+        bail!("{} has {} tracks: no track {bad}", archive.display(), n);
     }
     let set: HashSet<usize> = which.iter().copied().collect();
     Ok((0..n).filter(|i| !set.contains(i)).map(|src| Pick::Old { arch: 0, src }).collect())
 }
 
-/// Every source of every archive, one archive after the other.
+/// Every track of every archive, one archive after the other.
 pub fn pick_all(archives: &[PathBuf]) -> Result<Vec<Pick>> {
     let mut picks = Vec::new();
     for (arch, p) in archives.iter().enumerate() {

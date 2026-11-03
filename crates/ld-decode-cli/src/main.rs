@@ -285,6 +285,7 @@ fn main() -> Result<()> {
     };
 
     let (inputs, out_arg) = resolve_io(&args)?;
+    let inputs = reader::expand_rfx(&inputs)?;
     let tbc = match (args.tbc, inputs.len()) {
         (Some(TbcMode::Resample), n) if n > 1 => {
             anyhow::bail!("several inputs are stacked with read-time TBC; --tbc resample takes a single input")

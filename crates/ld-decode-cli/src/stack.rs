@@ -625,7 +625,20 @@ struct RawFile {
     /// steps: the GPU path moves these instead of f32.
     code: Option<(fn(&[u8], &mut [u16]), f32)>,
     len: u64,
+    /// A track of an `.rfx` archive, decoded as it is read (then `file` is only
+    /// the archive's handle, never read here).
+    rfx: Option<RfxTrack>,
 }
+
+struct RfxTrack {
+    archive: std::sync::Arc<rfx::reader::Archive>,
+    track: usize,
+    /// Factor from the stored values to ld-decode's samples.
+    mul: f32,
+}
+
+fn code_none(_: &[u8], _: &mut [u16]) {}
+fn widen_none(_: &[u8], _: &mut [f32]) {}
 
 fn code_s16(b: &[u8], out: &mut [u16]) {
     for (o, w) in out.iter_mut().zip(b.chunks_exact(2)) {
@@ -656,6 +669,18 @@ impl RawFile {
         if path == "-" {
             bail!("--tbc read reads its input at random positions, which stdin cannot do");
         }
+        if format == SampleFormat::Rfx {
+            let (file, track) = crate::reader::rfx_split(path);
+            let track = track.with_context(|| format!("{path}: name a track, as in {file}#0"))?;
+            let archive = rfx::reader::Archive::open(std::path::Path::new(file))?;
+            if track >= archive.tracks() {
+                bail!("{file} has {} tracks: no track {track}", archive.tracks());
+            }
+            let (mul, signed) = crate::reader::rfx_scale(archive.fmt(track));
+            let len = archive.len(track);
+            let handle = File::open(file).with_context(|| format!("opening {file}"))?;
+            return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), if signed { -32768.0 } else { 0.0 })), len, rfx: Some(RfxTrack { archive, track, mul }) });
+        }
         let Some((bytes, widen)) = crate::reader::raw_layout(format) else {
             bail!("--tbc read needs a fixed-width raw input (s16, r16, r8, s8, rf); {path} is {format:?}");
         };
@@ -668,7 +693,7 @@ impl RawFile {
             SampleFormat::S8Le => Some((code_s8 as fn(&[u8], &mut [u16]), -32768.0)),
             _ => None,
         };
-        Ok(Self { file, bytes, widen, code, len })
+        Ok(Self { file, bytes, widen, code, len, rfx: None })
     }
 
     /// The file's bytes for samples `[lo, hi)` (clipped to the file).
@@ -690,6 +715,21 @@ impl RawFile {
     /// the code of 0 outside the file.
     fn read_codes_at(&self, start: i64, out: &mut [u16]) -> Result<f32> {
         let (code, off) = self.code.expect("a format with 16-bit codes");
+        if let Some(r) = &self.rfx {
+            out.fill((-off) as u16);
+            let lo = start.max(0) as u64;
+            let hi = ((start + out.len() as i64).max(0) as u64).min(self.len);
+            if hi > lo {
+                let at = (lo as i64 - start) as usize;
+                let n = (hi - lo) as usize;
+                let mut buf = vec![0i32; n];
+                r.archive.read(r.track, lo as i64, &mut buf)?;
+                for (o, v) in out[at..at + n].iter_mut().zip(buf) {
+                    *o = (v as f32 * r.mul - off).round() as i32 as u16;
+                }
+            }
+            return Ok(off);
+        }
         out.fill((-off) as u16);
         let lo = start.max(0) as u64;
         let hi = ((start + out.len() as i64).max(0) as u64).min(self.len);
@@ -710,6 +750,15 @@ impl RawFile {
             return Ok(());
         }
         let n = (hi - lo) as usize;
+        if let Some(r) = &self.rfx {
+            let mut buf = vec![0i32; n];
+            r.archive.read(r.track, lo as i64, &mut buf)?;
+            let off = (lo as i64 - start) as usize;
+            for (o, v) in out[off..off + n].iter_mut().zip(buf) {
+                *o = v as f32 * r.mul;
+            }
+            return Ok(());
+        }
         let mut buf = vec![0u8; n * self.bytes];
         let mut filled = 0usize;
         while filled < buf.len() {

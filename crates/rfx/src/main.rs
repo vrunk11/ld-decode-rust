@@ -56,7 +56,7 @@ enum Cmd {
         /// Where the predictor runs: cpu or gpu (OpenCL, same bits).
         #[arg(long, default_value = "cpu")]
         device: String,
-        /// Extract only this source (0 is the primary).
+        /// Extract only this track (0 is the primary).
         #[arg(long)]
         only: Option<usize>,
         /// Write the captures in another format (s16, r16, s8, r8, lds, flac or ldf) instead of the
@@ -127,12 +127,12 @@ enum Cmd {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
     },
-    /// Merge .rfx files into one (the sources of each after the ones of the
-    /// previous; no source is coded again unless `--recode` is given).
+    /// Merge .rfx files into one (the tracks of each after the ones of the
+    /// previous; no track is coded again unless `--recode` is given).
     Merge {
         #[arg(short, long)]
         output: PathBuf,
-        /// Code the sources of the later files again against everything before
+        /// Code the tracks of the later files again against everything before
         /// them, so that captures of one disc in different files predict each other.
         #[arg(long)]
         recode: bool,
@@ -141,23 +141,23 @@ enum Cmd {
         #[arg(required = true, num_args = 2..)]
         inputs: Vec<PathBuf>,
     },
-    /// Write some of the sources of a .rfx file as a .rfx file of their own.
+    /// Write some of the tracks of a .rfx file as a .rfx file of their own.
     Extract {
         input: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
-        /// Sources to keep (0 is the primary), e.g. 0,3,5.
+        /// Tracks to keep (0 is the primary), e.g. 0,3,5.
         #[arg(long, required = true, value_delimiter = ',')]
         only: Vec<usize>,
         #[command(flatten)]
         work: WorkOpts,
     },
-    /// Write a .rfx file without some of the sources of another.
+    /// Write a .rfx file without some of the tracks of another.
     Remove {
         input: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
-        /// Sources to remove (0 is the primary), e.g. 2,4.
+        /// Tracks to remove (0 is the primary), e.g. 2,4.
         #[arg(long, required = true, value_delimiter = ',')]
         track: Vec<usize>,
         #[command(flatten)]
@@ -174,7 +174,7 @@ enum Cmd {
         #[arg(required = true)]
         captures: Vec<PathBuf>,
     },
-    /// List the sources of a .rfx file.
+    /// List the tracks of a .rfx file.
     Info { input: PathBuf },
 }
 
@@ -260,16 +260,16 @@ fn parse_order(s: &str) -> Result<OrderMode> {
     }
 }
 
-/// What the editing commands need to code or decode a source again.
+/// What the editing commands need to code or decode a track again.
 #[derive(clap::Args, Clone, Debug)]
 struct WorkOpts {
-    /// Predictor strength for sources coded again or added: 1 fastest to 4 strongest.
+    /// Predictor strength for tracks coded again or added: 1 fastest to 4 strongest.
     #[arg(short, long, default_value_t = 3)]
     level: u32,
     /// Skip the check that each coded segment decodes back to itself.
     #[arg(long)]
     no_verify: bool,
-    /// Pass 0 dumps already made (pass0_<i>.txt, in the order of the sources written).
+    /// Pass 0 dumps already made (pass0_<i>.txt, in the order of the tracks written).
     #[arg(long)]
     pass0: Option<PathBuf>,
     /// ld-decode, to locate the lines of the captures (pass 0).

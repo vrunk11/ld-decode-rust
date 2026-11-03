@@ -160,7 +160,7 @@ fn device_stages<'s, 'e>(
     Ok(rx4)
 }
 
-/// Pack source `k`; returns the bytes written.
+/// Pack track `k`; returns the bytes written.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pack_source(
     k: usize,
@@ -246,8 +246,8 @@ crate::io::read_words_into(&files[k], sm.fmt(), sm.words, s0 as i64, &mut inp[..
     Ok(packed)
 }
 
-/// Unpack source `k` into `out` (word `q * s` of segment `q`); the reference
-/// sources are read from `refs` (already written).
+/// Unpack track `k` into `out` (word `q * s` of segment `q`); the reference
+/// tracks are read from `refs` (already written).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn unpack_source(
     k: usize,

@@ -44,6 +44,10 @@ pub enum SampleFormat {
     /// Python reference decodes these with PyAV resampled to s16, i.e. the
     /// raw 16-bit RF samples, so claxon's i32 samples stay unscaled.
     Flac,
+    /// A track of an `.rfx` archive: `file.rfx#N` (track N, 0 is the primary);
+    /// `file.rfx` alone stands for all its tracks, stacked.
+    #[value(name = "rfx")]
+    Rfx,
 }
 
 /// Infer the sample format from the input filename extension.
@@ -51,7 +55,7 @@ pub fn infer_format(path: &str) -> Result<SampleFormat> {
     if path == "-" {
         bail!("cannot infer format from stdin; use --format");
     }
-    let ext = path
+    let ext = rfx_split(path).0
         .rsplit('.')
         .next()
         .unwrap_or("")
@@ -66,6 +70,7 @@ pub fn infer_format(path: &str) -> Result<SampleFormat> {
         "r30" => Ok(SampleFormat::R30),
         "ldf" => Ok(SampleFormat::Ldf),
         "flac" => Ok(SampleFormat::Flac),
+        "rfx" => Ok(SampleFormat::Rfx),
         other => bail!("cannot infer sample format from extension .{other}; use --format"),
     }
 }
@@ -88,6 +93,9 @@ pub struct Input {
 pub fn open_input(path: &str, format: SampleFormat) -> Result<Input> {
     if path == "-" {
         return open_stdin(format);
+    }
+    if format == SampleFormat::Rfx {
+        return Ok(Input { source: Box::new(RfxSource::open(path)?), container_rate_hz: None });
     }
     let mut file = File::open(path).with_context(|| format!("opening {path}"))?;
     let container_rate_hz = if matches!(format, SampleFormat::Ldf | SampleFormat::Flac) {
@@ -117,6 +125,7 @@ fn open_source(path: &str, file: File, format: SampleFormat, rate_hz: u32) -> Re
         SampleFormat::R30 => Box::new(PackedSource::new(file, 3, 4, unpack_r30)),
         SampleFormat::Ldf => open_ldf(path, file, rate_hz)?,
         SampleFormat::Flac => open_raw_flac(path, file, 0, rate_hz)?,
+        SampleFormat::Rfx => bail!("an .rfx track is opened through open_input"),
     })
 }
 
@@ -164,6 +173,7 @@ fn open_stdin(format: SampleFormat) -> Result<Input> {
         SampleFormat::F32Le => raw(4, 1, widen_f32),
         SampleFormat::Lds => raw(5, 4, unpack_lds),
         SampleFormat::R30 => raw(4, 3, unpack_r30),
+        SampleFormat::Rfx => bail!("an .rfx archive cannot be read from stdin"),
         SampleFormat::Ldf | SampleFormat::Flac => {
             let mut head = vec![0u8; PROBE_WINDOW];
             let n = read_fully(&mut std::io::stdin().lock(), &mut head)?;
@@ -1405,5 +1415,85 @@ mod sample_rate_tests {
     fn rejects_garbage() {
         assert_eq!(flac_sample_rate(b"fLaC not a streaminfo block at all"), None);
         assert_eq!(flac_sample_rate(&[]), None);
+    }
+}
+
+/// Split `file.rfx#N` into the file and the track.
+pub fn rfx_split(path: &str) -> (&str, Option<usize>) {
+    match path.rsplit_once('#') {
+        Some((file, n)) if n.parse::<usize>().is_ok() => (file, n.parse().ok()),
+        _ => (path, None),
+    }
+}
+
+/// The inputs with every `file.rfx` (no track given) replaced by all its
+/// tracks, `file.rfx#0`, `file.rfx#1`, ...
+pub fn expand_rfx(inputs: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for p in inputs {
+        let (file, track) = rfx_split(p);
+        if track.is_none() && file.to_ascii_lowercase().ends_with(".rfx") {
+            let a = rfx::reader::Archive::open(std::path::Path::new(file))?;
+            tracing::info!("{file}: {} tracks, stacked", a.tracks());
+            out.extend((0..a.tracks()).map(|i| format!("{file}#{i}")));
+        } else {
+            out.push(p.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// How a track of an archive reads as ld-decode's samples: the factor from the
+/// stored values (the scale of the original file) and whether the 16-bit code
+/// is offset (`value = code - 32768`, like `s16`).
+pub fn rfx_scale(fmt: rfx::fmt::Fmt) -> (f32, bool) {
+    match fmt {
+        rfx::fmt::Fmt::S8 => (256.0, true),
+        rfx::fmt::Fmt::U8 | rfx::fmt::Fmt::U16 => (1.0, false),
+        rfx::fmt::Fmt::S16 | rfx::fmt::Fmt::Lds => (1.0, true),
+    }
+}
+
+/// A track of an `.rfx` archive as a sample stream.
+struct RfxSource {
+    archive: std::sync::Arc<rfx::reader::Archive>,
+    track: usize,
+    scale: f32,
+    pos: u64,
+}
+
+impl RfxSource {
+    fn open(path: &str) -> Result<Self> {
+        let (file, track) = rfx_split(path);
+        let track = track.with_context(|| format!("{path}: name a track, as in {file}#0"))?;
+        let archive = rfx::reader::Archive::open(std::path::Path::new(file))?;
+        if track >= archive.tracks() {
+            bail!("{file} has {} tracks: no track {track}", archive.tracks());
+        }
+        let scale = rfx_scale(archive.fmt(track)).0;
+        Ok(Self { archive, track, scale, pos: 0 })
+    }
+}
+
+impl SampleSource for RfxSource {
+    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        let left = self.archive.len(self.track).saturating_sub(self.pos) as usize;
+        let n = out.len().min(left);
+        let mut buf = vec![0i32; n];
+        self.archive.read(self.track, self.pos as i64, &mut buf)?;
+        for (o, v) in out.iter_mut().zip(buf) {
+            *o = v as f32 * self.scale;
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn seek_samples(&mut self, sample: u64) -> Result<()> {
+        self.pos = sample;
+        Ok(())
+    }
+
+    fn is_seekable(&self) -> bool {
+        true
     }
 }
