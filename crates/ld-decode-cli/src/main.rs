@@ -285,6 +285,7 @@ fn main() -> Result<()> {
     };
 
     let (inputs, out_arg) = resolve_io(&args)?;
+    let inputs = reader::expand_rfx(&inputs)?;
     let tbc = match (args.tbc, inputs.len()) {
         (Some(TbcMode::Resample), n) if n > 1 => {
             anyhow::bail!("several inputs are stacked with read-time TBC; --tbc resample takes a single input")
@@ -355,7 +356,7 @@ fn main() -> Result<()> {
         (None, Some(hz)) => {
             // The container rate is the RF rate in kHz (`-ar 40k` = 40 MHz).
             let f = f64::from(hz) / 1000.0;
-            tracing::info!("Input sample rate {f} MHz (from the FLAC metadata, {hz} Hz)");
+            tracing::info!("Input sample rate {f} MHz (from the input file's metadata, {hz} Hz)");
             f
         }
         (None, None) => 40.0,
@@ -683,6 +684,12 @@ fn read_tbc_source(
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rfsync::locate(&src, fs, &sys, &live, i)));
             live.finish(i, run.unwrap_or_else(|_| Err(anyhow::anyhow!("panicked"))));
         })?;
+    }
+    // `LD_PASS0_ONLY`: locate the lines of every input (see `LD_DUMP_PASS0`)
+    // and stop, for tools that need the alignment between captures.
+    if std::env::var_os("LD_PASS0_ONLY").is_some() {
+        live.wait_done()?;
+        std::process::exit(0);
     }
     let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
     stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, xtal, leak, rf_out)

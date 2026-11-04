@@ -2,6 +2,7 @@
 members = [
     "crates/ld-decode",
     "crates/ld-decode-cli",
+    "crates/rfx",
 ]
 resolver = "2"
 
