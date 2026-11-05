@@ -1,7 +1,8 @@
-//! The FLAC variant of the archive, read by sample index (what ld-decode does):
-//! an ordinary Matroska audio file with a FLAC track per capture (`A_FLAC`) and
-//! one attachment, `rfx.json`, that keeps what the archive holds besides the
-//! samples. Writing such a file is the job of the `rfx` tool of RF-tools.
+//! The FLAC and raw variants of the archive, read by sample index (what
+//! ld-decode does): an ordinary Matroska audio file with a track per capture
+//! (`A_FLAC`, or `A_PCM/INT/LIT` for the raw variant) and one attachment,
+//! `rfx.json`, that keeps what the archive holds besides the samples. Writing
+//! such a file is the job of the `rfx` tool of RF-tools.
 //!
 //! The samples are 16-bit ones: the capture's sample scaled to 16 bits (a capture of 8 bits is multiplied by 256, an unsigned one is offset), and
 //! `from_i16` gives it back.
@@ -49,12 +50,16 @@ fn from_i16(fmt: Fmt, s: i16) -> i32 {
 pub struct FlacArchive {
     file: File,
     meta: FlacMeta,
+    /// Raw 16-bit PCM blocks rather than FLAC frames.
+    raw: bool,
     /// `fLaC` and the STREAMINFO block, put before a frame to decode it.
     header: Vec<u8>,
     /// Samples a frame holds (a fixed block size).
     frame: usize,
-    /// Offset and length of each frame, per track.
+    /// Offset and length of each block (a FLAC frame or a run of PCM), per track.
     frames: Vec<Vec<(u64, u64)>>,
+    /// Raw variant: the first sample of each block, per track.
+    starts: Vec<Vec<u64>>,
     cache: std::sync::Mutex<std::collections::HashMap<(usize, usize), std::sync::Arc<Vec<i16>>>>,
 }
 
@@ -65,41 +70,72 @@ impl FlacArchive {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let idx = crate::ebml::scan_with(&file, None)?;
-        let flac_tracks: Vec<u64> = idx.codecs.iter().filter(|(_, c)| c == "A_FLAC").map(|(n, _)| *n).collect();
+        let audio = |c: &str| c == "A_FLAC" || c == "A_PCM/INT/LIT";
+        // The audio tracks, by track number (the attachment is not a track).
+        let mut flac_tracks: Vec<u64> = idx.codecs.iter().filter(|(_, c)| audio(c)).map(|(n, _)| *n).collect();
+        flac_tracks.sort_unstable();
         let att = idx.attachments.iter().find(|a| a.0 == "rfx.json").with_context(|| format!("{}: no rfx.json attachment (not an rfx archive)", path.display()))?;
         let mut buf = vec![0u8; att.2 as usize];
         read_exact_at(&file, &mut buf, att.1)?;
         let meta: FlacMeta = serde_json::from_slice(&buf).context("bad metadata")?;
-        if meta.format != "rfx" || meta.codec != "flac" || meta.version != 1 {
+        let raw = meta.codec == "raw";
+        if meta.format != "rfx" || !(meta.codec == "flac" || raw) || meta.version != 1 {
             bail!("unsupported FLAC-mode archive ({} {} v{})", meta.format, meta.codec, meta.version);
+        }
+        let id = if raw { "A_PCM/INT/LIT" } else { "A_FLAC" };
+        if idx.codecs.iter().any(|(n, c)| flac_tracks.contains(n) && c != id) {
+            bail!("{}: the tracks are not all {id}", path.display());
         }
         if flac_tracks.len() != meta.tracks.len() {
             bail!("{} has {} FLAC tracks but its metadata lists {}", path.display(), flac_tracks.len(), meta.tracks.len());
         }
-        let private = idx.private.iter().find(|(n, _)| Some(n) == flac_tracks.first()).map(|(_, p)| p.clone()).context("the FLAC track has no stream header")?;
-        let b = private.strip_prefix(b"fLaC").unwrap_or(&private);
-        if b.len() < 8 {
-            bail!("the FLAC stream header is too short");
-        }
-        let len = (usize::from(b[1]) << 16) | (usize::from(b[2]) << 8) | usize::from(b[3]);
-        if b.len() < 4 + len || len < 34 {
-            bail!("the FLAC stream header is damaged");
-        }
-        let (min, max) = (u16::from_be_bytes([b[4], b[5]]), u16::from_be_bytes([b[6], b[7]]));
-        if min != max || min == 0 {
-            bail!("the FLAC tracks have a variable block size ({min} to {max}), which is not supported");
-        }
-        let mut header = b"fLaC".to_vec();
-        header.push(b[0] | 0x80);
-        header.extend_from_slice(&b[1..4 + len]);
-        let frame = usize::from(min);
-        let frames: Vec<Vec<(u64, u64)>> = flac_tracks.iter().map(|n| idx.blocks.iter().filter(|b| b.track == *n).map(|b| (b.off, b.len)).collect()).collect();
-        for (k, f) in frames.iter().enumerate() {
-            if f.len() as u64 != meta.tracks[k].words.div_ceil(frame as u64) {
-                bail!("{}: track {k} has {} frames for {} samples", path.display(), f.len(), meta.tracks[k].words);
+        let blocks: Vec<Vec<(u64, u64)>> = flac_tracks.iter().map(|n| idx.blocks.iter().filter(|b| b.track == *n).map(|b| (b.off, b.len)).collect()).collect();
+        let (header, frame, frames, starts) = if raw {
+            // Each block holds len / 2 samples; the first sample of a block is the
+            // sum of those before it (the timestamps are in milliseconds, not exact).
+            let mut starts = Vec::with_capacity(blocks.len());
+            for (k, f) in blocks.iter().enumerate() {
+                let mut at = 0u64;
+                let mut v = Vec::with_capacity(f.len());
+                for &(_, len) in f {
+                    if len % 2 != 0 {
+                        bail!("{}: a block of track {k} holds {len} bytes, not whole 16-bit samples", path.display());
+                    }
+                    v.push(at);
+                    at += len / 2;
+                }
+                if at != meta.tracks[k].words {
+                    bail!("{}: track {k} holds {at} samples, its metadata says {}", path.display(), meta.tracks[k].words);
+                }
+                starts.push(v);
             }
-        }
-        Ok(Self { file, meta, header, frame, frames, cache: Default::default() })
+            (Vec::new(), 0, blocks, starts)
+        } else {
+            let private = idx.private.iter().find(|(n, _)| Some(n) == flac_tracks.first()).map(|(_, p)| p.clone()).context("the FLAC track has no stream header")?;
+            let b = private.strip_prefix(b"fLaC").unwrap_or(&private);
+            if b.len() < 8 {
+                bail!("the FLAC stream header is too short");
+            }
+            let len = (usize::from(b[1]) << 16) | (usize::from(b[2]) << 8) | usize::from(b[3]);
+            if b.len() < 4 + len || len < 34 {
+                bail!("the FLAC stream header is damaged");
+            }
+            let (min, max) = (u16::from_be_bytes([b[4], b[5]]), u16::from_be_bytes([b[6], b[7]]));
+            if min != max || min == 0 {
+                bail!("the FLAC tracks have a variable block size ({min} to {max}), which is not supported");
+            }
+            let mut header = b"fLaC".to_vec();
+            header.push(b[0] | 0x80);
+            header.extend_from_slice(&b[1..4 + len]);
+            let frame = usize::from(min);
+            for (k, f) in blocks.iter().enumerate() {
+                if f.len() as u64 != meta.tracks[k].words.div_ceil(frame as u64) {
+                    bail!("{}: track {k} has {} frames for {} samples", path.display(), f.len(), meta.tracks[k].words);
+                }
+            }
+            (header, frame, blocks, Vec::new())
+        };
+        Ok(Self { file, meta, raw, header, frame, frames, starts, cache: Default::default() })
     }
 
     pub fn tracks(&self) -> usize {
@@ -159,6 +195,9 @@ impl FlacArchive {
         if hi <= lo {
             return Ok(());
         }
+        if self.raw {
+            return self.read_raw(k, lo, hi, start, out);
+        }
         let n = self.frame as i64;
         let frames: Vec<usize> = ((lo / n) as usize..=((hi - 1) / n) as usize).collect();
         let decoded: Vec<std::sync::Arc<Vec<i16>>> = frames.par_iter().map(|&f| self.decode_frame(k, f)).collect::<Result<_>>()?;
@@ -169,6 +208,28 @@ impl FlacArchive {
             for p in a..b {
                 out[(p - start) as usize] = from_i16(fmt, v[(p - base) as usize]);
             }
+        }
+        Ok(())
+    }
+
+    /// The raw variant: the blocks that hold `[lo, hi)` are read as they are.
+    fn read_raw(&self, k: usize, lo: i64, hi: i64, start: i64, out: &mut [i32]) -> Result<()> {
+        let (starts, blocks) = (&self.starts[k], &self.frames[k]);
+        let fmt = self.fmt(k);
+        let mut b = starts.partition_point(|&s| s as i64 <= lo).saturating_sub(1);
+        let mut buf = Vec::new();
+        while b < blocks.len() && (starts[b] as i64) < hi {
+            let (off, len) = blocks[b];
+            let base = starts[b] as i64;
+            let (a, e) = (base.max(lo), (base + (len / 2) as i64).min(hi));
+            if e > a {
+                buf.resize(((e - a) * 2) as usize, 0);
+                read_exact_at(&self.file, &mut buf, off + ((a - base) * 2) as u64)?;
+                for (i, w) in buf.chunks_exact(2).enumerate() {
+                    out[(a - start) as usize + i] = from_i16(fmt, i16::from_le_bytes([w[0], w[1]]));
+                }
+            }
+            b += 1;
         }
         Ok(())
     }

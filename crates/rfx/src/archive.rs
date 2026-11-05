@@ -34,6 +34,15 @@ pub const CODEC_MAP: &str = "D_RFX/MAP";
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SrcMeta {
     pub name: String,
+    /// A note about the capture (empty when there is none).
+    #[serde(default)]
+    pub notes: String,
+    /// Date of the original file, as the packer wrote it (empty when not known).
+    #[serde(default)]
+    pub file_time: String,
+    /// Bits the capture carries (0: not told).
+    #[serde(default)]
+    pub bits: u32,
     pub size: u64,
     pub sha256: String,
     /// Samples of the file (what `fmt` makes of its bytes); the bytes past the
@@ -261,7 +270,7 @@ pub(crate) struct Opened {
 
 pub(crate) fn open(path: &Path) -> Result<Opened> {
     if crate::flacmode::is_flac_archive(path) {
-        bail!("{} holds FLAC tracks (packed with --flac): it is a Matroska audio file, and rfx reads it only to unpack, info, or extract the metadata", path.display());
+        bail!("{} holds FLAC or raw tracks (packed with --flac or --raw): it is a Matroska audio file, and rfx reads it only to unpack, info, or extract the metadata", path.display());
     }
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let idx = ebml::scan(&file)?;

@@ -438,6 +438,40 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod stored_tests {
+    use super::*;
+
+    /// The first 30 011 samples of the signal above, stored by the `rfx` tool of
+    /// RF-tools as FLAC (`--flac`) and as raw PCM (`--raw`) tracks: read at
+    /// positions that cross blocks and both ends of the track.
+    #[test]
+    fn reads_the_flac_and_raw_variants_at_any_position() {
+        let n = 30_011usize;
+        let mut x = 3u32;
+        let mut s = Vec::with_capacity(n);
+        for i in 0..n {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            let v = (((i as f64 * 0.05).sin() * 3000.0) as i32 + ((x >> 24) as i32 - 128)) as i16;
+            s.push(i32::from(v & !63));
+        }
+        for file in ["reader_flac.rfx", "reader_raw.rfx"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(file);
+            let a = Archive::open(&path).unwrap();
+            assert_eq!((a.tracks(), a.len(0)), (1, n as u64), "{file}");
+            for (start, len) in [(0i64, 10usize), (4090, 20), (8190, 12), (1000, 25_000), (n as i64 - 5, 20), (-7, 12), (n as i64 + 3, 4)] {
+                let mut got = vec![7i32; len];
+                a.read(0, start, &mut got).unwrap();
+                for (i, g) in got.iter().enumerate() {
+                    let p = start + i as i64;
+                    let want = if p >= 0 && (p as usize) < n { s[p as usize] } else { 0 };
+                    assert_eq!(*g, want, "{file}: sample {p}");
+                }
+            }
+        }
+    }
+}
+
 impl Pred {
     /// Start the service of track `k` if it is not running: it builds the
     /// GPU kernel at once, while the reader is still setting up.
