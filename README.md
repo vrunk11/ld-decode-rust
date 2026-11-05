@@ -118,6 +118,7 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--keep-audio-crosstalk` | off | Leave the analog audio carriers' crosstalk in the video (`read` cancels it by default). |
 | `--keep-crystal-lines` | off | Leave the clock lines in the RF (`read` subtracts them by default): the player's EFM decoder crystal, its 4fsc video clock, the capture board's clocks. |
 | `--keep-chroma-leak` | off | Leave the chroma that leaks into the RF (NTSC; `read` cancels it by default). |
+| `--recompute-tbc` | off | Locate the lines of every `.rfx` track from its RF, even where the archive keeps what pass 0 found. By default the kept fields are used (saving the minutes pass 0 takes on a large capture) when they were made for the same system (NTSC/PAL) and sample rate; lines are kept to 0.01 sample, so the result is not bit-identical to a fresh pass 0. |
 | `--stack-weight <w>` | `adaptive` | How a stack weighs its inputs: `adaptive` (per sample, by carrier amplitude, with an alignment guard) or `fixed` (one weight per input, the earlier stack). |
 | `--rf-out <file>` | off | Also write the RF the decoder reads (the stacked or time-base corrected stream, s16 at the input rate). |
 | `--device <cpu\|opencl>` | `cpu` | Where the FM demodulator and the read-time TBC / stack run. `opencl` runs them on a GPU through the driver's OpenCL runtime. See [GPU demodulation](#gpu-demodulation). |

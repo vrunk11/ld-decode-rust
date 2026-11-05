@@ -301,3 +301,105 @@ pub(crate) fn open(path: &Path) -> Result<Opened> {
     }
     Ok(Opened { meta, tables, blocks, file })
 }
+
+/// A field of a capture as pass 0 located it (specification 3.1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedField {
+    pub first: bool,
+    /// Frame code words, as ld-decode's pass 0 reads them (`None`: no code).
+    pub code: Option<Vec<i64>>,
+    /// Sample position of each line (rounded to 0.01 sample).
+    pub lines: Vec<f64>,
+}
+
+/// What pass 0 found in the RF of a track, kept in the archive.
+#[derive(Clone, Debug)]
+pub struct SavedPass0 {
+    pub pal: bool,
+    pub rate_hz: f64,
+    pub fields: Vec<SavedField>,
+}
+
+/// The text of a frame code as pass 0 writes it: `None`, or `Some([w0, w1, ...])`.
+fn parse_code(s: &str) -> Option<Vec<i64>> {
+    let inner = s.trim().strip_prefix("Some([")?.strip_suffix("])")?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    inner.split(',').map(|w| w.trim().parse().ok()).collect::<Option<Vec<i64>>>()
+}
+
+/// The pass 0 curves an archive of the predictor variant keeps (the last
+/// block of timestamp 1 of the metadata track), one entry per track (`None`:
+/// that track has none). An archive that keeps none, or is of another
+/// variant, gives all `None`.
+pub fn saved_pass0(path: &Path) -> Result<Vec<Option<SavedPass0>>> {
+    if crate::flacmode::is_flac_archive(path) {
+        return Ok(Vec::new());
+    }
+    let o = open(path)?;
+    let idx = ebml::scan(&o.file)?;
+    let n = o.meta.sources.len();
+    let mut out: Vec<Option<SavedPass0>> = vec![None; n];
+    let meta_track = idx.codecs.iter().find(|(_, c)| c == CODEC_META).map(|(t, _)| *t).context("no metadata track")?;
+    let Some(b) = idx.blocks.iter().rev().find(|b| b.track == meta_track && b.ts == 1) else { return Ok(out) };
+    let mut buf = vec![0u8; b.len as usize];
+    read_exact_at(&o.file, &mut buf, b.off)?;
+    let v: serde_json::Value = serde_json::from_slice(&buf).context("bad pass 0 block")?;
+    for e in v.get("pass0").and_then(|x| x.as_array()).into_iter().flatten() {
+        let Some(t) = e.get("track").and_then(|x| x.as_u64()).map(|t| t as usize).filter(|&t| t < n) else { continue };
+        let fields: Vec<SavedField> = e
+            .get("fields")
+            .and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+            .map(|f| SavedField {
+                first: f.get("first").and_then(|x| x.as_i64()).unwrap_or(0) != 0,
+                code: f.get("code").and_then(|x| x.as_str()).and_then(parse_code),
+                lines: f.get("lines").and_then(|x| x.as_array()).map(|l| l.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default(),
+            })
+            .collect();
+        if !fields.is_empty() {
+            out[t] = Some(SavedPass0 { pal: e.get("system").and_then(|x| x.as_str()) == Some("pal"), rate_hz: e.get("rate_hz").and_then(|x| x.as_f64()).unwrap_or(0.0), fields });
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod pass0_tests {
+    #[test]
+    fn frame_codes_read_as_pass_0_writes_them() {
+        assert_eq!(super::parse_code("None"), None);
+        assert_eq!(super::parse_code("Some([15, 4096, -3])"), Some(vec![15, 4096, -3]));
+        assert_eq!(super::parse_code("Some([])"), Some(vec![]));
+    }
+
+    /// A block of timestamp 1 appended to a file written by the rfx tool (as
+    /// the tool appends it): the last one counts, a track without one gives None.
+    #[test]
+    fn reads_the_pass_0_block_appended_to_an_archive() {
+        use std::io::Write;
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/reader.rfx");
+        let dir = std::env::temp_dir().join(format!("rfx-pass0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.rfx");
+        std::fs::copy(&src, &path).unwrap();
+        assert!(super::saved_pass0(&path).unwrap().iter().all(|p| p.is_none()));
+        let old = br#"{"pass0":[{"track":0,"system":"pal","rate_hz":1.0,"fields":[{"first":1,"lines":[1.0]}]}]}"#;
+        let new = br#"{"pass0":[{"track":0,"system":"ntsc","rate_hz":40000000.0,"fields":[{"first":1,"code":"Some([5, 7])","lines":[10.5,74.25]},{"first":0,"lines":[300.0]}]}]}"#;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&crate::ebml::cluster(1, 2, old)).unwrap();
+        f.write_all(&crate::ebml::cluster(1, 2, new)).unwrap();
+        drop(f);
+        let got = super::saved_pass0(&path).unwrap();
+        let p = got[0].clone().unwrap();
+        assert!(!p.pal && p.rate_hz == 40e6);
+        assert_eq!(p.fields.len(), 2);
+        assert_eq!(p.fields[0], super::SavedField { first: true, code: Some(vec![5, 7]), lines: vec![10.5, 74.25] });
+        assert_eq!(p.fields[1], super::SavedField { first: false, code: None, lines: vec![300.0] });
+        // The archive still reads as before.
+        assert_eq!(crate::reader::Archive::open(&path).unwrap().tracks(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

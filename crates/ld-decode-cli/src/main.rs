@@ -93,6 +93,11 @@ struct Args {
     /// decoded chroma on every chunk and subtracted before demodulation.
     #[arg(long)]
     keep_chroma_leak: bool,
+    /// Locate the lines of every `.rfx` track from its RF, even where the
+    /// archive keeps what pass 0 found (it is used by default, and saves the
+    /// minutes pass 0 takes on a large capture).
+    #[arg(long)]
+    recompute_tbc: bool,
     /// Where the FM demodulation and the read-time TBC / stack run: `cpu`
     /// (bit-exact to the reference), or `opencl` (a GPU through its driver's
     /// OpenCL runtime; see --gpu-precision).
@@ -412,7 +417,7 @@ fn main() -> Result<()> {
 
     let source: Box<dyn reader::SampleSource> = match tbc {
         TbcMode::Resample => input.source,
-        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak, args.rf_out.as_deref()) {
+        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak, args.recompute_tbc, args.rf_out.as_deref()) {
             Ok(v) => Box::new(v),
             // Read was the default, not asked for: a source it cannot read
             // (stdin, a compressed format) or finds no lines in still
@@ -646,6 +651,7 @@ fn read_tbc_source(
     xtalk: bool,
     xtal: bool,
     leak: bool,
+    recompute_tbc: bool,
     rf_out: Option<&str>,
 ) -> Result<stack::VirtualSource> {
     let fmts = inputs
@@ -674,9 +680,49 @@ fn read_tbc_source(
     // Pass 0, one per input running alongside the stacked decode: it locates
     // the lines and reads the VBI codes from the RF, and the timeline is laid
     // down as it goes, so it stops where the stacked decode stops.
+    // An `.rfx` track whose archive keeps what pass 0 found (specification
+    // 3.1) is not located again, unless `--recompute-tbc`: the kept fields
+    // are used when they were made for this system and this sample rate.
+    let mut kept: std::collections::HashMap<String, Vec<Option<rfx::archive::SavedPass0>>> = Default::default();
     for (i, (path, &fmt)) in inputs.iter().zip(&fmts).enumerate() {
         let (live, path) = (Arc::clone(&live), path.clone());
         let src = stack::StackInput::new(&path, fmt)?;
+        let saved = match reader::rfx_split(&path) {
+            (file, Some(track)) if !recompute_tbc => {
+                if !kept.contains_key(file) {
+                    let list = rfx::archive::saved_pass0(std::path::Path::new(file)).unwrap_or_else(|e| {
+                        tracing::warn!("{file}: the pass 0 it keeps cannot be read ({e:#}): locating the lines instead");
+                        Vec::new()
+                    });
+                    kept.insert(file.to_string(), list);
+                }
+                match kept[file].get(track).cloned().flatten() {
+                    Some(s) if s.pal == pal && (s.rate_hz - fs).abs() < 0.5 => Some(s),
+                    Some(s) => {
+                        tracing::info!(
+                            "{path}: the pass 0 it keeps is for {} at {} MHz, not {} at {} MHz: locating the lines instead",
+                            if s.pal { "PAL" } else { "NTSC" },
+                            s.rate_hz / 1e6,
+                            if pal { "PAL" } else { "NTSC" },
+                            fs / 1e6
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(s) = saved {
+            tracing::info!("read-time TBC pass 0: using the {} fields kept in the archive for {path} (--recompute-tbc to locate them again)", s.fields.len());
+            std::thread::Builder::new().name(format!("pass0-{i}")).spawn(move || {
+                for f in s.fields {
+                    live.push(i, stack::FieldRec { first: f.first, code: f.code, lines: f.lines });
+                }
+                live.finish(i, Ok(()));
+            })?;
+            continue;
+        }
         std::thread::Builder::new().name(format!("pass0-{i}")).spawn(move || {
             tracing::info!("read-time TBC pass 0: locating the lines of {path}");
             // A panic would leave the stacked decode waiting on this input.
