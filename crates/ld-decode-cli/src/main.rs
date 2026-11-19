@@ -291,6 +291,17 @@ fn main() -> Result<()> {
 
     let (inputs, out_arg) = resolve_io(&args)?;
     let inputs = reader::expand_rfx(&inputs)?;
+    // The video standard an `.rfx` archive says of its primary capture is not given
+    // to the decoder: its lines choose between the PAL and the NTSC decoder (625 or
+    // 525), and the LDX file says the standard itself (`system`).
+    let rfx_standard = ldx::standard_of(&inputs);
+    let mut args = args;
+    if let Some((lines625, name)) = rfx_standard {
+        if lines625 != args.pal {
+            tracing::warn!("the archive says {name} ({} lines): decoding as {}, not as {}", if lines625 { 625 } else { 525 }, if lines625 { "PAL" } else { "NTSC" }, if args.pal { "PAL" } else { "NTSC" });
+        }
+        args.pal = lines625;
+    }
     let tbc = match (args.tbc, inputs.len()) {
         (Some(TbcMode::Resample), n) if n > 1 => {
             anyhow::bail!("several inputs are stacked with read-time TBC; --tbc resample takes a single input")
@@ -459,6 +470,7 @@ fn main() -> Result<()> {
         config.tbc_extra = from.tbc_extra;
         config.attachments = from.attachments;
         config.rfsource = from.rfsource;
+        config.system = rfx_standard.map(|(_, name)| name.to_string());
         Some(ldx::LdxOutput::new(writer, config))
     } else {
         None

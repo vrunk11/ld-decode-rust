@@ -303,10 +303,11 @@ become parameters of the `tbc` track; the cover of the disc is the attachment
 `cover.png` or `cover.jpg`, its address `cover.url` (a relative path is made
 relative to the folder of the LDX file) and its link `link.url` (web addresses
 are never fetched); and a `metadata` track `ldx.rfsource` holds the entry of the
-capture in the archive without its predictor members, with `archive` and `track`.
+capture in the archive without its predictor members and without what the `tbc` track already says (`face`, `reference`, `copy`, `capture`, `standard`), with `archive` and `track`, and, for a stack, `sources`: every capture it was made from (name, archive and track), the primary first.
 The history of the archive (every archive of the inputs, each entry once) comes
 first in `LDX_HISTORY`, then the entry of this decode. The newer copy of the
 metadata an archive may carry (timestamp 2) is the one read.
+The `standard` an archive says of its primary capture (`pal`, `secam`, `ntsc`, `pal-m`, `ntsc-vhd`) is not given to the decoder: its lines choose the decoder (625 lines, `pal` and `secam`, decode as PAL; 525 lines, `ntsc`, `pal-m` and `ntsc-vhd`, as NTSC), over `--PAL`, with a warning when they differ. An LDX file then says the standard itself as `system` (in the `tbc` track and in `videoParameters`); the other outputs keep the PAL or NTSC of the decoder.
 
 ## Verifying parity
 

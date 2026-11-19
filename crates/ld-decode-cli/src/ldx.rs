@@ -368,7 +368,7 @@ fn track_entry(track: &Track) -> Vec<u8> {
     // it. No CodecPrivate: the description is in the track's tag, as for FLAC.
     if track.kind == Kind::Tbc && !flac {
         let dimension = |name: &str| track.parameters.get(name).and_then(Value::as_u64).unwrap_or(0);
-        let ntsc_or_pal_ns = if track.parameters.get("system").and_then(Value::as_str) == Some("PAL") {
+        let ntsc_or_pal_ns = if matches!(track.parameters.get("system").and_then(Value::as_str), Some("PAL" | "SECAM")) {
             20_000_000
         } else {
             16_683_333
@@ -733,6 +733,31 @@ pub struct LdxOutputConfig {
     pub attachments: Vec<Attachment>,
     /// What the capture was decoded from (the track `ldx.rfsource`, section 8.4).
     pub rfsource: Option<Value>,
+    /// The `system` the file says when the archive says the standard of the
+    /// disc (`PAL-M`, `SECAM`, `NTSC-VHD`: the decoder knows only the lines).
+    pub system: Option<String>,
+}
+
+/// The standard an `.rfx` archive says of the primary capture (the first
+/// input, `file.rfx#N`): whether it has 625 lines (PAL, SECAM) or 525 (NTSC,
+/// PAL-M, NTSC-VHD), and its name as an LDX file spells `system`.
+pub fn standard_of(inputs: &[String]) -> Option<(bool, &'static str)> {
+    let (file, track) = crate::reader::rfx_split(inputs.first()?);
+    let track = track.filter(|_| file.to_ascii_lowercase().ends_with(".rfx"))?;
+    let archive = rfx::reader::Archive::open(Path::new(file)).ok().filter(|a| track < a.tracks())?;
+    standard_system(archive.source(track).standard.as_deref()?)
+}
+
+/// The lines (`true`: 625) and the LDX `system` of a standard as an archive spells it.
+pub fn standard_system(standard: &str) -> Option<(bool, &'static str)> {
+    Some(match standard.trim().to_ascii_lowercase().as_str() {
+        "pal" => (true, "PAL"),
+        "secam" => (true, "SECAM"),
+        "ntsc" => (false, "NTSC"),
+        "pal-m" => (false, "PAL-M"),
+        "ntsc-vhd" => (false, "NTSC-VHD"),
+        _ => return None,
+    })
 }
 
 /// A file kept in the container (section 9).
@@ -745,7 +770,7 @@ pub struct Attachment {
 impl LdxOutputConfig {
     /// A configuration that says nothing of where the capture comes from.
     pub fn new(name: String, pcm: bool, efm: bool, codec: Codec, history: Value) -> Self {
-        Self { name, pcm, efm, codec, history, tbc_extra: Value::Null, attachments: Vec::new(), rfsource: None }
+        Self { name, pcm, efm, codec, history, tbc_extra: Value::Null, attachments: Vec::new(), rfsource: None, system: None }
     }
 }
 
@@ -773,6 +798,8 @@ pub struct LdxOutput {
     config: LdxOutputConfig,
     begun: bool,
     pal: bool,
+    /// The system the decoder gave (`PAL` or `NTSC`), as the metadata say it.
+    decoded_system: String,
     pcm_track: Option<u32>,
     efm_track: Option<u32>,
     pending: Vec<Pending>,
@@ -792,6 +819,7 @@ impl LdxOutput {
             config,
             begun: false,
             pal: false,
+            decoded_system: String::new(),
             pcm_track,
             efm_track,
             pending: Vec::new(),
@@ -807,10 +835,33 @@ impl LdxOutput {
         self.begun
     }
 
+    /// `json` (the whole metadata, or its parameters) with the `system` of
+    /// `videoParameters` the file says, in place of the decoder's: the first
+    /// `"system":"..."` of the compact JSON, which comes before the fields.
+    fn with_system(&self, json: Vec<u8>) -> Vec<u8> {
+        let Some(system) = self.config.system.as_deref().filter(|s| *s != self.decoded_system) else { return json };
+        let old = format!("\"system\":\"{}\"", self.decoded_system).into_bytes();
+        match json.windows(old.len()).position(|w| w == old) {
+            Some(at) => {
+                let mut out = Vec::with_capacity(json.len() + 8);
+                out.extend_from_slice(&json[..at]);
+                out.extend_from_slice(format!("\"system\":\"{system}\"").as_bytes());
+                out.extend_from_slice(&json[at + old.len()..]);
+                out
+            }
+            None => json,
+        }
+    }
+
     /// Write the head of the file and queue the first metadata block: the
     /// parameters alone (`header_json` has `videoParameters` and no `fields`).
     pub fn begin(&mut self, video: &VideoGeometry, header_json: Vec<u8>) -> Result<()> {
         self.pal = video.system == "PAL";
+        // The standard the archive says, in place of the one of the lines (the
+        // metadata and the `system` of the track say the same name, section 3.1).
+        self.decoded_system = video.system.clone();
+        let header_json = self.with_system(header_json);
+        let mut video = VideoGeometry { system: self.config.system.clone().unwrap_or_else(|| video.system.clone()), ..*video };
         let codec = self.config.codec;
         let (tbc_private, pcm_private) = match codec {
             Codec::Flac => (flac::codec_private(1)?, flac::codec_private(2)?),
@@ -988,6 +1039,7 @@ impl LdxOutput {
         self.flush_until(i64::MAX)?;
         let mut writer = self.writer.take().context("LDX output already finished")?;
         if let Some(json) = final_json {
+            let json = self.with_system(json);
             writer.write_block(METADATA_TRACK, self.last_ns, json)?;
         }
         writer.finish()
@@ -1119,10 +1171,38 @@ pub fn from_rfx(inputs: &[String], ldx_dir: &Path) -> FromRfx {
         }
         let mut source = src.source_json();
         if let Some(o) = source.as_object_mut() {
+            // What the `tbc` track says already (its parameters, and `system` for the standard) is not said twice.
+            for key in extra.keys() {
+                o.remove(key);
+            }
+            if src.standard.as_deref().and_then(standard_system).is_some() {
+                o.remove("standard");
+            }
             o.insert("archive".into(), json!(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| file.to_string())));
             o.insert("track".into(), json!(track));
         }
         out.rfsource = Some(source);
+    }
+    // A stack: every capture it was made from, in the order of the inputs (the
+    // primary first), by the name of its file and where it is in its archive.
+    if inputs.len() > 1 {
+        let sources: Vec<Value> = inputs
+            .iter()
+            .map(|input| {
+                let (file, track) = crate::reader::rfx_split(input);
+                let base = |p: &str| Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string());
+                match track.filter(|_| file.to_ascii_lowercase().ends_with(".rfx")) {
+                    Some(t) => match rfx::reader::Archive::open(Path::new(file)) {
+                        Ok(a) if t < a.tracks() => json!({ "name": a.source(t).name, "archive": base(file), "track": t }),
+                        _ => json!({ "archive": base(file), "track": t }),
+                    },
+                    None => json!({ "name": base(file) }),
+                }
+            })
+            .collect();
+        if let Some(o) = out.rfsource.as_mut().and_then(Value::as_object_mut) {
+            o.insert("sources".into(), Value::Array(sources));
+        }
     }
     if !extra.is_empty() {
         out.tbc_extra = Value::Object(extra);
@@ -1265,10 +1345,21 @@ mod tests {
         assert_eq!(by("link.url").unwrap(), b"https://example.com/disc");
         let source = from.rfsource.as_ref().unwrap();
         assert_eq!((source["archive"].as_str(), source["track"].as_u64()), (Some("reader_ldx.rfx"), Some(0)));
-        assert_eq!((source["signal"].as_str(), source["standard"].as_str(), source["fmt"].as_str()), (Some("cvbs"), Some("ntsc"), Some("s16")));
+        assert_eq!((source["signal"].as_str(), source["fmt"].as_str()), (Some("cvbs"), Some("s16")));
+        // The medium, face, reference, copy, capture (parameters of the tbc track) and the standard (the system) are not repeated.
+        for key in ["medium", "face", "reference", "copy", "capture", "standard"] {
+            assert!(source.get(key).is_none(), "{key}");
+        }
         assert!(source.get("refs").is_none() && source.get("own").is_none());
         let commands: Vec<&str> = from.history.iter().filter_map(|e| e["command"].as_str()).collect();
         assert_eq!(commands, ["pack", "tag"]);
+        // A single capture lists no sources; a stack lists them all, the primary first.
+        assert!(source.get("sources").is_none());
+        let stack = from_rfx(&[format!("{}#0", dir.join("reader_ldx.rfx").display()), "other.s16".to_string()], &dir);
+        let list = stack.rfsource.as_ref().unwrap()["sources"].as_array().unwrap().clone();
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0]["name"].as_str(), list[0]["archive"].as_str(), list[0]["track"].as_u64()), (Some("t.s16"), Some("reader_ldx.rfx"), Some(0)));
+        assert_eq!(list[1]["name"].as_str(), Some("other.s16"));
 
         // The file: the attachments are before the data, and the track of the source is about the video.
         let mut config = LdxOutputConfig::new("test".into(), false, false, Codec::Raw, Value::Array(from.history));
@@ -1287,6 +1378,39 @@ mod tests {
         assert_eq!(&ids[..5], &[id::INFO, id::TRACKS, id::VOID, id::TAGS, id::ATTACHMENTS]);
         let has = |s: &str| b.windows(s.len()).any(|w| w == s.as_bytes());
         assert!(has("cover.png") && has("cover.url") && has("link.url") && has("ldx.rfsource") && has(r#""medium":"ld""#));
+    }
+
+    /// The standard of an archive chooses the decoder by its lines, and the file
+    /// says it as `system` (in the track and in the metadata); the one of the
+    /// archive of the test says `ntsc`, so the system stays `NTSC`.
+    #[test]
+    fn the_standard_gives_the_lines_and_the_system_name() {
+        assert_eq!(standard_system("pal"), Some((true, "PAL")));
+        assert_eq!(standard_system("SECAM"), Some((true, "SECAM")));
+        assert_eq!(standard_system("ntsc"), Some((false, "NTSC")));
+        assert_eq!(standard_system("pal-m"), Some((false, "PAL-M")));
+        assert_eq!(standard_system("ntsc-vhd"), Some((false, "NTSC-VHD")));
+        assert_eq!(standard_system("nope"), None);
+        let archive = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rfx/tests/data/reader_ldx.rfx");
+        assert_eq!(standard_of(&[format!("{}#0", archive.display())]), Some((false, "NTSC")));
+        assert_eq!(standard_of(&["capture.s16".to_string()]), None);
+
+        // The decoder knew the lines only (`NTSC`); the file says `PAL-M`.
+        let mut config = LdxOutputConfig::new("test".into(), false, false, Codec::Raw, history("test"));
+        config.system = Some("PAL-M".into());
+        let path = std::env::temp_dir().join(format!("ldx-system-{}.ldx", std::process::id()));
+        let mut out = LdxOutput::new(LdxWriter::create(&path).unwrap(), config);
+        let video = VideoGeometry { system: "NTSC".into(), field_width: 4, field_height: 2, sample_rate: 14318181.8 };
+        out.begin(&video, br#"{"pcmAudioParameters":{},"videoParameters":{"system":"NTSC","fieldWidth":4}}"#.to_vec()).unwrap();
+        out.write_field(br#"{"seqNo":1}"#.to_vec(), &[1u16; 8], &[], &[]).unwrap();
+        out.finish(Some(br#"{"videoParameters":{"system":"NTSC","fieldWidth":4},"fields":[{"seqNo":1,"system":"x"}]}"#.to_vec())).unwrap();
+        let b = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let count = |s: &str| b.windows(s.len()).filter(|w| *w == s.as_bytes()).count();
+        // The parameters block, the whole set, and the description of the track (its tag).
+        assert_eq!(count(r#""system":"PAL-M""#), 3);
+        assert_eq!(count(r#""system":"NTSC""#), 0);
+        assert_eq!(count(r#""system":"x""#), 1);
     }
 
     /// The frames of a block's data, undoing its lacing (none or EBML).
