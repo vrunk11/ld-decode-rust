@@ -594,7 +594,7 @@ impl Archive {
         }
     }
 
-    /// What the archive says of track `k` (name, size, hashes, rate, notes, face, signal...).
+    /// What the archive says of track `k` (name, size, hashes, rate, notes, face...).
     pub fn source(&self, k: usize) -> &crate::archive::SrcMeta {
         match &self.kind {
             Kind::Pred(p) => p.source(k),

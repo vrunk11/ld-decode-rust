@@ -1345,7 +1345,7 @@ mod tests {
         assert_eq!(by("link.url").unwrap(), b"https://example.com/disc");
         let source = from.rfsource.as_ref().unwrap();
         assert_eq!((source["archive"].as_str(), source["track"].as_u64()), (Some("reader_ldx.rfx"), Some(0)));
-        assert_eq!((source["signal"].as_str(), source["fmt"].as_str()), (Some("cvbs"), Some("s16")));
+        assert_eq!(source["fmt"].as_str(), Some("s16"));
         // The medium, face, reference, copy, capture (parameters of the tbc track) and the standard (the system) are not repeated.
         for key in ["medium", "face", "reference", "copy", "capture", "standard"] {
             assert!(source.get(key).is_none(), "{key}");

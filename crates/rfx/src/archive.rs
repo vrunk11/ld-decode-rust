@@ -113,9 +113,6 @@ pub struct SrcMeta {
     /// The number of the capture itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<u32>,
-    /// What was captured: `cvbs` or `yc` (when it was said).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signal: Option<String>,
 }
 
 impl SrcMeta {
@@ -145,7 +142,7 @@ impl SrcMeta {
         if !self.notes.is_empty() {
             o.insert("notes".into(), json!(self.notes));
         }
-        for (k, v) in [("origin", &self.origin), ("face", &self.face), ("signal", &self.signal), ("standard", &self.standard), ("reference", &self.reference)] {
+        for (k, v) in [("origin", &self.origin), ("face", &self.face), ("standard", &self.standard), ("reference", &self.reference)] {
             if let Some(v) = v {
                 o.insert(k.into(), json!(v));
             }
