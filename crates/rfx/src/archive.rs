@@ -97,6 +97,73 @@ pub struct SrcMeta {
     /// when it was packed); 0 when unknown.
     #[serde(default)]
     pub rate_hz: f64,
+    /// The face of the disc: `A`, `B`, `AB` or `BA` (when it was said).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<String>,
+    /// The video standard of the disc as a person said it: `pal`, `ntsc`,
+    /// `pal-m`, `secam` or `ntsc-vhd` (when it was said).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard: Option<String>,
+    /// A reference of the disc (a catalogue number, a title).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// The number of the physical copy of the disc the capture was made from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<u32>,
+    /// The number of the capture itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<u32>,
+    /// What was captured: `cvbs` or `yc` (when it was said).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+}
+
+impl SrcMeta {
+    /// What the archive says of this capture, without what its predictor
+    /// needs: the object `ldx.rfsource` of an LDX file keeps (the members that
+    /// have their default value are left out).
+    pub fn source_json(&self) -> serde_json::Value {
+        use serde_json::{json, Map, Value};
+        let mut o = Map::new();
+        o.insert("name".into(), json!(self.name));
+        o.insert("size".into(), json!(self.size));
+        o.insert("sha256".into(), json!(self.sha256));
+        o.insert("words".into(), json!(self.words));
+        o.insert("fmt".into(), json!(self.fmt));
+        if !self.sample_sha256.is_empty() {
+            o.insert("sample_sha256".into(), json!(self.sample_sha256));
+        }
+        if self.bits != 0 {
+            o.insert("bits".into(), json!(self.bits));
+        }
+        if self.rate_hz != 0.0 {
+            o.insert("rate_hz".into(), json!(self.rate_hz));
+        }
+        if !self.file_time.is_empty() {
+            o.insert("file_time".into(), json!(self.file_time));
+        }
+        if !self.notes.is_empty() {
+            o.insert("notes".into(), json!(self.notes));
+        }
+        for (k, v) in [("origin", &self.origin), ("face", &self.face), ("signal", &self.signal), ("standard", &self.standard), ("reference", &self.reference)] {
+            if let Some(v) = v {
+                o.insert(k.into(), json!(v));
+            }
+        }
+        for (k, v) in [("copy", self.copy), ("capture", self.capture)] {
+            if let Some(v) = v {
+                o.insert(k.into(), json!(v));
+            }
+        }
+        o.insert("position".into(), json!(self.position));
+        if let Some(n) = self.noise {
+            o.insert("noise".into(), json!(n));
+        }
+        if !self.sidecars.is_empty() {
+            o.insert("sidecars".into(), serde_json::to_value(&self.sidecars).unwrap_or(Value::Null));
+        }
+        Value::Object(o)
+    }
 }
 
 /// A small file stored whole in the metadata and given back by `unpack`.
@@ -139,6 +206,87 @@ pub struct Meta {
     /// Samples per segment.
     pub segment: usize,
     pub sources: Vec<SrcMeta>,
+    #[serde(flatten)]
+    pub root: Root,
+}
+
+/// What the archive says of the whole file (specification 3): the source, the
+/// cover of the disc and its link, and the history of the file. All optional.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Root {
+    /// `ld`, `vhs`, `vhd` or `cvbs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<String>,
+    /// The picture, PNG or JPEG, as Base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_url: Option<String>,
+    /// One entry per time a tool wrote or changed the file, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<serde_json::Value>,
+}
+
+/// The cover picture of an archive: the bytes and `image/png` or `image/jpeg`.
+#[derive(Clone, Debug)]
+pub struct Cover {
+    pub media_type: &'static str,
+    pub data: Vec<u8>,
+}
+
+impl Root {
+    /// The picture, when the file keeps one that fits (PNG or JPEG, at most
+    /// 2 MiB; the type is found from the first bytes, as the specification
+    /// says, when `cover_type` is missing).
+    pub fn cover(&self) -> Option<Cover> {
+        let data = base64_decode(self.cover.as_deref()?)?;
+        if data.len() > 2 << 20 {
+            return None;
+        }
+        let media_type = if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+            "image/png"
+        } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            "image/jpeg"
+        } else {
+            return None;
+        };
+        Some(Cover { media_type, data })
+    }
+
+    /// `link_url` when it is a web address on one line.
+    pub fn link(&self) -> Option<&str> {
+        let u = self.link_url.as_deref()?.trim();
+        ((u.starts_with("http://") || u.starts_with("https://")) && !u.contains(['\n', '\r'])).then_some(u)
+    }
+}
+
+/// Base64 (standard alphabet, padding and white space allowed).
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 
@@ -280,9 +428,20 @@ pub(crate) fn open(path: &Path) -> Result<Opened> {
     let mb = idx.blocks.iter().find(|b| b.track == meta_track).context("no metadata block")?;
     let mut buf = vec![0u8; mb.len as usize];
     read_exact_at(&file, &mut buf, mb.off)?;
-    let meta: Meta = serde_json::from_slice(&buf).context("bad metadata")?;
+    let mut meta: Meta = serde_json::from_slice(&buf).context("bad metadata")?;
     if meta.format != "rfx" || meta.version != 1 {
         bail!("unsupported rfx version {}", meta.version);
+    }
+    // A newer copy of the metadata added at the end (specification 3.2): the
+    // last block of timestamp 2 counts instead of the first one, for the same archive.
+    if let Some(ub) = idx.blocks.iter().rev().find(|b| b.track == meta_track && b.ts == 2) {
+        let mut buf = vec![0u8; ub.len as usize];
+        read_exact_at(&file, &mut buf, ub.off)?;
+        let newer: Meta = serde_json::from_slice(&buf).context("bad updated metadata")?;
+        if newer.format != "rfx" || newer.version != 1 || newer.segment != meta.segment || newer.sources.len() != meta.sources.len() {
+            bail!("the updated metadata of {} do not describe the same archive", path.display());
+        }
+        meta = newer;
     }
     let mut tables = HashMap::new();
     for b in idx.blocks.iter().filter(|b| b.track == map_track) {
@@ -373,6 +532,36 @@ mod pass0_tests {
         assert_eq!(super::parse_code("None"), None);
         assert_eq!(super::parse_code("Some([15, 4096, -3])"), Some(vec![15, 4096, -3]));
         assert_eq!(super::parse_code("Some([])"), Some(vec![]));
+    }
+
+    /// The newer copy of the metadata added at the end (timestamp 2, section
+    /// 3.2) counts instead of the first one; the root says what the file says.
+    #[test]
+    fn a_newer_copy_of_the_metadata_replaces_the_first() {
+        use std::io::Write;
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/reader_ldx.rfx");
+        let dir = std::env::temp_dir().join(format!("rfx-meta2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.rfx");
+        std::fs::copy(&src, &path).unwrap();
+        let first = super::open(&path).unwrap();
+        assert_eq!(first.meta.root.medium.as_deref(), Some("ld"));
+        assert_eq!(first.meta.root.history.len(), 2);
+        assert_eq!(first.meta.root.cover().unwrap().media_type, "image/png");
+        assert_eq!(first.meta.root.link(), Some("https://example.com/disc"));
+        assert_eq!((first.meta.sources[0].face.as_deref(), first.meta.sources[0].copy), (Some("A"), Some(2)));
+        let mut v = serde_json::to_value(&first.meta).unwrap();
+        v["medium"] = "vhs".into();
+        v["sources"][0]["notes"] = "second look".into();
+        v["history"].as_array_mut().unwrap().push(serde_json::json!({"tool": "rfx", "command": "metadata"}));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&crate::ebml::cluster(2, 2, v.to_string().as_bytes())).unwrap();
+        drop(f);
+        let now = super::open(&path).unwrap();
+        assert_eq!(now.meta.root.medium.as_deref(), Some("vhs"));
+        assert_eq!(now.meta.root.history.len(), 3);
+        assert_eq!(now.meta.sources[0].notes, "second look");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A block of timestamp 1 appended to a file written by the rfx tool (as

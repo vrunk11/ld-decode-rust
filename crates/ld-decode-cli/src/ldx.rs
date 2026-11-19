@@ -85,6 +85,12 @@ mod id {
     pub const SIMPLE_TAG: u32 = 0x67C8;
     pub const TAG_NAME: u32 = 0x45A3;
     pub const TAG_STRING: u32 = 0x4487;
+    pub const ATTACHMENTS: u32 = 0x1941_A469;
+    pub const ATTACHED_FILE: u32 = 0x61A7;
+    pub const FILE_NAME: u32 = 0x466E;
+    pub const FILE_MEDIA_TYPE: u32 = 0x4660;
+    pub const FILE_DATA: u32 = 0x465C;
+    pub const FILE_UID: u32 = 0x46AE;
     pub const CLUSTER: u32 = 0x1F43_B675;
     pub const TIMESTAMP: u32 = 0xE7;
     pub const BLOCK_GROUP: u32 = 0xA0;
@@ -507,7 +513,7 @@ impl LdxWriter {
     }
 
     /// Everything before the data: header, segment head, info, tracks, tags.
-    pub fn begin(&mut self, tracks: &[Track], history: &Value) -> Result<()> {
+    pub fn begin(&mut self, tracks: &[Track], history: &Value, attachments: &[Attachment]) -> Result<()> {
         let ebml = master(
             id::EBML,
             &[
@@ -563,7 +569,27 @@ impl LdxWriter {
                 ],
             ));
         }
-        self.put(&master(id::TAGS, &tags))
+        self.put(&master(id::TAGS, &tags))?;
+        // The attachments (the cover and its link) are before the data, so a
+        // reader of the start of the file or of a stream has them (section 9).
+        if !attachments.is_empty() {
+            let files: Vec<Vec<u8>> = attachments
+                .iter()
+                .map(|a| {
+                    master(
+                        id::ATTACHED_FILE,
+                        &[
+                            string(id::FILE_NAME, &a.name),
+                            string(id::FILE_MEDIA_TYPE, a.media_type),
+                            element(id::FILE_DATA, &a.data),
+                            uint(id::FILE_UID, new_uid()),
+                        ],
+                    )
+                })
+                .collect();
+            self.put(&master(id::ATTACHMENTS, &files))?;
+        }
+        Ok(())
     }
 
     /// One block (one unit of `track`). Blocks must come in time order; a
@@ -701,6 +727,26 @@ pub struct LdxOutputConfig {
     pub codec: Codec,
     /// The `LDX_HISTORY` array (see [`history`]).
     pub history: Value,
+    /// Members added to the parameters of the `tbc` track (`medium`, `face`).
+    pub tbc_extra: Value,
+    /// Attachments: the cover, `cover.url`, `link.url` (section 9).
+    pub attachments: Vec<Attachment>,
+    /// What the capture was decoded from (the track `ldx.rfsource`, section 8.4).
+    pub rfsource: Option<Value>,
+}
+
+/// A file kept in the container (section 9).
+pub struct Attachment {
+    pub name: String,
+    pub media_type: &'static str,
+    pub data: Vec<u8>,
+}
+
+impl LdxOutputConfig {
+    /// A configuration that says nothing of where the capture comes from.
+    pub fn new(name: String, pcm: bool, efm: bool, codec: Codec, history: Value) -> Self {
+        Self { name, pcm, efm, codec, history, tbc_extra: Value::Null, attachments: Vec::new(), rfsource: None }
+    }
 }
 
 const TBC_TRACK: u32 = 1;
@@ -779,12 +825,20 @@ impl LdxOutput {
                 number: TBC_TRACK,
                 uid: new_uid(),
                 name: name.clone(),
-                parameters: json!({
-                    "system": video.system,
-                    "sampleRate": video.sample_rate,
-                    "fieldWidth": video.field_width,
-                    "fieldHeight": video.field_height,
-                }),
+                parameters: {
+                    let mut p = json!({
+                        "system": video.system,
+                        "sampleRate": video.sample_rate,
+                        "fieldWidth": video.field_width,
+                        "fieldHeight": video.field_height,
+                    });
+                    if let (Some(p), Some(extra)) = (p.as_object_mut(), self.config.tbc_extra.as_object()) {
+                        for (k, v) in extra {
+                            p.insert(k.clone(), v.clone());
+                        }
+                    }
+                    p
+                },
             },
             Track {
                 kind: Kind::Metadata,
@@ -822,10 +876,27 @@ impl LdxOutput {
                 parameters: json!({ "track": TBC_TRACK }),
             });
         }
+        // Where the capture comes from, in a track of its own after the others.
+        let rfsource = self.config.rfsource.as_ref().map(|v| v.to_string());
+        let rfsource_track = rfsource.as_ref().map(|_| tracks.iter().map(|t| t.number).max().unwrap_or(0) + 1);
+        if let Some(number) = rfsource_track {
+            tracks.push(Track {
+                kind: Kind::Metadata,
+                codec: Codec::Raw,
+                flac_private: Vec::new(),
+                number,
+                uid: new_uid(),
+                name: format!("{name} source"),
+                parameters: json!({ "namespace": "ldx.rfsource", "track": TBC_TRACK }),
+            });
+        }
         let writer = self.writer.as_mut().context("LDX output already finished")?;
-        writer.begin(&tracks, &self.config.history)?;
+        writer.begin(&tracks, &self.config.history, &self.config.attachments)?;
         self.begun = true;
         self.queue(0, METADATA_TRACK, header_json);
+        if let (Some(number), Some(json)) = (rfsource_track, rfsource) {
+            self.queue(0, number, json.into_bytes());
+        }
         Ok(())
     }
 
@@ -961,6 +1032,104 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// What an LDX file takes from the `.rfx` archive its capture was decoded
+/// from: the source and the face (parameters of the `tbc` track), the cover
+/// and its link (attachments), what the archive says of the capture
+/// (`ldx.rfsource`) and the history of the archive, which the history of the
+/// file continues. The names are those of the archive's, as its specification
+/// asks, so that nothing is renamed.
+#[derive(Default)]
+pub struct FromRfx {
+    pub tbc_extra: Value,
+    pub attachments: Vec<Attachment>,
+    pub rfsource: Option<Value>,
+    pub history: Vec<Value>,
+}
+
+/// The address of the cover picture, for a file in `ldx_dir`: a web address
+/// and an absolute path as they are, a path relative to the folder of the
+/// `.rfx` file made relative to the folder of the LDX file (absolute when it
+/// is not under it).
+fn cover_url_for(url: &str, rfx_file: &Path, ldx_dir: &Path) -> String {
+    let url = url.trim();
+    if url.starts_with("http://") || url.starts_with("https://") || Path::new(url).is_absolute() {
+        return url.to_string();
+    }
+    let base = rfx_file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let (Ok(abs), Ok(dir)) = (std::path::absolute(base.join(url)), std::path::absolute(ldx_dir)) else {
+        return url.to_string();
+    };
+    let shown = abs.strip_prefix(&dir).unwrap_or(&abs);
+    shown.to_string_lossy().replace('\\', "/")
+}
+
+/// Read what the archives of `inputs` (`file.rfx#N`) say, for the LDX file
+/// that will be in `ldx_dir`. The primary (the first input) gives the source,
+/// the face, the cover, the link and `ldx.rfsource`; the history is that of
+/// every archive, once each entry, in the order of the inputs. An input that
+/// is not a track of an archive, or an archive that cannot be read, says nothing.
+pub fn from_rfx(inputs: &[String], ldx_dir: &Path) -> FromRfx {
+    let mut out = FromRfx::default();
+    let mut extra = serde_json::Map::new();
+    for (i, input) in inputs.iter().enumerate() {
+        let (file, track) = crate::reader::rfx_split(input);
+        let Some(track) = track.filter(|_| file.to_ascii_lowercase().ends_with(".rfx")) else { continue };
+        let path = Path::new(file);
+        let archive = match rfx::reader::Archive::open(path) {
+            Ok(a) if track < a.tracks() => a,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!("{file}: what the archive says of the capture is not kept in the LDX file: {e:#}");
+                continue;
+            }
+        };
+        let root = archive.root();
+        for entry in &root.history {
+            if !out.history.contains(entry) {
+                out.history.push(entry.clone());
+            }
+        }
+        if i != 0 {
+            continue;
+        }
+        if let Some(m) = root.medium.as_deref().filter(|m| ["ld", "vhs", "vhd", "cvbs"].contains(m)) {
+            extra.insert("medium".into(), json!(m));
+        }
+        let src = archive.source(track);
+        if let Some(f) = src.face.as_deref().filter(|f| ["A", "B", "AB", "BA"].contains(f)) {
+            extra.insert("face".into(), json!(f));
+        }
+        if let Some(r) = src.reference.as_deref().filter(|r| !r.trim().is_empty() && !r.contains(['\n', '\r'])) {
+            extra.insert("reference".into(), json!(r.trim()));
+        }
+        for (k, v) in [("copy", src.copy), ("capture", src.capture)] {
+            if let Some(v) = v.filter(|&v| v >= 1) {
+                extra.insert(k.into(), json!(v));
+            }
+        }
+        if let Some(cover) = root.cover() {
+            let ext = if cover.media_type == "image/png" { "png" } else { "jpg" };
+            out.attachments.push(Attachment { name: format!("cover.{ext}"), media_type: cover.media_type, data: cover.data });
+        }
+        if let Some(url) = root.cover_url.as_deref().filter(|u| !u.trim().is_empty() && !u.contains(['\n', '\r'])) {
+            out.attachments.push(Attachment { name: "cover.url".into(), media_type: "text/plain", data: cover_url_for(url, path, ldx_dir).into_bytes() });
+        }
+        if let Some(link) = root.link() {
+            out.attachments.push(Attachment { name: "link.url".into(), media_type: "text/plain", data: link.as_bytes().to_vec() });
+        }
+        let mut source = src.source_json();
+        if let Some(o) = source.as_object_mut() {
+            o.insert("archive".into(), json!(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| file.to_string())));
+            o.insert("track".into(), json!(track));
+        }
+        out.rfsource = Some(source);
+    }
+    if !extra.is_empty() {
+        out.tbc_extra = Value::Object(extra);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,7 +1225,7 @@ mod tests {
     fn sample_output(writer: LdxWriter, codec: Codec, luma: &[u16]) -> Result<()> {
         let mut out = LdxOutput::new(
             writer,
-            LdxOutputConfig { name: "test".into(), pcm: true, efm: true, codec, history: history("test") },
+            LdxOutputConfig::new("test".into(), true, true, codec, history("test")),
         );
         let video = VideoGeometry {
             system: "NTSC".into(),
@@ -1075,6 +1244,49 @@ mod tests {
             )?;
         }
         out.finish(Some(br#"{"videoParameters":{},"fields":[]}"#.to_vec()))
+    }
+
+    /// An `.rfx` archive written by the rfx tool of RF-tools, with a source, a
+    /// cover, a link, a face, a reference, a copy and a capture number and two
+    /// entries of history, becomes what an LDX file keeps of it.
+    #[test]
+    fn an_rfx_archive_gives_its_source_cover_and_history_to_the_ldx_file() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rfx/tests/data");
+        let input = format!("{}#0", dir.join("reader_ldx.rfx").display());
+        let from = from_rfx(&[input], &dir);
+        let p = &from.tbc_extra;
+        assert_eq!(p["medium"], "ld");
+        assert_eq!((p["face"].as_str(), p["reference"].as_str()), (Some("A"), Some("LD-1234")));
+        assert_eq!((p["copy"].as_u64(), p["capture"].as_u64()), (Some(2), Some(3)));
+        let by = |n: &str| from.attachments.iter().find(|a| a.name == n).map(|a| a.data.clone());
+        assert!(by("cover.png").unwrap().starts_with(&[0x89, b'P', b'N', b'G']));
+        // Relative to the folder of the archive, which is the folder of the LDX file here.
+        assert_eq!(by("cover.url").unwrap(), b"covers/a.jpg");
+        assert_eq!(by("link.url").unwrap(), b"https://example.com/disc");
+        let source = from.rfsource.as_ref().unwrap();
+        assert_eq!((source["archive"].as_str(), source["track"].as_u64()), (Some("reader_ldx.rfx"), Some(0)));
+        assert_eq!((source["signal"].as_str(), source["standard"].as_str(), source["fmt"].as_str()), (Some("cvbs"), Some("ntsc"), Some("s16")));
+        assert!(source.get("refs").is_none() && source.get("own").is_none());
+        let commands: Vec<&str> = from.history.iter().filter_map(|e| e["command"].as_str()).collect();
+        assert_eq!(commands, ["pack", "tag"]);
+
+        // The file: the attachments are before the data, and the track of the source is about the video.
+        let mut config = LdxOutputConfig::new("test".into(), false, false, Codec::Raw, Value::Array(from.history));
+        config.tbc_extra = from.tbc_extra;
+        config.attachments = from.attachments;
+        config.rfsource = from.rfsource;
+        let path = std::env::temp_dir().join(format!("ldx-rfx-{}.ldx", std::process::id()));
+        let mut out = LdxOutput::new(LdxWriter::create(&path).unwrap(), config);
+        let video = VideoGeometry { system: "NTSC".into(), field_width: 4, field_height: 2, sample_rate: 14318181.8 };
+        out.begin(&video, br#"{"videoParameters":{"numberOfSequentialFields":0}}"#.to_vec()).unwrap();
+        out.write_field(br#"{"seqNo":1}"#.to_vec(), &[1u16; 8], &[], &[]).unwrap();
+        out.finish(None).unwrap();
+        let b = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let ids: Vec<u32> = segment_children(&b).iter().map(|c| c.0).collect();
+        assert_eq!(&ids[..5], &[id::INFO, id::TRACKS, id::VOID, id::TAGS, id::ATTACHMENTS]);
+        let has = |s: &str| b.windows(s.len()).any(|w| w == s.as_bytes());
+        assert!(has("cover.png") && has("cover.url") && has("link.url") && has("ldx.rfsource") && has(r#""medium":"ld""#));
     }
 
     /// The frames of a block's data, undoing its lacing (none or EBML).

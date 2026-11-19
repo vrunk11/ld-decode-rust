@@ -86,6 +86,14 @@ impl Pred {
         self.inner.meta.sources[k].rate_hz
     }
 
+    pub fn root(&self) -> &crate::archive::Root {
+        &self.inner.meta.root
+    }
+
+    pub fn source(&self, k: usize) -> &crate::archive::SrcMeta {
+        &self.inner.meta.sources[k]
+    }
+
     pub fn tracks(&self) -> usize {
         self.inner.meta.sources.len()
     }
@@ -574,6 +582,23 @@ impl Archive {
         match &self.kind {
             Kind::Pred(p) => p.rate_hz(k),
             Kind::Flac(f) => f.rate_hz(k),
+        }
+    }
+
+    /// What the archive says of the whole file: the source (`medium`), the
+    /// cover and its link, and the history.
+    pub fn root(&self) -> &crate::archive::Root {
+        match &self.kind {
+            Kind::Pred(p) => p.root(),
+            Kind::Flac(f) => f.root(),
+        }
+    }
+
+    /// What the archive says of track `k` (name, size, hashes, rate, notes, face, signal...).
+    pub fn source(&self, k: usize) -> &crate::archive::SrcMeta {
+        match &self.kind {
+            Kind::Pred(p) => p.source(k),
+            Kind::Flac(f) => f.source(k),
         }
     }
 

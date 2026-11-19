@@ -447,16 +447,19 @@ fn main() -> Result<()> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| inputs[0].clone())
         };
-        Some(ldx::LdxOutput::new(
-            writer,
-            ldx::LdxOutputConfig {
-                name,
-                pcm: !args.disable_analog_audio,
-                efm: !args.no_efm,
-                codec: args.ldx_codec.for_tbc()?,
-                history: ldx::history(&format!("decoded {} at {} MHz", inputs.join(" + "), inputfreq)),
-            },
-        ))
+        // What an `.rfx` archive says of its captures (the source, the cover and its link,
+        // where the capture comes from, the history) goes into the file as it is spelt there.
+        let ldx_dir = if to_stdout { std::path::PathBuf::from(".") } else { std::path::Path::new(&format!("{outfile}.ldx")).parent().map(|p| p.to_path_buf()).unwrap_or_default() };
+        let from = ldx::from_rfx(&inputs, &ldx_dir);
+        let mut history = from.history;
+        if let Some(mine) = ldx::history(&format!("decoded {} at {} MHz", inputs.join(" + "), inputfreq)).as_array() {
+            history.extend(mine.iter().cloned());
+        }
+        let mut config = ldx::LdxOutputConfig::new(name, !args.disable_analog_audio, !args.no_efm, args.ldx_codec.for_tbc()?, serde_json::Value::Array(history));
+        config.tbc_extra = from.tbc_extra;
+        config.attachments = from.attachments;
+        config.rfsource = from.rfsource;
+        Some(ldx::LdxOutput::new(writer, config))
     } else {
         None
     };

@@ -118,7 +118,7 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--keep-audio-crosstalk` | off | Leave the analog audio carriers' crosstalk in the video (`read` cancels it by default). |
 | `--keep-crystal-lines` | off | Leave the clock lines in the RF (`read` subtracts them by default): the player's EFM decoder crystal, its 4fsc video clock, the capture board's clocks. |
 | `--keep-chroma-leak` | off | Leave the chroma that leaks into the RF (NTSC; `read` cancels it by default). |
-| `--recompute-tbc` | off | Locate the lines of every `.rfx` track from its RF, even where the archive keeps what pass 0 found. By default the kept fields are used (saving the minutes pass 0 takes on a large capture) when they were made for the same system (NTSC/PAL) and sample rate; lines are kept to 0.01 sample, so the result is not bit-identical to a fresh pass 0. |
+| `--recompute-tbc` | off | Locate the lines of every `.rfx` track from its RF, even where the archive keeps what pass 0 found. By default the kept fields are used (saving the minutes pass 0 takes on a large capture) when they were made for the same system (NTSC/PAL) and sample rate (the lines are kept so that they read back the same to the bit, as pass 0 found them). |
 | `--stack-weight <w>` | `adaptive` | How a stack weighs its inputs: `adaptive` (per sample, by carrier amplitude, with an alignment guard) or `fixed` (one weight per input, the earlier stack). |
 | `--rf-out <file>` | off | Also write the RF the decoder reads (the stacked or time-base corrected stream, s16 at the input rate). |
 | `--device <cpu\|opencl>` | `cpu` | Where the FM demodulator and the read-time TBC / stack run. `opencl` runs them on a GPU through the driver's OpenCL runtime. See [GPU demodulation](#gpu-demodulation). |
@@ -294,6 +294,19 @@ a short one), each unit coded by an encoder of its own so a block decodes alone,
 the top bit of the unsigned TBC samples flipped before coding, and the stand-in
 48 kHz rate. The metadata and EFM tracks are always raw. FFV1 is only for the
 10-bit frames of a `cvbs` track, which this decoder does not produce.
+
+**From an `.rfx` archive.** When the input is an `.rfx` archive (`-i x.rfx#N`, or
+the archive alone for a stack), what the archive says is copied into the LDX
+file as the specifications of both formats spell it, with no renaming. From the
+primary capture: the source (`medium`), `face`, `reference`, `copy` and `capture`
+become parameters of the `tbc` track; the cover of the disc is the attachment
+`cover.png` or `cover.jpg`, its address `cover.url` (a relative path is made
+relative to the folder of the LDX file) and its link `link.url` (web addresses
+are never fetched); and a `metadata` track `ldx.rfsource` holds the entry of the
+capture in the archive without its predictor members, with `archive` and `track`.
+The history of the archive (every archive of the inputs, each entry once) comes
+first in `LDX_HISTORY`, then the entry of this decode. The newer copy of the
+metadata an archive may carry (timestamp 2) is the one read.
 
 ## Verifying parity
 

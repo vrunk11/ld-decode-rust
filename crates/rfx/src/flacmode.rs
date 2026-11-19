@@ -21,6 +21,8 @@ pub struct FlacMeta {
     pub codec: String,
     pub version: u32,
     pub tracks: Vec<SrcMeta>,
+    #[serde(flatten)]
+    pub root: crate::archive::Root,
 }
 
 /// Whether `path` is a FLAC-mode archive (a Matroska file) rather than one of
@@ -156,6 +158,14 @@ impl FlacArchive {
 
     pub fn rate_hz(&self, k: usize) -> f64 {
         self.meta.tracks[k].rate_hz
+    }
+
+    pub fn root(&self) -> &crate::archive::Root {
+        &self.meta.root
+    }
+
+    pub fn source(&self, k: usize) -> &SrcMeta {
+        &self.meta.tracks[k]
     }
 
     fn decode_frame(&self, k: usize, f: usize) -> Result<std::sync::Arc<Vec<i16>>> {
