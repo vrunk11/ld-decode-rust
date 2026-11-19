@@ -303,7 +303,7 @@ become parameters of the `tbc` track; the cover of the disc is the attachment
 `cover.png` or `cover.jpg`, its address `cover.url` (a relative path is made
 relative to the folder of the LDX file) and its link `link.url` (web addresses
 are never fetched); and a `metadata` track `ldx.rfsource` holds the entry of the
-capture in the archive without its predictor members and without what the `tbc` track already says (`face`, `reference`, `copy`, `capture`, `standard`), with `archive` and `track`, and, for a stack, `sources`: every capture it was made from (name, archive and track), the primary first.
+capture in the archive without its predictor members and without what the `tbc` track already says (`face`, `reference`, `copy`, `capture`, `standard`), with `archive` and `track`.
 The history of the archive (every archive of the inputs, each entry once) comes
 first in `LDX_HISTORY`, then the entry of this decode. The newer copy of the
 metadata an archive may carry (timestamp 2) is the one read.

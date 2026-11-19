@@ -1183,27 +1183,6 @@ pub fn from_rfx(inputs: &[String], ldx_dir: &Path) -> FromRfx {
         }
         out.rfsource = Some(source);
     }
-    // A stack: every capture it was made from, in the order of the inputs (the
-    // primary first), by the name of its file and where it is in its archive.
-    if inputs.len() > 1 {
-        let sources: Vec<Value> = inputs
-            .iter()
-            .map(|input| {
-                let (file, track) = crate::reader::rfx_split(input);
-                let base = |p: &str| Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string());
-                match track.filter(|_| file.to_ascii_lowercase().ends_with(".rfx")) {
-                    Some(t) => match rfx::reader::Archive::open(Path::new(file)) {
-                        Ok(a) if t < a.tracks() => json!({ "name": a.source(t).name, "archive": base(file), "track": t }),
-                        _ => json!({ "archive": base(file), "track": t }),
-                    },
-                    None => json!({ "name": base(file) }),
-                }
-            })
-            .collect();
-        if let Some(o) = out.rfsource.as_mut().and_then(Value::as_object_mut) {
-            o.insert("sources".into(), Value::Array(sources));
-        }
-    }
     if !extra.is_empty() {
         out.tbc_extra = Value::Object(extra);
     }
@@ -1353,13 +1332,6 @@ mod tests {
         assert!(source.get("refs").is_none() && source.get("own").is_none());
         let commands: Vec<&str> = from.history.iter().filter_map(|e| e["command"].as_str()).collect();
         assert_eq!(commands, ["pack", "tag"]);
-        // A single capture lists no sources; a stack lists them all, the primary first.
-        assert!(source.get("sources").is_none());
-        let stack = from_rfx(&[format!("{}#0", dir.join("reader_ldx.rfx").display()), "other.s16".to_string()], &dir);
-        let list = stack.rfsource.as_ref().unwrap()["sources"].as_array().unwrap().clone();
-        assert_eq!(list.len(), 2);
-        assert_eq!((list[0]["name"].as_str(), list[0]["archive"].as_str(), list[0]["track"].as_u64()), (Some("t.s16"), Some("reader_ldx.rfx"), Some(0)));
-        assert_eq!(list[1]["name"].as_str(), Some("other.s16"));
 
         // The file: the attachments are before the data, and the track of the source is about the video.
         let mut config = LdxOutputConfig::new("test".into(), false, false, Codec::Raw, Value::Array(from.history));
