@@ -56,9 +56,9 @@ struct Args {
     /// reference decoder's way). Both clean the RF first (audio crosstalk,
     /// clock lines, chroma leak; see the `--keep-*` options), so the
     /// reference's bytes need all three kept. Default: read (measured +0.5 to
-    /// +0.8 dB on one capture); where it cannot run on one source (stdin, a
-    /// compressed format, no lines found), resample. Several sources always
-    /// use read.
+    /// +0.8 dB on one capture). There is no fallback between the two: what
+    /// cannot be read at positions is buffered (stdin to a temporary file, a
+    /// packed or FLAC capture in chunks). Several sources always use read.
     #[arg(long, value_enum)]
     tbc: Option<TbcMode>,
     /// Also write the RF the decoder reads to this file (s16 at the input
@@ -363,13 +363,25 @@ fn main() -> Result<()> {
         .init();
     }
 
+    let mut spool: Option<Spool> = None;
     // Opened before the decoder spec is built: a .flac/.ldf header supplies
     // the input sample rate.
     let format = match args.format {
         Some(f) => f,
         None => reader::infer_format(&inputs[0])?,
     };
+    let (inputs, format, spooled_rate) = if inputs.len() == 1 && inputs[0] == "-" && !(tbc == TbcMode::Resample && args.keep_audio_crosstalk && args.keep_crystal_lines && args.keep_chroma_leak) {
+        // stdin cannot be read at positions: it is buffered to a file first (the
+        // decoder reads it from there, and the file goes when the run ends).
+        let (s, fmt, rate) = spool_stdin(format)?;
+        let path = s.0.to_string_lossy().into_owned();
+        spool = Some(s);
+        (vec![path], fmt, rate)
+    } else {
+        (inputs, format, None)
+    };
     let input = reader::open_input(&inputs[0], format)?;
+    let input = reader::Input { container_rate_hz: input.container_rate_hz.or(spooled_rate), ..input };
     let inputfreq = match (args.inputfreq, input.container_rate_hz) {
         (Some(f), _) => f,
         (None, Some(hz)) => {
@@ -429,26 +441,18 @@ fn main() -> Result<()> {
         spec.output_lines()
     );
 
+    // The format of the inputs the stack reads: the buffered stdin has its own.
+    let source_format = if spool.is_some() { Some(format) } else { args.format };
     let source: Box<dyn reader::SampleSource> = match tbc {
         // The decoder resamples, but the RF is still cleaned first (audio
         // crosstalk, clock lines, chroma leak) unless all three are kept.
         TbcMode::Resample if args.keep_audio_crosstalk && args.keep_crystal_lines && args.keep_chroma_leak => input.source,
-        TbcMode::Resample => match clean_source(&inputs[0], args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak) {
+        TbcMode::Resample => match clean_source(&inputs[0], source_format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak) {
             Ok(v) => Box::new(v),
-            Err(e) => {
-                tracing::warn!("--tbc resample: the RF cannot be cleaned ({e:#}); decoding it as it is");
-                input.source
-            }
+            Err(e) => return Err(e.context("--tbc resample cannot clean the RF (--keep-audio-crosstalk --keep-crystal-lines --keep-chroma-leak decode it as it is)")),
         },
-        TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak, args.recompute_tbc, args.rf_out.as_deref()) {
+        TbcMode::Read => match read_tbc_source(&inputs, source_format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak, args.recompute_tbc, args.rf_out.as_deref()) {
             Ok(v) => Box::new(v),
-            // Read was the default, not asked for: a source it cannot read
-            // (stdin, a compressed format) or finds no lines in still
-            // decodes, the reference's way.
-            Err(e) if args.tbc.is_none() && inputs.len() == 1 => {
-                tracing::warn!("--tbc read: {e:#}; decoding with --tbc resample");
-                input.source
-            }
             Err(e) => return Err(e),
         },
     };
@@ -663,6 +667,45 @@ fn resolve_io(args: &Args) -> Result<(Vec<String>, String)> {
         (Some(i), Some(o)) => Ok((vec![i.clone()], o.clone())),
         _ => anyhow::bail!("missing output: `ld-decode infile outfile`, or `-i infile -o outfile`"),
     }
+}
+
+/// A temporary file that goes with the run.
+struct Spool(std::path::PathBuf);
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Buffer what stdin carries to a temporary file (16-bit samples: unsigned
+/// ones stay unsigned), for a decode that reads the RF at positions. Returns the
+/// file, its format, and the container's sample rate when the stream said one.
+fn spool_stdin(format: reader::SampleFormat) -> Result<(Spool, reader::SampleFormat, Option<u32>)> {
+    use std::io::Write;
+    let input = reader::open_input("-", format)?;
+    let mut src = input.source;
+    let unsigned = format == reader::SampleFormat::U16Le;
+    let path = std::env::temp_dir().join(format!("ld-decode-stdin-{}.{}", std::process::id(), if unsigned { "u16" } else { "s16" }));
+    let mut out = std::io::BufWriter::with_capacity(8 << 20, File::create(&path).with_context(|| format!("creating {}", path.display()))?);
+    let spool = Spool(path.clone());
+    tracing::info!("stdin is buffered to {} (the decode reads the RF at positions)", path.display());
+    let mut buf = vec![0f32; 1 << 20];
+    let mut bytes = Vec::with_capacity(2 << 20);
+    loop {
+        let n = src.read(&mut buf)?;
+        bytes.clear();
+        for &v in &buf[..n] {
+            let w = if unsigned { v as u16 } else { v.clamp(-32768.0, 32767.0) as i16 as u16 };
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        out.write_all(&bytes)?;
+        if n < buf.len() {
+            break;
+        }
+    }
+    out.flush()?;
+    Ok((spool, if unsigned { reader::SampleFormat::U16Le } else { reader::SampleFormat::S16Le }, input.container_rate_hz))
 }
 
 /// `--tbc read`: locate every input's lines (pass 0, straight from the RF,

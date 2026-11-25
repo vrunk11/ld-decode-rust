@@ -702,8 +702,8 @@ impl RawFile {
             let handle = File::open(file).with_context(|| format!("opening {file}"))?;
             return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), if signed { -32768.0 } else { 0.0 })), len, rfx: Some(RfxTrack { archive, track, mul }), flac: None });
         }
-        if matches!(format, SampleFormat::Flac | SampleFormat::Ldf) {
-            tracing::info!("{path}: indexing the FLAC frames (read by sample index)");
+        if matches!(format, SampleFormat::Flac | SampleFormat::Ldf | SampleFormat::Lds | SampleFormat::R30) {
+            tracing::info!("{path}: opening it to be read by sample index");
             let flac = crate::flacindex::FlacSource::open(path, format)?;
             let len = flac.len();
             let handle = File::open(path).with_context(|| format!("opening {path}"))?;

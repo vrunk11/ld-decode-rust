@@ -227,7 +227,14 @@ const WINDOW_KEPT: usize = 4;
 impl FlacWindow {
     pub fn open(path: &str, format: crate::reader::SampleFormat) -> Result<Self> {
         let mut src = crate::reader::open_input(path, format)?.source;
-        let total = match streaminfo_total(path) {
+        // A packed 10-bit file's length follows from its size.
+        let size = std::fs::metadata(path).map(|m| m.len()).ok();
+        let known = match format {
+            crate::reader::SampleFormat::Lds => size.map(|n| n / 5 * 4),
+            crate::reader::SampleFormat::R30 => size.map(|n| n / 4 * 3),
+            _ => streaminfo_total(path),
+        };
+        let total = match known {
             Some(t) if t > 0 => t,
             _ => {
                 // The length was not written: count the samples once.
@@ -321,6 +328,10 @@ pub enum FlacSource {
 
 impl FlacSource {
     pub fn open(path: &str, format: crate::reader::SampleFormat) -> Result<Self> {
+        // The packed 10-bit captures have no frames to index: they are read in chunks.
+        if matches!(format, crate::reader::SampleFormat::Lds | crate::reader::SampleFormat::R30) {
+            return Ok(Self::Window(FlacWindow::open(path, format)?));
+        }
         // `LD_FLAC_WINDOW=1` reads in chunks even where the index would do (to test it).
         let index = if std::env::var_os("LD_FLAC_WINDOW").is_some() { Err(anyhow::anyhow!("LD_FLAC_WINDOW is set")) } else { FlacIndex::open(path) };
         match index {
@@ -611,5 +622,38 @@ mod window_tests {
     fn ogg_flac_is_read_in_chunks() {
         let Some(p) = make(&["-c:a", "flac", "-frame_size", "4096", "-f", "ogg"], "wogg.ldf", 50_001) else { return };
         check(&p, SampleFormat::Ldf, 50_001);
+    }
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use crate::reader::SampleFormat;
+
+    /// A `.lds` file (four 10-bit samples in five bytes) read in chunks.
+    #[test]
+    fn lds_is_read_in_chunks() {
+        let n = 4 * 5000;
+        let tenbit = |i: usize| ((i * 37 + (i / 7) * 101) % 1024) as u16;
+        let mut bytes = Vec::new();
+        for g in 0..n / 4 {
+            let t: Vec<u16> = (0..4).map(|k| tenbit(g * 4 + k)).collect();
+            bytes.extend_from_slice(&[(t[0] >> 2) as u8, (((t[0] & 3) << 6) | (t[1] >> 4)) as u8, (((t[1] & 15) << 4) | (t[2] >> 6)) as u8, (((t[2] & 63) << 2) | (t[3] >> 8)) as u8, (t[3] & 255) as u8]);
+        }
+        let dir = std::env::temp_dir().join(format!("flacindex-lds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.lds");
+        std::fs::write(&path, bytes).unwrap();
+        let w = FlacWindow::open(path.to_str().unwrap(), SampleFormat::Lds).unwrap();
+        assert_eq!(w.len(), n as u64);
+        for (start, len) in [(0i64, 50usize), (12_345, 4000), (3, 20), (n as i64 - 10, 30)] {
+            let mut out = vec![7i32; len];
+            w.read(start, &mut out).unwrap();
+            for (k, &v) in out.iter().enumerate() {
+                let p = start + k as i64;
+                let want = if p < 0 || p >= n as i64 { 0 } else { (i32::from(tenbit(p as usize)) - 512) << 6 };
+                assert_eq!(v, want, "sample {p}");
+            }
+        }
     }
 }
