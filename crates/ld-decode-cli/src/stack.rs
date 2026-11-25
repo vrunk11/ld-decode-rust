@@ -362,6 +362,25 @@ impl Live {
         })
     }
 
+    /// The timeline of one source read as it is, with no correction: virtual
+    /// sample `s` is input sample `s`. For `--tbc resample`, where the
+    /// cancellations still run on the RF and the decoder corrects the time base
+    /// afterwards. `len` is the capture's length, and `probe` the place where
+    /// the noise floor and the player's lines are measured (it needs picture).
+    pub fn identity(path: String, len: u64, probe: f64) -> Arc<Self> {
+        let live = Self::new(vec![path], len, 0.0);
+        {
+            let mut st = live.state.lock().unwrap();
+            st.tl.t = vec![0.0, len as f64];
+            st.tl.pos[0] = vec![0.0, len as f64];
+            st.fields[0].push(FieldRec { first: true, code: None, lines: vec![probe] });
+            st.done[0] = true;
+            st.finalized = true;
+            st.next_primary = 1;
+        }
+        live
+    }
+
     pub(crate) fn push(&self, input: usize, rec: FieldRec) {
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
@@ -628,6 +647,8 @@ struct RawFile {
     /// A track of an `.rfx` archive, decoded as it is read (then `file` is only
     /// the archive's handle, never read here).
     rfx: Option<RfxTrack>,
+    /// A FLAC capture, decoded as it is read.
+    flac: Option<crate::flacindex::FlacSource>,
 }
 
 struct RfxTrack {
@@ -679,7 +700,15 @@ impl RawFile {
             let (mul, signed) = crate::reader::rfx_scale(archive.fmt(track));
             let len = archive.len(track);
             let handle = File::open(file).with_context(|| format!("opening {file}"))?;
-            return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), if signed { -32768.0 } else { 0.0 })), len, rfx: Some(RfxTrack { archive, track, mul }) });
+            return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), if signed { -32768.0 } else { 0.0 })), len, rfx: Some(RfxTrack { archive, track, mul }), flac: None });
+        }
+        if matches!(format, SampleFormat::Flac | SampleFormat::Ldf) {
+            tracing::info!("{path}: indexing the FLAC frames (read by sample index)");
+            let flac = crate::flacindex::FlacSource::open(path, format)?;
+            let len = flac.len();
+            let handle = File::open(path).with_context(|| format!("opening {path}"))?;
+            // The 16-bit values of the capture, as the signed codes of an s16 file.
+            return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), -32768.0)), len, rfx: None, flac: Some(flac) });
         }
         let Some((bytes, widen)) = crate::reader::raw_layout(format) else {
             bail!("--tbc read needs a fixed-width raw input (s16, r16, r8, s8, rf); {path} is {format:?}");
@@ -693,7 +722,7 @@ impl RawFile {
             SampleFormat::S8Le => Some((code_s8 as fn(&[u8], &mut [u16]), -32768.0)),
             _ => None,
         };
-        Ok(Self { file, bytes, widen, code, len, rfx: None })
+        Ok(Self { file, bytes, widen, code, len, rfx: None, flac: None })
     }
 
     /// The file's bytes for samples `[lo, hi)` (clipped to the file).
@@ -715,6 +744,21 @@ impl RawFile {
     /// the code of 0 outside the file.
     fn read_codes_at(&self, start: i64, out: &mut [u16]) -> Result<f32> {
         let (code, off) = self.code.expect("a format with 16-bit codes");
+        if let Some(f) = &self.flac {
+            out.fill((-off) as u16);
+            let lo = start.max(0) as u64;
+            let hi = ((start + out.len() as i64).max(0) as u64).min(self.len);
+            if hi > lo {
+                let at = (lo as i64 - start) as usize;
+                let n = (hi - lo) as usize;
+                let mut buf = vec![0i32; n];
+                f.read(lo as i64, &mut buf)?;
+                for (o, v) in out[at..at + n].iter_mut().zip(buf) {
+                    *o = (v as f32 - off).round() as i32 as u16;
+                }
+            }
+            return Ok(off);
+        }
         if let Some(r) = &self.rfx {
             out.fill((-off) as u16);
             let lo = start.max(0) as u64;
@@ -750,6 +794,15 @@ impl RawFile {
             return Ok(());
         }
         let n = (hi - lo) as usize;
+        if let Some(f) = &self.flac {
+            let mut buf = vec![0i32; n];
+            f.read(lo as i64, &mut buf)?;
+            let off = (lo as i64 - start) as usize;
+            for (o, v) in out[off..off + n].iter_mut().zip(buf) {
+                *o = v as f32;
+            }
+            return Ok(());
+        }
         if let Some(r) = &self.rfx {
             let mut buf = vec![0i32; n];
             r.archive.read(r.track, lo as i64, &mut buf)?;
@@ -775,12 +828,12 @@ impl RawFile {
 }
 
 #[cfg(windows)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, buf, offset)
 }
 
 #[cfg(unix)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(file, buf, offset)
 }
 

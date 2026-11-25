@@ -4,6 +4,7 @@
 mod async_db;
 mod async_writer;
 mod db;
+mod flacindex;
 mod ldx;
 mod prefetch;
 mod reader;
@@ -51,11 +52,13 @@ struct Args {
     #[arg(short = 'o', long = "output")]
     output: Option<String>,
     /// Time-base correction: `read` reads the RF at the corrected positions
-    /// before demodulation (and takes the audio crosstalk out), `resample`
-    /// resamples the demodulated video (the reference decoder's way, its
-    /// bytes). Default: read (measured +0.5 to +0.8 dB on one capture); where
-    /// it cannot run on one source (stdin, a compressed format, no lines
-    /// found), resample. Several sources always use read.
+    /// before demodulation, `resample` resamples the demodulated video (the
+    /// reference decoder's way). Both clean the RF first (audio crosstalk,
+    /// clock lines, chroma leak; see the `--keep-*` options), so the
+    /// reference's bytes need all three kept. Default: read (measured +0.5 to
+    /// +0.8 dB on one capture); where it cannot run on one source (stdin, a
+    /// compressed format, no lines found), resample. Several sources always
+    /// use read.
     #[arg(long, value_enum)]
     tbc: Option<TbcMode>,
     /// Also write the RF the decoder reads to this file (s16 at the input
@@ -427,7 +430,16 @@ fn main() -> Result<()> {
     );
 
     let source: Box<dyn reader::SampleSource> = match tbc {
-        TbcMode::Resample => input.source,
+        // The decoder resamples, but the RF is still cleaned first (audio
+        // crosstalk, clock lines, chroma leak) unless all three are kept.
+        TbcMode::Resample if args.keep_audio_crosstalk && args.keep_crystal_lines && args.keep_chroma_leak => input.source,
+        TbcMode::Resample => match clean_source(&inputs[0], args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak) {
+            Ok(v) => Box::new(v),
+            Err(e) => {
+                tracing::warn!("--tbc resample: the RF cannot be cleaned ({e:#}); decoding it as it is");
+                input.source
+            }
+        },
         TbcMode::Read => match read_tbc_source(&inputs, args.format, request.inputfreq, args.pal, args.device, args.preset, args.stack_weight, !args.keep_audio_crosstalk, !args.keep_crystal_lines, !args.keep_chroma_leak, args.recompute_tbc, args.rf_out.as_deref()) {
             Ok(v) => Box::new(v),
             // Read was the default, not asked for: a source it cannot read
@@ -754,6 +766,31 @@ fn read_tbc_source(
     }
     let rf_out = rf_out.map(|p| stack::RfOut::create(p, fmts[0])).transpose()?;
     stack::VirtualSource::new(stacked, live, fs, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, xtal, leak, rf_out)
+}
+
+/// `--tbc resample`: the one input's RF with the cancellations of `--tbc read`
+/// (audio crosstalk, clock lines, chroma leak) but no time-base correction: the
+/// stacking pipeline on a timeline that maps each sample to itself.
+fn clean_source(
+    input: &str,
+    format: Option<reader::SampleFormat>,
+    inputfreq: f64,
+    pal: bool,
+    device: Device,
+    preset: Preset,
+    stack_weight: StackWeight,
+    xtalk: bool,
+    xtal: bool,
+    leak: bool,
+) -> Result<stack::VirtualSource> {
+    let fmt = format.map_or_else(|| reader::infer_format(input), Ok)?;
+    let src = stack::StackInput::new(input, fmt)?;
+    let len = src.len();
+    // Measured a quarter in, where there is picture (read mode measures at the first line).
+    let probe = (len / 4).min(len.saturating_sub(1 << 22)) as f64;
+    let live = stack::Live::identity(input.to_string(), len, probe);
+    tracing::info!("--tbc resample: cleaning the RF of {input} before the decoder resamples it");
+    stack::VirtualSource::new(vec![src], live, inputfreq * 1e6, pal, device == Device::Opencl, preset == Preset::Slow, stack_weight == StackWeight::Adaptive, xtalk, xtal, leak, None)
 }
 
 /// The sample rate a Domesday Duplicator capture records in the `.yaml`

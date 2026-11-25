@@ -114,10 +114,10 @@ other end closes the pipe early, the decode stops immediately with an error.
 | `--ntsc-color-notch` | off | Notch filter on the decoded video, reduces colour wobble. With `--tbc read` the chroma leak behind it is already cancelled (see `--keep-chroma-leak`). |
 | `--lowband` | off | Lower-bandwidth (lowband) decode settings. |
 | `-i`, `--input <file>` / `-o`, `--output <base>` | — | The sources and the output base name, instead of the positional form; repeat `-i` to stack captures. |
-| `--tbc <read\|resample>` | `read` | Time-base correction. `read` reads the RF at the corrected positions before demodulation (and cancels the audio crosstalk, the clock lines and the chroma leak); `resample` resamples the demodulated video, the reference decoder's way and **its bytes**. Where `read` cannot run on a single source (stdin, `.flac`/`.ldf`, no lines found) the decode falls back to `resample` with a warning. Several sources always use `read`. |
-| `--keep-audio-crosstalk` | off | Leave the analog audio carriers' crosstalk in the video (`read` cancels it by default). |
-| `--keep-crystal-lines` | off | Leave the clock lines in the RF (`read` subtracts them by default): the player's EFM decoder crystal, its 4fsc video clock, the capture board's clocks. |
-| `--keep-chroma-leak` | off | Leave the chroma that leaks into the RF (NTSC; `read` cancels it by default). |
+| `--tbc <read\|resample>` | `read` | Time-base correction. `read` reads the RF at the corrected positions before demodulation; `resample` resamples the demodulated video, the reference decoder's way. Both cancel the audio crosstalk, the clock lines and the chroma leak on the RF first (see the `--keep-*` options); with the three kept, `resample` is the reference decoder's bytes. `read` reads a `.flac`/`.ldf` by sample index (the frames are indexed once); a FLAC the index cannot read (variable block size, stereo) is decoded in chunks of about a second into a buffer instead, which is slower but never refused (`LD_FLAC_WINDOW=1` forces it). Where it cannot run on a single source (stdin, a compressed format, no lines found) the decode falls back to `resample` with a warning. Several sources always use `read`. |
+| `--keep-audio-crosstalk` | off | Leave the analog audio carriers' crosstalk in the video (cancelled by default, with `read` and with `resample`). |
+| `--keep-crystal-lines` | off | Leave the clock lines in the RF (subtracted by default, with `read` and with `resample`): the player's EFM decoder crystal, its 4fsc video clock, the capture board's clocks. |
+| `--keep-chroma-leak` | off | Leave the chroma that leaks into the RF (NTSC; cancelled by default, with `read` and with `resample`). |
 | `--recompute-tbc` | off | Locate the lines of every `.rfx` track from its RF, even where the archive keeps what pass 0 found. By default the kept fields are used (saving the minutes pass 0 takes on a large capture) when they were made for the same system (NTSC/PAL) and sample rate (the lines are kept so that they read back the same to the bit, as pass 0 found them). |
 | `--stack-weight <w>` | `adaptive` | How a stack weighs its inputs: `adaptive` (per sample, by carrier amplitude, with an alignment guard) or `fixed` (one weight per input, the earlier stack). |
 | `--rf-out <file>` | off | Also write the RF the decoder reads (the stacked or time-base corrected stream, s16 at the input rate). |
@@ -311,9 +311,9 @@ The `standard` an archive says of its primary capture (`pal`, `secam`, `ntsc`, `
 
 ## Verifying parity
 
-**Run the comparison with `--tbc resample`.** The default `--tbc read` (and the
+**Run the comparison with `--tbc resample` and the three `--keep-*` options** (`--keep-audio-crosstalk --keep-crystal-lines --keep-chroma-leak`). The default `--tbc read` (and the
 cancellations it carries) is a better decode than the
-reference's and therefore not its bytes; `--tbc resample` is the reference's
+reference's and therefore not its bytes; `--tbc resample` with those options is the reference's
 time-base correction, byte-identical as below.
 
 The end-to-end gate is a **full-disc** decode: a hash comparison of all four
