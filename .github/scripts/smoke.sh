@@ -33,7 +33,7 @@ grep -q -- "--threads" "$WORK/help.txt"
 # JSONDumper never receives a snapshot and its `_enqueue` drops the None
 # (tests/test_json_dumper_empty.py there).
 head -c 40000000 /dev/zero > "$WORK/zeros.s16"
-"$BIN" -t 4 -l 4 "$WORK/zeros.s16" "$WORK/out"
+"$BIN" -t 4 -l 4 --tbc resample "$WORK/zeros.s16" "$WORK/out"
 
 for ext in tbc pcm efm tbc.db log; do
   if [ ! -f "$WORK/out.$ext" ]; then
@@ -56,14 +56,14 @@ grep -q "Decode finished" "$WORK/out.log"
 ffmpeg -v error -y -f s16le -ar 40000 -ac 1 -i "$WORK/zeros.s16" \
   -c:a flac -f flac "$WORK/zeros.ldf"
 cp "$WORK/zeros.ldf" "$WORK/zeros.flac"
-"$BIN" -t 4 -l 4 "$WORK/zeros.ldf" "$WORK/ldf"
-"$BIN" -t 4 -l 4 "$WORK/zeros.flac" "$WORK/flac"
+"$BIN" -t 4 -l 4 --tbc resample "$WORK/zeros.ldf" "$WORK/ldf"
+"$BIN" -t 4 -l 4 --tbc resample "$WORK/zeros.flac" "$WORK/flac"
 cmp "$WORK/flac.tbc" "$WORK/ldf.tbc"
 
 # Ogg-wrapped FLAC must still take the Ogg path.
 ffmpeg -v error -y -f s16le -ar 40000 -ac 1 -i "$WORK/zeros.s16" \
   -c:a flac -compression_level 6 -f ogg "$WORK/ogg.ldf"
-"$BIN" -t 4 -l 4 "$WORK/ogg.ldf" "$WORK/ogg"
+"$BIN" -t 4 -l 4 --tbc resample "$WORK/ogg.ldf" "$WORK/ogg"
 for ext in tbc pcm efm tbc.db log; do
   if [ ! -f "$WORK/ogg.$ext" ]; then
     echo "Missing output: $WORK/ogg.$ext" >&2
@@ -81,7 +81,7 @@ grep -q "no FLAC capture found" "$WORK/junk.err"
 
 # `-` streams the picture to stdout: the bytes must match the file writer's
 # exactly, no sidecar files may appear, and the console log must move to stderr.
-"$BIN" -t 4 -l 4 "$WORK/zeros.s16" - > "$WORK/pipe.tbc" 2> "$WORK/pipe.err"
+"$BIN" -t 4 -l 4 --tbc resample "$WORK/zeros.s16" - > "$WORK/pipe.tbc" 2> "$WORK/pipe.err"
 cmp "$WORK/out.tbc" "$WORK/pipe.tbc"
 if compgen -G "$WORK/-.*" > /dev/null; then
   echo "Pipe mode created sidecar files:" >&2
