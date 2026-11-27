@@ -619,7 +619,15 @@ pub struct StackInput {
 
 impl StackInput {
     pub fn new(path: &str, format: SampleFormat) -> Result<Self> {
-        Ok(Self { path: path.to_string(), reader: RawFile::open(path, format)?, xtal: None })
+        let mut reader = RawFile::open(path, format)?;
+        reader.measure_dc()?;
+        tracing::debug!("stack: {path} DC offset {:.6}", reader.dc);
+        Ok(Self { path: path.to_string(), reader, xtal: None })
+    }
+
+    /// The capture's DC offset, which `read_at` takes out of the samples.
+    pub(crate) fn dc(&self) -> f64 {
+        self.reader.dc
     }
 
     /// Length in samples.
@@ -649,7 +657,20 @@ struct RawFile {
     rfx: Option<RfxTrack>,
     /// A FLAC capture, decoded as it is read.
     flac: Option<crate::flacindex::FlacSource>,
+    /// The capture's DC offset (see `measure_dc`), taken out of the samples
+    /// `read_at` returns inside the file; outside it they read zero.
+    dc: f64,
 }
+
+/// The span a capture's DC offset is measured on: this many samples a quarter
+/// into the capture (all of it when shorter).
+const DC_SPAN: u64 = 1 << 21;
+/// The grid the offset is rounded to: an integer sample less it, and the
+/// difference plus it, are exact in double precision, and over a power-of-two
+/// span the mean of integer samples is exact, so a capture at a power-of-two
+/// scale with an integer offset (a `.r30` against the same samples in a
+/// `.s16`) gets the offset scaled and shifted exactly.
+const DC_GRID: f64 = 4294967296.0;
 
 struct RfxTrack {
     archive: std::sync::Arc<rfx::reader::Archive>,
@@ -700,7 +721,7 @@ impl RawFile {
             let (mul, signed) = crate::reader::rfx_scale(archive.fmt(track));
             let len = archive.len(track);
             let handle = File::open(file).with_context(|| format!("opening {file}"))?;
-            return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), if signed { -32768.0 } else { 0.0 })), len, rfx: Some(RfxTrack { archive, track, mul }), flac: None });
+            return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), if signed { -32768.0 } else { 0.0 })), len, rfx: Some(RfxTrack { archive, track, mul }), flac: None, dc: 0.0 });
         }
         if matches!(format, SampleFormat::Flac | SampleFormat::Ldf | SampleFormat::Lds | SampleFormat::R30) {
             tracing::info!("{path}: opening it to be read by sample index");
@@ -708,7 +729,7 @@ impl RawFile {
             let len = flac.len();
             let handle = File::open(path).with_context(|| format!("opening {path}"))?;
             // The 16-bit values of the capture, as the signed codes of an s16 file.
-            return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), -32768.0)), len, rfx: None, flac: Some(flac) });
+            return Ok(Self { file: handle, bytes: 2, widen: widen_none, code: Some((code_none as fn(&[u8], &mut [u16]), -32768.0)), len, rfx: None, flac: Some(flac), dc: 0.0 });
         }
         let Some((bytes, widen)) = crate::reader::raw_layout(format) else {
             bail!("--tbc read needs a fixed-width raw input (s16, r16, r8, s8, rf); {path} is {format:?}");
@@ -722,7 +743,7 @@ impl RawFile {
             SampleFormat::S8Le => Some((code_s8 as fn(&[u8], &mut [u16]), -32768.0)),
             _ => None,
         };
-        Ok(Self { file, bytes, widen, code, len, rfx: None, flac: None })
+        Ok(Self { file, bytes, widen, code, len, rfx: None, flac: None, dc: 0.0 })
     }
 
     /// The file's bytes for samples `[lo, hi)` (clipped to the file).
@@ -785,8 +806,45 @@ impl RawFile {
         Ok(off)
     }
 
-    /// Samples `[start, start + out.len())`; zeros outside the file.
+    /// The capture's DC offset: its mean over `DC_SPAN` samples a quarter into
+    /// it, on the `DC_GRID`. The corrections assume a centred RF and read zero
+    /// outside the chunk and the capture, so an offset left in makes a step
+    /// there that moves their fits: an unsigned capture (a `.r30`'s 10-bit
+    /// values sit on 512) was cleaned otherwise than the same one signed.
+    fn measure_dc(&mut self) -> Result<()> {
+        self.dc = 0.0;
+        if self.len == 0 {
+            return Ok(());
+        }
+        let count = DC_SPAN.min(self.len);
+        let start = (self.len / 4).min(self.len.saturating_sub(2 * DC_SPAN)).min(self.len - count);
+        let mut buf = vec![0f32; count as usize];
+        self.read_raw(start as i64, &mut buf)?;
+        let mean = buf.iter().map(|&v| f64::from(v)).sum::<f64>() / count as f64;
+        self.dc = (mean * DC_GRID).round() / DC_GRID;
+        Ok(())
+    }
+
+    /// Samples `[start, start + out.len())`, the DC offset out; zeros outside
+    /// the file.
     fn read_at(&self, start: i64, out: &mut [f32]) -> Result<()> {
+        self.read_raw(start, out)?;
+        if self.dc != 0.0 {
+            let n = out.len() as i64;
+            let i0 = (-start).clamp(0, n) as usize;
+            let i1 = (self.len as i64 - start).clamp(0, n) as usize;
+            if i1 > i0 {
+                for o in &mut out[i0..i1] {
+                    *o = (f64::from(*o) - self.dc) as f32;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Samples `[start, start + out.len())` as the capture holds them; zeros
+    /// outside the file.
+    fn read_raw(&self, start: i64, out: &mut [f32]) -> Result<()> {
         out.fill(0.0);
         let lo = start.max(0) as u64;
         let hi = ((start + out.len() as i64).max(0) as u64).min(self.len);
@@ -1054,8 +1112,9 @@ impl InputSpan {
 impl Inner {
     /// Whether every input has 16-bit codes (see `RawFile::code`).
     pub(crate) fn has_codes(&self) -> bool {
-        // The cleaned samples are no longer codes.
-        self.inputs.iter().all(|s| s.reader.code.is_some() && s.xtal.is_none())
+        // The cleaned samples are no longer codes, nor are the centred ones
+        // (a code's offset is a whole number; the capture's DC is not).
+        self.inputs.iter().all(|s| s.reader.code.is_some() && s.xtal.is_none() && s.reader.dc == 0.0)
     }
 
     fn plan(&self, s0: f64, len: usize, codes: bool) -> Result<Plan> {
@@ -1153,10 +1212,12 @@ impl RfOut {
         Ok(Self { file, scale, shift })
     }
 
-    fn write(&self, s0: u64, data: &[f32]) -> Result<()> {
+    /// `data` is the stream centred; `dc` is the primary's offset, put back.
+    fn write(&self, s0: u64, data: &[f32], dc: f64) -> Result<()> {
+        let (scale, shift) = (f64::from(self.scale), f64::from(self.shift));
         let bytes: Vec<u8> = data
             .iter()
-            .flat_map(|&v| ((v * self.scale + self.shift).round().clamp(-32768.0, 32767.0) as i16).to_le_bytes())
+            .flat_map(|&v| ((((f64::from(v) + dc) * scale + shift).round()).clamp(-32768.0, 32767.0) as i16).to_le_bytes())
             .collect();
         let mut done = 0;
         while done < bytes.len() {
@@ -1332,7 +1393,7 @@ impl Ahead {
     /// length once pass 0 knows it.
     fn deliver(&self, engine: &Engine, c: u64, data: Vec<f32>, len: Option<u64>) -> Result<()> {
         if let Some(out) = &engine.rf_out {
-            out.write(c * CHUNK as u64, &data)?;
+            out.write(c * CHUNK as u64, &data, engine.inner.inputs.first().map_or(0.0, StackInput::dc))?;
         }
         let mut st = self.state.lock().unwrap();
         if let Some(l) = len {
@@ -1707,6 +1768,7 @@ fn cancel_crosstalk(out: &mut [f32], v: &[Complex64], fs: f64, fa: [f64; 2], kee
 
 /// FFT plans of `cancel_crosstalk` and `cancel_chroma_leak`.
 static LEAK_FFT: OnceLock<Mutex<FftPlanner<f32>>> = OnceLock::new();
+static LEAK_RFFT: OnceLock<Mutex<realfft::RealFftPlanner<f32>>> = OnceLock::new();
 
 /// The narrow lines the player's and the capture's clocks put into a
 /// capture, subtracted from its samples as they are read (`clean`), before
@@ -1972,16 +2034,18 @@ impl CrystalLines {
 /// raised-cosine edges `rise` and `fall` (Hz): the instantaneous frequency
 /// of the video band `v` (Hz) and the RF `x`, by overlap-save FFT blocks in
 /// parallel (zero outside them), each block computing its own stretch of
-/// both. One complex FFT carries the pair, the frequency as its real part
-/// and the RF as its imaginary part, the band's gain being real and even;
-/// in single precision, ample for a correction this small.
+/// both. Each signal goes through a real FFT of its own: carried as the real
+/// and imaginary parts of one complex FFT, the RF's rounding error followed
+/// the frequency's magnitude (some 1e7 Hz), not its own, so the same disc
+/// was cleaned otherwise at another scale. Single precision, ample for a
+/// correction this small.
 fn leak_bands(v: &[Complex64], x: &[f32], fs: f64, rise: (f64, f64), fall: (f64, f64)) -> (Vec<f32>, Vec<f32>) {
     let n = x.len();
     let size = LEAK_FFT_LEN;
     let ov = ((XTALK_OV_S * fs).round() as usize).clamp(1, size / 4);
     let step = size - 2 * ov;
     let (fwd, inv) = {
-        let mut planner = LEAK_FFT.get_or_init(|| Mutex::new(FftPlanner::new())).lock().unwrap();
+        let mut planner = LEAK_RFFT.get_or_init(|| Mutex::new(realfft::RealFftPlanner::new())).lock().unwrap();
         (planner.plan_fft_forward(size), planner.plan_fft_inverse(size))
     };
     let rc = |f: f64, (a, b): (f64, f64)| {
@@ -1993,9 +2057,10 @@ fn leak_bands(v: &[Complex64], x: &[f32], fs: f64, rise: (f64, f64), fall: (f64,
             0.5 - 0.5 * (std::f64::consts::PI * (f - a) / (b - a)).cos()
         }
     };
-    let gain: Vec<f32> = (0..size)
+    // The band's gain on the half spectrum, the inverse's 1/size in it.
+    let gain: Vec<f32> = (0..=size / 2)
         .map(|b| {
-            let f = b.min(size - b) as f64 * fs / size as f64;
+            let f = b as f64 * fs / size as f64;
             (rc(f, rise) * (1.0 - rc(f, fall)) / size as f64) as f32
         })
         .collect();
@@ -2003,26 +2068,29 @@ fn leak_bands(v: &[Complex64], x: &[f32], fs: f64, rise: (f64, f64), fall: (f64,
     let (mut oc, mut or) = (vec![0.0f32; n], vec![0.0f32; n]);
     oc.par_chunks_mut(step).zip(or.par_chunks_mut(step)).enumerate().for_each(|(blk, (a, b))| {
         let s0 = blk * step;
-        let mut buf: Vec<Complex32> = (0..size)
-            .map(|i| {
-                let t = (s0 + i) as isize - ov as isize;
-                if t >= 1 && (t as usize) < n {
-                    let t = t as usize;
-                    Complex32::new(((v[t] * v[t - 1].conj()).arg() * hz) as f32, x[t])
-                } else if t == 0 {
-                    Complex32::new(0.0, x[0])
-                } else {
-                    Complex32::new(0.0, 0.0)
-                }
-            })
-            .collect();
-        fwd.process(&mut buf);
-        for (v, g) in buf.iter_mut().zip(&gain) {
-            *v *= *g;
+        let mut re = vec![0.0f32; size];
+        let mut im = vec![0.0f32; size];
+        for i in 0..size {
+            let t = (s0 + i) as isize - ov as isize;
+            if t >= 1 && (t as usize) < n {
+                let t = t as usize;
+                re[i] = ((v[t] * v[t - 1].conj()).arg() * hz) as f32;
+                im[i] = x[t];
+            } else if t == 0 {
+                im[i] = x[0];
+            }
         }
-        inv.process(&mut buf);
-        for (i, (p, q)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
-            (*p, *q) = (buf[ov + i].re, buf[ov + i].im);
+        let mut spec = fwd.make_output_vec();
+        for (sig, out) in [(&mut re, &mut *a), (&mut im, &mut *b)] {
+            fwd.process(sig, &mut spec).expect("real FFT of the band's length");
+            for (s, g) in spec.iter_mut().zip(&gain) {
+                *s *= *g;
+            }
+            // A real signal's DC and Nyquist bins are real; the product keeps them so.
+            spec[0].im = 0.0;
+            spec[size / 2].im = 0.0;
+            inv.process(&mut spec, sig).expect("inverse real FFT of the band's length");
+            out.copy_from_slice(&sig[ov..ov + out.len()]);
         }
     });
     (oc, or)
@@ -2533,5 +2601,49 @@ impl SampleSource for VirtualSource {
 
     fn is_seekable(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod dc_tests {
+    use super::*;
+
+    fn capture(name: &str, samples: &[i16]) -> String {
+        let path = std::env::temp_dir().join(format!("ld-stack-dc-{}-{name}", std::process::id()));
+        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_capture_is_read_centred_inside_and_zero_outside() {
+        let raw: Vec<i16> = (0..10).map(|i| 100 + i).collect();
+        let path = capture("centred.s16", &raw);
+        let input = StackInput::new(&path, SampleFormat::S16Le).unwrap();
+        assert_eq!(input.dc(), 104.5);
+        let mut out = [0f32; 6];
+        input.read_at(-3, &mut out).unwrap();
+        assert_eq!(out, [0.0, 0.0, 0.0, -4.5, -3.5, -2.5]);
+        let mut out = [0f32; 4];
+        input.read_at(8, &mut out).unwrap();
+        assert_eq!(out, [3.5, 4.5, 0.0, 0.0]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn the_same_samples_signed_or_unsigned_read_alike() {
+        let signed: Vec<i16> = (0..5000).map(|i| ((i * 37) % 2000 - 1000) as i16).collect();
+        let unsigned: Vec<u16> = signed.iter().map(|&v| (v as i32 + 32768) as u16).collect();
+        let a = capture("signed.s16", &signed);
+        let b = std::env::temp_dir().join(format!("ld-stack-dc-{}-unsigned.u16", std::process::id()));
+        std::fs::write(&b, unsigned.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        let b = b.to_string_lossy().into_owned();
+        let (a_in, b_in) = (StackInput::new(&a, SampleFormat::S16Le).unwrap(), StackInput::new(&b, SampleFormat::U16Le).unwrap());
+        let (mut x, mut y) = (vec![0f32; 5200], vec![0f32; 5200]);
+        a_in.read_at(-100, &mut x).unwrap();
+        b_in.read_at(-100, &mut y).unwrap();
+        assert_eq!(x, y);
+        std::fs::remove_file(a).ok();
+        std::fs::remove_file(b).ok();
     }
 }
