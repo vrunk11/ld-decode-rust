@@ -56,7 +56,9 @@ env:
 jobs:
   windows:
     name: Build, test and smoke (windows x86_64)
-    runs-on: windows-latest
+    # Pinned, as the release is: windows-latest moved to Visual Studio 18, whose
+    # STL wants Clang 22 and fails on the runner's Clang 20 (STL1000).
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v6
